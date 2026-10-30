@@ -53,6 +53,13 @@ def test_offline_script_is_complete():
     assert s.title and len(s.scenes) >= 4 and s.hashtags[0] == "#shorts"
 
 
+def test_offline_script_uses_distinct_queries_for_a_generic_topic():
+    s = offline_script("the history of coffee", Settings())
+    queries = [sc.search_query for sc in s.scenes]
+    assert len(queries) == len(set(queries)) > 1
+    assert all("coffee" in q.lower() for q in queries)
+
+
 def test_prompt_mentions_language_and_length():
     system, user = build_prompt("space", "facts", Settings(language="es", target_seconds=30), ["Old title"])
     assert "Spanish" in user and "78 words" in user and "Old title" in user

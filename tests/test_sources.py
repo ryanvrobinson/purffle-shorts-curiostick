@@ -43,6 +43,7 @@ def test_from_url(monkeypatch):
     monkeypatch.setattr(T, "http", lambda: Session({"https://blog.example/flamingos": ARTICLE}))
     t = T.from_url("https://blog.example/flamingos")
     assert t.source == "url" and t.subject == "Why Flamingos Are Pink" and "carotenoid" in t.context
+    assert t.source_references == [{"title": "Why Flamingos Are Pink", "url": "https://blog.example/flamingos"}]
     with pytest.raises(ValueError):
         T.from_url("file:///etc/passwd")
 
@@ -73,6 +74,7 @@ def test_rss_skips_sensitive_and_used_items(monkeypatch, tmp_path):
     s = Settings(rss_feeds=["https://feed/rss"])
     t = T.from_rss(s, h)
     assert t.subject == "Octopus caught using tools" and t.context == "Researchers filmed an octopus carrying shells."
+    assert t.source_references == [{"title": "Octopus caught using tools", "url": "https://n/2"}]
     h.mark_topic(t.key)
     assert T.from_rss(s, h).subject == "Bees can count"
 
@@ -81,6 +83,7 @@ def test_atom_feeds_work(monkeypatch, tmp_path):
     monkeypatch.setattr(T, "http", lambda: Session({"https://feed/atom": ATOM}))
     t = T.from_rss(Settings(rss_feeds=["https://feed/atom"]), History(tmp_path / "h.db"))
     assert t.subject == "Tardigrades survive space" and t.key == "rss:https://a/1"
+    assert t.source_references == [{"title": "Tardigrades survive space", "url": "https://a/1"}]
 
 
 def test_idea_queue_comes_first_and_can_be_released(tmp_path):

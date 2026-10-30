@@ -6,9 +6,9 @@ from __future__ import annotations
 
 import concurrent.futures
 import logging
-import random
 import sys
 from dataclasses import replace
+from datetime import datetime
 from pathlib import Path
 
 from . import ffmpeg
@@ -54,6 +54,30 @@ def _encode_args(settings: Settings, final: bool) -> list[str]:
             "-pix_fmt", "yuv420p", "-g", str(settings.fps * 2)]
 
 
+def _usable(path: Path | None) -> bool:
+    """A media file we can actually read: it exists and is not empty."""
+    return bool(path) and Path(path).exists() and Path(path).stat().st_size > 0
+
+
+def _generated_segment(seconds: float, idx: int, settings: Settings, work: Path) -> Path:
+    """Render a deterministic animated gradient — the fallback when a scene has no usable footage."""
+    W, H, F = settings.width, settings.height, settings.fps
+    out = work / f"seg{idx:02d}.mp4"
+    frames = max(2, round(seconds * F))
+    enc = _encode_args(settings, final=False)
+    # Deterministic palette and seed based on segment index for consistency.
+    c0, c1 = GRADIENT_PALETTES[idx % len(GRADIENT_PALETTES)]
+    seed = (idx * 12345) % 9999
+    if ffmpeg.has_filter("gradients"):
+        src = (f"gradients=s={W}x{H}:r={F}:c0={c0}:c1={c1}:x0=0:y0=0:x1={W}:y1={H}:"
+               f"speed=0.02:d={seconds:.3f}:seed={seed}")
+    else:
+        src = f"color=c={c0}:s={W}x{H}:r={F}:d={seconds:.3f}"
+    ffmpeg.run(["-f", "lavfi", "-i", src, "-vf", "setsar=1,format=yuv420p", *enc, "-frames:v", str(frames),
+                str(out)], label=f"segment {idx} (generated)")
+    return out
+
+
 def prepare_segment(item: MediaItem, seconds: float, idx: int, settings: Settings, work: Path) -> Path:
     W, H, F = settings.width, settings.height, settings.fps
     out = work / f"seg{idx:02d}.mp4"
@@ -63,47 +87,55 @@ def prepare_segment(item: MediaItem, seconds: float, idx: int, settings: Setting
     grade = _grade(settings)
     enc = _encode_args(settings, final=False)
 
-    if item.kind == "video" and item.path:
-        src = ffmpeg.duration(item.path)
-        pre: list[str] = []
-        if src <= seconds + 0.1:
-            pre = ["-stream_loop", "-1"]
-        else:
-            # Skip the first moments (often a fade-in) and pick a random window for variety.
-            max_start = src - seconds
-            lo = min(0.5, max_start)
-            hi = max(lo, min(max_start, src * 0.35))
-            pre = ["-ss", f"{random.uniform(lo, hi):.2f}"]
-        ffmpeg.run([*pre, "-i", str(item.path), "-t", f"{seconds:.3f}", "-an",
-                    "-vf", f"{cover},fps={F}{grade}", *enc, "-frames:v", str(frames), str(out)],
-                   label=f"segment {idx}")
-        return out
+    if item.kind == "video" and _usable(item.path):
+        try:
+            src = ffmpeg.duration(item.path)
+            if src <= 0:
+                raise ffmpeg.FFmpegError(f"unreadable video: {item.path}")
+            pre: list[str] = []
+            if src <= seconds + 0.1:
+                pre = ["-stream_loop", "-1"]
+            else:
+                # Deterministic start position based on segment index for consistency.
+                # Skip the first 0.5s (often a fade-in) and pick a window in the first 35% of the clip.
+                max_start = src - seconds
+                lo = min(0.5, max_start)
+                hi = max(lo, min(max_start, src * 0.35))
+                # Use a deterministic pseudo-random value based on segment index and clip duration.
+                deterministic_offset = (hash(item.key) + idx * 7) % 10000 / 10000.0
+                start_pos = lo + deterministic_offset * (hi - lo)
+                # Use -ss after -i for frame-accurate seeking to avoid timestamp issues with VFR
+                pre = ["-ss", f"{start_pos:.2f}"]
+            # Force constant frame rate via the fps filter (vsync is not universally supported).
+            ffmpeg.run([*pre, "-i", str(item.path), "-t", f"{seconds:.3f}", "-an",
+                        "-vf", f"{cover},fps={F}:round=near{grade}", *enc, "-frames:v", str(frames), str(out)],
+                       label=f"segment {idx}")
+            return out
+        except ffmpeg.FFmpegError as e:
+            log.warning("Scene %d: unusable video %s (%s) — falling back to a generated background",
+                        idx, item.path, e)
 
-    if item.kind == "image" and item.path:
-        if settings.ken_burns:
-            z = random.choice(["in", "out", "pan"])
-            zoom = {"in": f"min(1+0.16*on/{frames},1.16)", "out": f"1.16-0.16*on/{frames}", "pan": "1.12"}[z]
-            x = "(iw-iw/zoom)*on/" + str(frames) if z == "pan" else "iw/2-(iw/zoom/2)"
-            y = "ih/2-(ih/zoom/2)"
-            vf = (f"scale={2 * W}:{2 * H}:force_original_aspect_ratio=increase,crop={2 * W}:{2 * H},"
-                  f"zoompan=z='{zoom}':x='{x}':y='{y}':d={frames}:s={W}x{H}:fps={F},setsar=1{grade}")
-            ffmpeg.run(["-i", str(item.path), "-vf", vf, *enc, "-frames:v", str(frames), str(out)],
-                       label=f"segment {idx} (ken burns)")
-        else:
-            ffmpeg.run(["-loop", "1", "-framerate", str(F), "-i", str(item.path), "-vf", f"{cover}{grade}",
-                        *enc, "-frames:v", str(frames), str(out)], label=f"segment {idx} (still)")
-        return out
+    if item.kind == "image" and _usable(item.path):
+        try:
+            if settings.ken_burns:
+                # Deterministic zoom direction based on segment index for consistency.
+                z = ["in", "out", "pan"][idx % 3]
+                zoom = {"in": f"min(1+0.16*on/{frames},1.16)", "out": f"1.16-0.16*on/{frames}", "pan": "1.12"}[z]
+                x = "(iw-iw/zoom)*on/" + str(frames) if z == "pan" else "iw/2-(iw/zoom/2)"
+                y = "ih/2-(ih/zoom/2)"
+                vf = (f"scale={2 * W}:{2 * H}:force_original_aspect_ratio=increase,crop={2 * W}:{2 * H},"
+                      f"zoompan=z='{zoom}':x='{x}':y='{y}':d={frames}:s={W}x{H}:fps={F},setsar=1{grade}")
+                ffmpeg.run(["-i", str(item.path), "-vf", vf, *enc, "-frames:v", str(frames), str(out)],
+                           label=f"segment {idx} (ken burns)")
+            else:
+                ffmpeg.run(["-loop", "1", "-framerate", str(F), "-i", str(item.path), "-vf", f"{cover}{grade}",
+                            *enc, "-frames:v", str(frames), str(out)], label=f"segment {idx} (still)")
+            return out
+        except ffmpeg.FFmpegError as e:
+            log.warning("Scene %d: unusable image %s (%s) — falling back to a generated background",
+                        idx, item.path, e)
 
-    # Generated animated background (no footage found / offline demo).
-    c0, c1 = random.choice(GRADIENT_PALETTES)
-    if ffmpeg.has_filter("gradients"):
-        src = (f"gradients=s={W}x{H}:r={F}:c0={c0}:c1={c1}:x0=0:y0=0:x1={W}:y1={H}:"
-               f"speed=0.02:d={seconds:.3f}:seed={random.randint(0, 9999)}")
-    else:
-        src = f"color=c={c0}:s={W}x{H}:r={F}:d={seconds:.3f}"
-    ffmpeg.run(["-f", "lavfi", "-i", src, "-vf", "setsar=1,format=yuv420p", *enc, "-frames:v", str(frames),
-                str(out)], label=f"segment {idx} (generated)")
-    return out
+    return _generated_segment(seconds, idx, settings, work)
 
 
 def segment_lengths(scene_durations: list[float], transition: float) -> list[float]:
@@ -123,9 +155,11 @@ def pick_music(settings: Settings) -> Path | None:
     if settings.music_volume <= 0:
         return None
     d = Path(settings.music_dir)
-    tracks = [p for p in d.rglob("*") if p.suffix.lower() in MUSIC_EXT] if d.is_dir() else []
+    tracks = sorted([p for p in d.rglob("*") if p.suffix.lower() in MUSIC_EXT]) if d.is_dir() else []
     if tracks:
-        return random.choice(tracks)
+        # Deterministic selection based on current date for variety across days but consistency within a day.
+        day_seed = int(datetime.now().strftime("%Y%m%d"))
+        return tracks[day_seed % len(tracks)]
     f = Path(settings.music_file)
     return f if settings.music_file and f.exists() else None
 
@@ -151,13 +185,15 @@ def compose(settings: Settings, segments: list[Path], lengths: list[float], voic
 
     f: list[str] = []
     for i in range(n):
-        f.append(f"[{i}:v]settb=AVTB,setpts=PTS-STARTPTS,fps={F},format=yuv420p[s{i}]")
+        # Normalize timestamps, force CFR, and ensure yuv420p for compatibility
+        f.append(f"[{i}:v]settb=AVTB,setpts=PTS-STARTPTS,fps={F}:round=near,format=yuv420p[s{i}]")
     if n == 1:
         last = "s0"
     elif T > 0:
         acc, last = lengths[0], "s0"
         for i in range(1, n):
-            tr = random.choice(TRANSITIONS) if settings.transition == "random" else settings.transition
+            # Deterministic transition selection based on segment index.
+            tr = TRANSITIONS[(i - 1) % len(TRANSITIONS)] if settings.transition == "random" else settings.transition
             f.append(f"[{last}][s{i}]xfade=transition={tr}:duration={T:.3f}:offset={acc - T:.3f}[x{i}]")
             acc += lengths[i] - T
             last = f"x{i}"
@@ -256,7 +292,7 @@ def render_video(settings: Settings, media: list[MediaItem], scene_durations: li
                  total: float, plan: OverlayPlan, out: Path, work: Path) -> Path:
     T = settings.transition_seconds if settings.transition != "none" else 0.0
     lengths = segment_lengths(scene_durations, T)
-    workers = max(1, min(4, len(media)))
+    workers = 1  # Limit simultaneous FFmpeg scene renders on low-resource PCs
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
         futs = [ex.submit(prepare_segment, m, L, i, settings, work) for i, (m, L) in enumerate(zip(media, lengths))]
         segments = [fu.result() for fu in futs]

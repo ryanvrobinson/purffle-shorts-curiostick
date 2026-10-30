@@ -12,19 +12,23 @@ provides them, otherwise from an aligner or an estimate) so captions land exactl
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import logging
-import random
+import queue
+import re
 import subprocess
 import sys
 import threading
+import time
 import wave
 from dataclasses import dataclass
 from pathlib import Path
 
 from . import ffmpeg
 from .config import Settings
-from .timing import Word, estimate_timings, tokenize, transfer_timings
+from .script import MULTI_SPEAKER
+from .timing import NO_SPACE_LANGS, Word, estimate_timings, tokenize, transfer_timings
 from .utils import PermanentError, http, raise_for_status, with_retries
 
 log = logging.getLogger("purffle")
@@ -72,9 +76,94 @@ class Speech:
     line_starts: list[float] | None = None  # multi-voice: when each line starts
 
 
+CATEGORY_VOICES = {
+    "educational": {
+        "en": "en-US-AndrewMultilingualNeural",
+        "es": "es-MX-JorgeNeural",
+        "fr": "fr-FR-HenriNeural",
+        "de": "de-DE-ConradNeural",
+        "default": "en-US-AndrewMultilingualNeural",
+    },
+    "storytelling": {
+        "en": "en-US-AriaNeural",
+        "es": "es-MX-DaliaNeural",
+        "fr": "fr-FR-DeniseNeural",
+        "de": "de-DE-KatjaNeural",
+        "default": "en-US-AriaNeural",
+    },
+    "documentary": {
+        "en": "en-US-SteveMorrisNeural",
+        "es": "es-MX-JorgeNeural",
+        "fr": "fr-FR-HenriNeural",
+        "de": "de-DE-ConradNeural",
+        "default": "en-US-SteveMorrisNeural",
+    },
+    "technology": {
+        "en": "en-US-GuyNeural",
+        "es": "es-MX-JorgeNeural",
+        "fr": "fr-FR-DeniseNeural",
+        "default": "en-US-GuyNeural",
+    },
+    "energetic": {
+        "en": "en-US-AvaMultilingualNeural",
+        "es": "es-MX-DaliaNeural",
+        "fr": "fr-FR-DeniseNeural",
+        "default": "en-US-AvaMultilingualNeural",
+    },
+    "calm": {
+        "en": "en-US-EthanNeural",
+        "es": "es-MX-JorgeNeural",
+        "fr": "fr-FR-HenriNeural",
+        "default": "en-US-EthanNeural",
+    },
+}
+
+
+def _classify_category(settings: Settings, style: str | None = None, topic: str | None = None) -> str:
+    """Determine the content category for voice selection."""
+    s = settings.style if style is None else style
+    t = (topic or "").lower()  # Settings has no 'topic'; callers may pass the script's subject
+    if s in MULTI_SPEAKER:
+        return "storytelling"
+    if any(kw in t for kw in ["science", "technology", "AI", "tech", "computer", "software"]):
+        return "technology"
+    if any(kw in t for kw in ["history", "civilization", "ancient", "archaeology", "biography"]):
+        return "documentary"
+    if any(kw in t for kw in ["fact", "explainer", "learn", "did you know", "surprising"]):
+        return "educational"
+    if any(kw in t for kw in ["story", "tale", "legend", "myth"]):
+        return "storytelling"
+    if any(kw in t for kw in ["music", "entertainment", "fun", "exciting"]):
+        return "energetic"
+    if any(kw in t for kw in ["calm", "relax", "peaceful", "meditative"]):
+        return "calm"
+    return "educational"  # default fallback
+
+
+def _pick_voice_by_category(settings: Settings, category: str, default: str) -> str:
+    """Select a voice based on content category and language."""
+    lang = settings.language.split("-")[0]
+    category_voices = CATEGORY_VOICES.get(category, CATEGORY_VOICES["educational"])
+    voice = category_voices.get(lang, category_voices.get("default"))
+    return voice if voice else default
+
+
 def _pick_voice(settings: Settings, default: str) -> str:
-    voices = [v.strip() for v in settings.tts_voice.split(",") if v.strip()]
-    return random.choice(voices) if voices else default
+    """Select a voice using category-based intelligence, with --voice override respected.
+
+    - If --voice is explicitly set, use it (honor user override).
+    - Otherwise, classify the content category and select an appropriate voice.
+    - Selection is deterministic for identical inputs unless variation is requested.
+    """
+    # If voice is explicitly set via --voice, use it (honor user override)
+    if settings.tts_voice:
+        voices = [v.strip() for v in settings.tts_voice.split(",") if v.strip()]
+        if voices:
+            return voices[0]  # single voice or first in list
+
+    # Otherwise, use intelligent category-based selection
+    category = _classify_category(settings)
+    return _pick_voice_by_category(settings, category, default)
 
 
 def _rate_multiplier(rate: str) -> float:
@@ -84,7 +173,60 @@ def _rate_multiplier(rate: str) -> float:
         return 1.0
 
 
+def expand_pronunciations(text: str, pronunciations: dict[str, str],
+                          language: str = "en") -> tuple[str, list[int]]:
+    """Expand configured terms for the voice only, leaving caption text untouched.
+
+    Returns the spoken text and, for each original whitespace token, how many spoken tokens it became.
+    Scripts without spaces are left alone because a term cannot be isolated reliably.
+    """
+    tokens = text.split()
+    if not pronunciations or language.split("-")[0] in NO_SPACE_LANGS:
+        return text, [1] * len(tokens)
+    spoken_tokens: list[str] = []
+    groups: list[int] = []
+    for token in tokens:
+        expanded = token
+        for term, replacement in pronunciations.items():
+            expanded = re.sub(rf"(?<!\w){re.escape(term)}(?!\w)", replacement, expanded, flags=re.IGNORECASE)
+        parts = expanded.split()
+        groups.append(len(parts))
+        spoken_tokens.extend(parts)
+    return " ".join(spoken_tokens), groups
+
+
+def _group_word_timings(tokens: list[str], groups: list[int],
+                        spoken_words: list[Word]) -> list[Word] | None:
+    """Fold expanded spoken words back onto the original caption tokens."""
+    if len(tokens) != len(groups) or any(n <= 0 for n in groups) or sum(groups) != len(spoken_words):
+        return None
+    out: list[Word] = []
+    k = 0
+    for token, count in zip(tokens, groups):
+        part = spoken_words[k:k + count]
+        k += count
+        out.append(Word(token, part[0].start, part[-1].end))
+    return out
+
+
+def _pronounced_timings(tokens: list[str], spoken_tokens: list[str], groups: list[int],
+                        native: list[Word], duration: float) -> list[Word]:
+    mapped = any(n != 1 for n in groups)
+    if not mapped:
+        return transfer_timings(tokens, native, duration)
+    spoken_words = transfer_timings(spoken_tokens, native, duration)
+    grouped = _group_word_timings(tokens, groups, spoken_words)
+    return grouped if grouped is not None else transfer_timings(tokens, native, duration)
+
+
 # ------------------------------------------------------------------------------------------ engines
+# edge-tts' own ``stream_sync`` waits on an unbounded queue with no timeout: if its worker thread dies
+# (a dropped connection, a socket the server half-closed) the sentinel is never queued and the call
+# blocks forever. Drive the public async ``stream()`` ourselves with a deadline so a stalled synthesis
+# raises instead of hanging the whole pipeline.
+EDGE_STREAM_TIMEOUT = 180.0  # seconds for one synthesis attempt (per with_retries attempt)
+
+
 def _edge(text: str, out: Path, settings: Settings) -> tuple[Path, list[Word], str]:
     try:
         import edge_tts
@@ -97,18 +239,58 @@ def _edge(text: str, out: Path, settings: Settings) -> tuple[Path, list[Word], s
         words: list[Word] = []
         comm = edge_tts.Communicate(text, voice, rate=settings.tts_rate, boundary="WordBoundary",
                                     receive_timeout=60)
+        items: queue.Queue = queue.Queue()
+        done = object()
+
+        def produce() -> None:
+            async def consume() -> None:
+                async for chunk in comm.stream():
+                    items.put(chunk)
+
+            try:
+                asyncio.run(consume())
+            except BaseException as e:  # noqa: BLE001 — hand the failure to the consumer below
+                items.put(e)
+            finally:
+                items.put(done)
+
+        threading.Thread(target=produce, name="edge-tts", daemon=True).start()
+        deadline = time.monotonic() + EDGE_STREAM_TIMEOUT
         with open(path, "wb") as f:
-            for chunk in comm.stream_sync():
-                if chunk["type"] == "audio":
-                    f.write(chunk["data"])
-                elif chunk["type"] == "WordBoundary":
-                    start = chunk["offset"] / 1e7
-                    words.append(Word(chunk["text"], start, start + chunk["duration"] / 1e7))
+            while True:
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    raise RuntimeError(f"edge-tts produced no complete audio within "
+                                       f"{EDGE_STREAM_TIMEOUT:.0f}s (stalled connection)")
+                try:
+                    item = items.get(timeout=min(left, 2.0))
+                except queue.Empty:
+                    continue
+                if item is done:
+                    break
+                if isinstance(item, BaseException):
+                    raise item
+                if item["type"] == "audio":
+                    f.write(item["data"])
+                elif item["type"] == "WordBoundary":
+                    start = item["offset"] / 1e7
+                    words.append(Word(item["text"], start, start + item["duration"] / 1e7))
         if path.stat().st_size == 0:
             raise RuntimeError("edge-tts returned no audio")
         return words
 
-    words = with_retries(_do, attempts=3, label=f"edge-tts {voice}")
+    try:
+        words = with_retries(_do, attempts=3, label=f"edge-tts {voice}")
+    except Exception as e:
+        status = getattr(e, "status", getattr(e, "status_code", None))
+        if status == 403 or "403" in str(e):
+            raise RuntimeError(
+                "Edge TTS was rejected with HTTP 403 by the upstream service; this may be a temporary "
+                "service or network restriction. The system voice can be used instead."
+            ) from e
+        if isinstance(e, (TimeoutError, asyncio.TimeoutError)) or "timeout" in type(e).__name__.lower():
+            raise RuntimeError("Edge TTS timed out while waiting for the upstream service.") from e
+        raise RuntimeError(f"Edge TTS synthesis failed ({type(e).__name__}): {e}") from e
     return path, words, voice
 
 
@@ -226,8 +408,9 @@ def _system(text: str, out: Path, settings: Settings) -> tuple[Path, list[Word],
             cmd[1:1] = ["-v", voice]
     elif sys.platform.startswith("win"):
         raw = out / "voice.wav"
+        # Use -Encoding UTF8 for PowerShell to properly read Unicode characters
         ps = ("Add-Type -AssemblyName System.Speech; $s = New-Object System.Speech.Synthesis.SpeechSynthesizer; "
-              f"$s.SetOutputToWaveFile('{raw}'); $s.Speak([IO.File]::ReadAllText('{txt}')); $s.Dispose()")
+              f"$s.SetOutputToWaveFile('{raw}'); $s.Speak([IO.File]::ReadAllText('{txt}', [System.Text.Encoding]::UTF8)); $s.Dispose()")
         cmd = ["powershell", "-NoProfile", "-Command", ps]
     else:
         raw = out / "voice.wav"
@@ -235,9 +418,14 @@ def _system(text: str, out: Path, settings: Settings) -> tuple[Path, list[Word],
         cmd = [exe, "-v", voice or settings.language, "-s", str(int(165 * _rate_multiplier(settings.tts_rate))),
                "-w", str(raw), "-f", str(txt)]
     try:
-        subprocess.run(cmd, check=True, capture_output=True, timeout=300)
+        # Ensure subprocess uses UTF-8 encoding for stdout/stderr
+        subprocess.run(cmd, check=True, capture_output=True, timeout=300, encoding="utf-8", errors="replace")
     except FileNotFoundError as e:
         raise PermanentError(f"System voice not available ({cmd[0]} missing). On Linux: apt install espeak-ng") from e
+    except UnicodeDecodeError as e:
+        # Retry without capturing output if encoding fails
+        log.warning("Unicode decode error in system TTS, retrying without capture: %s", e)
+        subprocess.run(cmd, check=True, timeout=300)
     return raw, [], voice or "system-default"
 
 
@@ -283,6 +471,7 @@ def _align(audio: Path, settings: Settings) -> tuple[list[Word], str]:
     lang = settings.language.split("-")[0]
     if mode in ("auto", "faster-whisper"):
         try:
+            log.info("Aligning word timings with faster-whisper (the first run downloads the model)")
             return _align_faster_whisper(audio, lang), "aligned"
         except ImportError:
             if mode == "faster-whisper":
@@ -301,18 +490,22 @@ def synthesize(text: str, out_dir: Path, settings: Settings) -> Speech:
     """Speak ``text`` and return audio + one timed Word per script token."""
     engine = settings.tts_engine if settings.tts_engine in _ENGINE_FUNCS else "edge"
     out_dir.mkdir(parents=True, exist_ok=True)
-    audio, native, voice = _ENGINE_FUNCS[engine](text, out_dir, settings)
+    spoken_text, groups = expand_pronunciations(text, settings.tts_pronunciations, settings.language)
+    audio, native, voice = _ENGINE_FUNCS[engine](spoken_text, out_dir, settings)
     dur = ffmpeg.duration(audio)
     if dur <= 0:
         raise RuntimeError(f"{engine} produced unreadable audio: {audio}")
     tokens = tokenize(text, settings.language)
+    mapped = any(n != 1 for n in groups)
+    spoken_tokens = tokenize(spoken_text, settings.language) if mapped else tokens
     if native:
-        words, timing = transfer_timings(tokens, native, dur), "native"
+        words, timing = _pronounced_timings(tokens, spoken_tokens, groups, native, dur), "native"
     elif engine == "silent":
         words, timing = estimate_timings(tokens, dur), "estimated"
     else:
         aligned, timing = _align(audio, settings)
-        words = transfer_timings(tokens, aligned, dur) if aligned else estimate_timings(tokens, dur)
+        words = (_pronounced_timings(tokens, spoken_tokens, groups, aligned, dur)
+                 if aligned else estimate_timings(tokens, dur))
     log.info("Voice: %s/%s, %.1fs, %d words (%s timing)", engine, voice, dur, len(words), timing)
     return Speech(audio=audio, words=words, duration=dur, engine=engine, voice=voice, timing=timing)
 
@@ -365,7 +558,7 @@ def synthesize_lines(lines: list[tuple[str, str]], out_dir: Path, settings: Sett
         if i + 1 < len(parts):
             listing.append(f"file '{gap.name}'")
             t += LINE_GAP
-    (out_dir / "lines.txt").write_text("\n".join(listing) + "\n")
+    (out_dir / "lines.txt").write_text("\n".join(listing) + "\n", encoding="utf-8")
     audio = out_dir / "voice.wav"
     ffmpeg.run(["-f", "concat", "-safe", "0", "-i", "lines.txt", "-c:a", "pcm_s16le", str(audio.name)],
                label="join voices", cwd=out_dir)

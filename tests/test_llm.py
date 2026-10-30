@@ -2,6 +2,7 @@ import sys
 import types
 
 import pytest
+import requests
 
 from purffle_shorts import llm as L
 from purffle_shorts.config import Settings
@@ -22,7 +23,7 @@ class FakeSession:
         self.resp, self.calls = resp, []
 
     def post(self, url, json=None, headers=None, timeout=None):
-        self.calls.append({"url": url, "json": json, "headers": headers})
+        self.calls.append({"url": url, "json": json, "headers": headers, "timeout": timeout})
         return self.resp
 
 
@@ -42,6 +43,20 @@ def test_no_provider_gives_helpful_error(monkeypatch):
         L.resolve_provider_name(Settings())
 
 
+def test_no_provider_raises_not_configured(monkeypatch):
+    """Nothing configured is a graceful-fallback case, not a hard config error."""
+    monkeypatch.setattr(L, "_ollama_up", lambda url: False)
+    with pytest.raises(L.LLMNotConfigured):
+        L.resolve_provider_name(Settings())
+    assert issubclass(L.LLMNotConfigured, L.LLMConfigError)
+
+
+def test_unknown_provider_still_hard_fails():
+    with pytest.raises(L.LLMConfigError) as exc:
+        L.resolve_provider_name(Settings(llm_provider="not-a-provider"))
+    assert not isinstance(exc.value, L.LLMNotConfigured)
+
+
 def test_openai_payload_for_chat_model(monkeypatch):
     sess = FakeSession(_ok())
     monkeypatch.setattr(L, "http", lambda: sess)
@@ -50,7 +65,63 @@ def test_openai_payload_for_chat_model(monkeypatch):
     body = sess.calls[0]["json"]
     assert body["temperature"] == 0.9 and body["max_tokens"] == 4000
     assert body["response_format"] == {"type": "json_object"}
+    assert sess.calls[0]["timeout"] == (5, 45)
     assert sess.calls[0]["headers"]["Authorization"] == "Bearer k"
+
+
+def test_openai_uses_final_content_not_reasoning_content(monkeypatch):
+    session = FakeSession(FakeResp(200, {
+        "choices": [{"message": {
+            "content": '{"answer": "final"}',
+            "reasoning_content": "private reasoning must not be returned",
+        }, "finish_reason": "stop"}],
+        "usage": {"prompt_tokens": 12, "completion_tokens": 4},
+    }))
+    monkeypatch.setattr(L, "http", lambda: session)
+    provider = L.OpenAICompatible(L.PRESETS["custom"], "reasoning-model", "fake-key", "https://x/v1")
+
+    assert provider.complete("s", "u") == '{"answer": "final"}'
+
+
+def test_openai_does_not_use_reasoning_when_final_content_is_empty(monkeypatch):
+    session = FakeSession(FakeResp(200, {
+        "choices": [{"message": {
+            "content": None,
+            "reasoning_content": "private reasoning must not be returned",
+        }, "finish_reason": "length"}],
+    }))
+    monkeypatch.setattr(L, "http", lambda: session)
+    provider = L.OpenAICompatible(L.PRESETS["custom"], "reasoning-model", "fake-key", "https://x/v1")
+
+    with pytest.raises(L.LLMError, match="empty reply.*reasoning_content is not final output"):
+        provider.complete("s", "u")
+
+
+def test_openai_timeout_is_reported_and_not_retried(monkeypatch):
+    class TimeoutSession:
+        def __init__(self):
+            self.calls = 0
+
+        def post(self, *args, **kwargs):
+            self.calls += 1
+            assert kwargs["timeout"] == (5, 45)
+            raise requests.exceptions.ReadTimeout("socket stalled")
+
+    session = TimeoutSession()
+    monkeypatch.setattr(L, "http", lambda: session)
+    provider = L.OpenAICompatible(L.PRESETS["custom"], "model", "fake-key", "https://x/v1")
+    chain = object.__new__(L.LLM)
+    chain.settings, chain.providers = Settings(), [provider]
+
+    with pytest.raises(L.LLMError, match="request timed out.*connect/read limits 5s/45s"):
+        chain.complete_json("s", "u")
+    assert session.calls == 1
+
+
+def test_malformed_json_error_does_not_echo_model_output():
+    with pytest.raises(L.LLMError, match="not a complete JSON object") as exc:
+        L.extract_json('{"sensitive": "generated text",')
+    assert "generated text" not in str(exc.value)
 
 
 def test_reasoning_models_skip_temperature(monkeypatch):
@@ -91,6 +162,63 @@ def test_fallback_chain_uses_next_provider():
 
     chain = object.__new__(L.LLM)
     chain.settings, chain.providers = Settings(), [Bad(), Good()]
+    assert chain.complete_json("s", "u") == {"ok": True}
+
+
+
+
+
+def test_invalid_json_gets_one_higher_token_retry():
+    class Truncated(L.Provider):
+        name, model = "truncated", "m"
+
+        def __init__(self):
+            self.limits = []
+
+        def complete(self, system, user, *, schema=None, temperature=0.9, max_tokens=4000):
+            self.limits.append(max_tokens)
+            return "{" if len(self.limits) == 1 else '{"ok": true}'
+
+    provider = Truncated()
+    chain = object.__new__(L.LLM)
+    chain.settings, chain.providers = Settings(), [provider]
+
+    assert chain.complete_json("s", "u") == {"ok": True}
+    assert provider.limits == [4000, 8000]
+
+
+def test_empty_length_response_gets_bounded_higher_token_retry():
+    class EmptyOnce(L.Provider):
+        name, model = "empty", "m"
+
+        def __init__(self):
+            self.limits = []
+
+        def complete(self, system, user, *, schema=None, temperature=0.9, max_tokens=4000):
+            self.limits.append(max_tokens)
+            if len(self.limits) == 1:
+                raise L.LLMError("empty reply (finish_reason=length)")
+            return '{"ok": true}'
+
+    provider = EmptyOnce()
+    chain = object.__new__(L.LLM)
+    chain.settings, chain.providers = Settings(), [provider]
+
+    assert chain.complete_json("s", "u") == {"ok": True}
+    assert provider.limits == [4000, 8000]
+
+
+def test_valid_json_is_preserved_when_provider_reports_length(monkeypatch):
+    class LengthResponse:
+        def post(self, *args, **kwargs):
+            return FakeResp(200, {"choices": [{"message": {"content": '{"ok": true}'},
+                                               "finish_reason": "length"}]})
+
+    monkeypatch.setattr(L, "http", lambda: LengthResponse())
+    provider = L.OpenAICompatible(L.PRESETS["openai"], "gpt-4o-mini", "fake-key",
+                                  L.PRESETS["openai"].base_url)
+    chain = object.__new__(L.LLM)
+    chain.settings, chain.providers = Settings(), [provider]
     assert chain.complete_json("s", "u") == {"ok": True}
 
 

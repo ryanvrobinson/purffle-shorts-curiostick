@@ -156,6 +156,8 @@ def test_mcp_tool_results_and_errors(settings):
     assert r["isError"] is False and r["content"][0]["text"] == "No videos yet."
     bad = _call(srv, "tools/call", {"name": "upload_video", "arguments": {"id": 99}})["result"]
     assert bad["content"][0]["text"] == "Video #99: missing"
+    upload_tool = next(t for t in TOOLS if t["name"] == "upload_video")
+    assert upload_tool["inputSchema"]["required"] == ["id", "approved"]
     assert _call(srv, "tools/call", {"name": "rm_rf"})["error"]["code"] == -32602
     assert _call(srv, "nope")["error"]["code"] == -32601
 

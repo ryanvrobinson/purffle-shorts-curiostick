@@ -19,8 +19,8 @@ from pathlib import Path
 from . import analytics, ffmpeg, notify, topics, tts, youtube
 from .config import Settings
 from .history import History, now_iso
-from .llm import LLM, LLMConfigError
-from .media import MediaItem, Visuals
+from .llm import LLM, LLMConfigError, LLMNotConfigured
+from .media import AI_SOURCES, MediaItem, Visuals
 from .overlays import ChatMessage, build_overlays
 from .render import extract_frame, render_video
 from .script import (
@@ -40,7 +40,7 @@ from .utils import redact, slugify, truncate_words
 log = logging.getLogger("purffle")
 
 END_PAD = 0.6          # seconds of breathing room after the last word
-REUSABLE_SOURCES = {"generated", "local", "openai-images", "ai", "dalle", "gpt-image", "pollinations"}
+REUSABLE_SOURCES = {"generated", "local", "openai-images", "ai", "dalle", "gpt-image", "pollinations", "agnes"}
 
 # Rough share of the work done when each stage starts (for progress bars).
 STAGES = {"topic": 2, "script": 8, "review": 20, "voice": 32, "footage": 45, "captions": 62, "render": 72,
@@ -123,6 +123,7 @@ class Studio:
         self._llm: LLM | None = None
         self.progress = progress
         self._stats_synced = 0.0
+        self._warned_no_llm = False
         self._refused_on = ""  # the quota day on which YouTube itself refused an upload
 
     def _step(self, stage: str, message: str = "") -> None:
@@ -143,11 +144,27 @@ class Studio:
                      if len(self._llm.providers) > 1 else "")
         return self._llm
 
+    def _llm_or_none(self) -> LLM | None:
+        """The LLM when one is configured, else None (write a basic script offline instead of failing).
+
+        A genuinely misconfigured provider (unknown name, custom without a URL, a named provider with no
+        key) still raises so the user can fix it; only "nothing is configured at all" degrades gracefully."""
+        try:
+            return self.llm
+        except LLMNotConfigured as e:
+            if not self._warned_no_llm:
+                self._warned_no_llm = True
+                log.warning("No LLM is configured — writing a basic script offline. For AI scripts set one LLM "
+                            "key in .env (or run Ollama). Details: %s", e)
+            return None
+
     # ------------------------------------------------------------------ voice with fallbacks
     def _speak(self, script: Script, work: Path, s: Settings) -> tts.Speech:
         engines = [s.tts_engine]
         if s.tts_engine != "edge":
             engines.append("edge")
+        else:
+            engines.append("system")
         if s.offline:
             engines += ["system", "silent"]
         lines = [(sc.speaker, sc.narration) for sc in script.scenes] if (
@@ -182,16 +199,17 @@ class Studio:
         try:
             self._step("script", pick.subject)
             insights = analytics.insights(self.history) if s.learn_from_stats else ""
-            script = write_script(self.llm, pick.subject, s, source=pick.source, avoid=self.history.recent_titles(),
+            llm = self._llm_or_none()
+            script = write_script(llm, pick.subject, s, source=pick.source, avoid=self.history.recent_titles(),
                                   context=pick.context, style=style or pick.style or None, insights=insights)
-            if self.llm is not None and s.script_review != "off":
+            if llm is not None and s.script_review != "off":
                 self._step("review", "Script Doctor")
-                script = review_script(self.llm, script, s)
+                script = review_script(llm, script, s)
         except BaseException:
             if pick.idea_id:
                 self.history.release_idea(pick.idea_id)
             raise
-        return script, pick, self.llm.label if self.llm else "offline"
+        return script, pick, llm.label if llm else "offline"
 
     # ------------------------------------------------------------------ one video
     def make(self, topic: str | None = None, *, source: str | None = None, upload: bool | None = None,
@@ -240,7 +258,7 @@ class Studio:
         state["folder"] = folder
         work = folder / "work"
         work.mkdir(parents=True, exist_ok=True)
-        (folder / "script.json").write_text(json.dumps(script.to_dict(), indent=2, ensure_ascii=False))
+        (folder / "script.json").write_text(json.dumps(script.to_dict(), indent=2, ensure_ascii=False), encoding="utf-8")
         try:
             self._step("voice", f"{s.tts_engine} voice")
             speech = self._speak(script, work, s)
@@ -251,15 +269,32 @@ class Studio:
             T = s.transition_seconds if s.transition != "none" else 0.0
 
             self._step("footage", f"{len(timeline)} scenes")
+            selection: list[dict] = [{} for _ in timeline]
             if media_map:
                 media = _media_for(timeline, media_map)
                 credits = set(credits or ())
             else:
                 jobs = [(script.scenes[st.index].search_query, script.scenes[st.index].image_prompt,
-                         st.duration + T) for st in timeline]
+                         st.duration + T, script.scenes[st.index].narration) for st in timeline]
                 visuals = Visuals(s, self.history.used_media())
                 media = visuals.for_scenes(jobs, script.topic, work / "media")
                 credits = visuals.credits
+                selection = [visuals.reports.get(i, {}) for i in range(len(media))]
+                videos = sum(m.kind == "video" for m in media)
+                generated = sum(m.kind == "image" and m.source in AI_SOURCES for m in media)
+                photos = sum(m.kind == "image" and m.source not in AI_SOURCES for m in media)
+                fallbacks = sum(m.kind == "generated" for m in media)
+                log.info("Visuals: %d video, %d generated image%s, %d stock photo%s, %d fallback background%s "
+                         "(mode: %s; sources: %s)",
+                         videos, generated, "" if generated == 1 else "s",
+                         photos, "" if photos == 1 else "s",
+                         fallbacks, "" if fallbacks == 1 else "s",
+                         s.visual_mode, ", ".join(s.visual_sources))
+                missing = [m for m in media if m.kind == "generated"]
+                if missing:
+                    log.warning("%d of %d scenes have no real visual — those scenes use an animated gradient. "
+                                "Add a free Pexels/Pixabay key, an image provider, or clips in MEDIA_DIR.",
+                                len(missing), len(media))
             by_scene = {st.index: m for st, m in zip(timeline, media)}
 
             self._step("captions")
@@ -289,28 +324,62 @@ class Studio:
             if (info["width"], info["height"]) != s.resolution or abs(info["duration"] - total) > 0.5:
                 raise RuntimeError(f"Render check failed: got {info['width']}x{info['height']} "
                                    f"{info['duration']:.2f}s, expected {s.width}x{s.height} {total:.2f}s")
+            if not info["has_audio"]:
+                raise RuntimeError("Render check failed: the rendered video has no audio track")
+            # Report how the narration length compares with the requested target so a drift is visible
+            # instead of silent (the single timeline makes this the real duration of the video).
+            deviation = round(info["duration"] - s.target_seconds, 2)
+            if s.target_seconds and abs(deviation) > max(3.0, s.target_seconds * 0.25):
+                log.warning("Narration is %.1fs, about %.0f%% off the requested %ds target. Adjust the "
+                            "script length (TARGET_SECONDS or the scene count) if this matters.",
+                            info["duration"], abs(deviation) / s.target_seconds * 100, s.target_seconds)
             extract_frame(video, min(1.2, total / 3), folder / "cover.jpg")
             (folder / "captions.srt").write_text(srt(chunks), encoding="utf-8")
 
             title = final_title(script, s)
             description = final_description(script, credits, s)
+            research_warnings = [
+                "AI-generated factual claims have not been independently verified; check each claim against the cited source."
+            ]
+            if not pick.source_references:
+                research_warnings.append("No external source URL is recorded; verify claims manually before publication.")
+            research = {
+                "source": pick.source,
+                "references": pick.source_references,
+                "notes": pick.context[:6000],
+                "verification_status": "needs_human_review",
+                "warnings": research_warnings,
+            }
+            script_review = {
+                "retention_score": script.score,
+                "issues": list(script.review),
+                "factual_verification": "not_performed",
+                "warnings": research_warnings,
+            }
             meta = {
                 "title": title, "description": description, "tags": script.tags,
                 "category_id": script.category_id, "language": s.language,
                 "topic": script.topic, "source": pick.source, "style": script.style,
                 "duration": round(info["duration"], 2), "resolution": f"{s.width}x{s.height}",
+                "requested_duration": s.target_seconds, "actual_duration": round(info["duration"], 2),
+                "duration_deviation": deviation, "assembled_duration": round(timeline[-1].end, 2),
                 "llm": writer, "score": script.score, "review": script.review, "cast": script.cast,
+                "research": research, "review_results": script_review, "approval_status": "pending",
                 "voice": f"{speech.engine}:{speech.voice}", "timing": speech.timing,
                 "visuals": [{"source": m.source, "id": m.id, "kind": m.kind, "query": m.query} for m in media],
+                "visual_mode": s.visual_mode,
+                "visual_selection": selection,
                 "parent_id": parent_id, "created_at": now_iso(),
             }
-            (folder / "metadata.json").write_text(json.dumps(meta, indent=2, ensure_ascii=False))
+            (folder / "metadata.json").write_text(json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8")
 
             rid = self.history.add_video(
                 subject=pick.subject, source=pick.source, topic=script.topic, style=script.style,
                 language=s.language, title=title, description=description, tags=script.tags,
                 folder=str(folder), video_path=str(video), duration=info["duration"],
-                llm=meta["llm"], voice=meta["voice"], status="rendered", score=script.score, parent_id=parent_id)
+                llm=meta["llm"], voice=meta["voice"], status="rendered", score=script.score, parent_id=parent_id,
+                approval_status="pending", research_json=json.dumps(research, ensure_ascii=False),
+                review_json=json.dumps(script_review, ensure_ascii=False))
             state["record_id"] = rid
             if not media_map:
                 self.history.mark_media([m.key for m in media if m.source not in REUSABLE_SOURCES])
@@ -368,6 +437,12 @@ class Studio:
         if not rec or not rec.get("video_path") or not Path(rec["video_path"]).exists():
             log.error("Video #%s has no file to upload", rid)
             return "missing"
+        if rec.get("youtube_id") or rec.get("status") in ("uploaded", "scheduled"):
+            log.warning("Video #%s already has a YouTube upload; refusing to create a duplicate", rid)
+            return "already-uploaded"
+        if rec.get("approval_status") != "approved" or not rec.get("approved_at"):
+            log.warning("Video #%s has not been explicitly approved; refusing to upload", rid)
+            return "approval-required"
         if self.quota_left() <= 0:
             log.warning("Daily upload limit (%d) reached — video #%d queued for tomorrow", self.s.daily_upload_limit, rid)
             self.history.update_video(rid, status="queued")
@@ -445,7 +520,7 @@ class Studio:
         upload = s.upload if upload is None else upload
         produced, batch, empty_batches = 0, 0, 0
         mode = "upload" if upload else "no-upload"
-        _ = self.llm  # fail fast on LLM configuration problems
+        _ = self._llm_or_none()  # fail fast on real LLM problems; fall back to offline scripts otherwise
         log.info("Autopilot started (%s, batch %d, workers %d%s)", mode, s.batch_size, s.workers,
                  f", target {count}" if count else "")
         try:

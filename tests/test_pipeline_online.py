@@ -1,9 +1,11 @@
 """The keyed path end to end with fakes: LLM -> Pexels search + download -> render -> upload/schedule/queue."""
 
 import json
+import logging
 import subprocess
 
 import pytest
+from PIL import Image
 
 from purffle_shorts import ffmpeg
 from purffle_shorts import media as M
@@ -39,6 +41,10 @@ class Resp:
 
     def json(self):
         return self._data
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise RuntimeError(f"HTTP {self.status_code}")
 
     def iter_content(self, chunk_size=65536):
         with open(self._path, "rb") as f:
@@ -85,6 +91,12 @@ def online(settings, monkeypatch, clip):
     return s, searches
 
 
+def _approve_for_test(studio, result):
+    assert result.record_id is not None
+    assert studio.history.approve_video(
+        result.record_id, P.now_iso(), {"platform": "youtube", "test_approval": True})
+
+
 @needs_ffmpeg
 def test_keyed_pipeline_uploads_and_dedupes(online, monkeypatch):
     s, searches = online
@@ -93,6 +105,9 @@ def test_keyed_pipeline_uploads_and_dedupes(online, monkeypatch):
     studio = P.Studio(s)
     r = studio.make()
     assert r.ok, r.error
+    assert r.status == "rendered" and not uploads
+    _approve_for_test(studio, r)
+    assert studio.upload_record(r.record_id, r) == "uploaded"
     assert r.status == "uploaded" and r.youtube_id == "vid1"
     assert searches[:1] == ["octopus"]
     body = uploads[0]
@@ -105,14 +120,125 @@ def test_keyed_pipeline_uploads_and_dedupes(online, monkeypatch):
 
 
 @needs_ffmpeg
+def test_pixabay_pipeline_reaches_the_renderer_with_real_videos(settings, monkeypatch, clip):
+    class Session:
+        def get(self, url, params=None, headers=None, timeout=None, stream=False):
+            if "api/videos" in url:
+                hits = []
+                for i in range(5):
+                    hits.append({
+                        "id": 100 + i, "duration": 6, "user": "Bob",
+                        "tags": "octopus, gills, ocean, underwater",
+                        "videos": {"medium": {"url": f"http://fake/pixabay-{i}.mp4",
+                                              "width": 640, "height": 360}},
+                    })
+                return Resp({"hits": hits})
+            if url == "https://pixabay.com/api/":
+                return Resp({"hits": []})
+            if url.startswith("http://fake/"):
+                return Resp(path=clip)
+            raise AssertionError(f"unexpected request {url}")
+
+    monkeypatch.setattr(M, "http", lambda: Session())
+    monkeypatch.setattr(U, "http", lambda: Session())
+    monkeypatch.setattr(P, "LLM", FakeLLM)
+    rendered = []
+    real_render = P.render_video
+
+    def spy_render(settings, media, durations, voice, total, plan, video, work):
+        rendered.extend((m.source, m.kind, bool(m.path and m.path.exists() and m.path.stat().st_size)) for m in media)
+        return real_render(settings, media, durations, voice, total, plan, video, work)
+
+    monkeypatch.setattr(P, "render_video", spy_render)
+    s = settings.with_overrides(tts_engine="silent", resolution=(360, 640), fps=24, music_volume=0.0,
+                                visual_sources=["pixabay", "agnes"], pixabay_api_key="k",
+                                agnes_api_key="a", upload=False)
+    r = P.Studio(s).make()
+    assert r.ok, r.error
+    assert len(rendered) == len(SCRIPT["scenes"])
+    assert all(source == "pixabay" and kind == "video" and downloaded
+               for source, kind, downloaded in rendered)
+    meta = json.loads((r.folder / "metadata.json").read_text(encoding="utf-8"))
+    assert meta["visuals"] and all(v["source"] == "pixabay" and v["kind"] == "video"
+                                   for v in meta["visuals"])
+    assert len(meta["visual_selection"]) == len(meta["visuals"])
+    assert all(s["chosen"]["kind"] == "video" for s in meta["visual_selection"])
+    assert all("video" in s["reason"] for s in meta["visual_selection"])
+
+
+@needs_ffmpeg
+def test_hybrid_pipeline_renders_pixabay_clips_and_agnes_images(settings, monkeypatch, clip, caplog):
+    caplog.set_level(logging.INFO)
+
+    class Session:
+        def get(self, url, params=None, headers=None, timeout=None, stream=False):
+            if "api/videos" in url:
+                hits = []
+                for i in range(5):
+                    hits.append({
+                        "id": 100 + i, "duration": 6, "user": "Bob",
+                        "tags": "octopus, gills, ocean, underwater",
+                        "videos": {"medium": {"url": f"http://fake/hybrid-{i}.mp4",
+                                              "width": 640, "height": 360}},
+                    })
+                return Resp({"hits": hits})
+            if url == "https://pixabay.com/api/":
+                return Resp({"hits": []})
+            if url.startswith("http://fake/"):
+                return Resp(path=clip)
+            raise AssertionError(f"unexpected request {url}")
+
+    def fake_agnes(prompt, dest, *args, **kwargs):
+        assert "Scene context:" in prompt
+        Image.new("RGB", (720, 1280), (220, 40, 40)).save(dest)
+        return dest
+
+    monkeypatch.setattr(M, "http", lambda: Session())
+    monkeypatch.setattr(U, "http", lambda: Session())
+    monkeypatch.setattr(M, "agnes_image", fake_agnes)
+    monkeypatch.setattr(P, "LLM", FakeLLM)
+    rendered = []
+    real_render = P.render_video
+
+    def spy_render(settings, media, durations, voice, total, plan, video, work):
+        rendered.extend((m.source, m.kind, bool(m.path and m.path.exists() and m.path.stat().st_size))
+                        for m in media)
+        return real_render(settings, media, durations, voice, total, plan, video, work)
+
+    monkeypatch.setattr(P, "render_video", spy_render)
+    s = settings.with_overrides(tts_engine="silent", resolution=(360, 640), fps=24, music_volume=0.0,
+                                visual_sources=["pixabay", "agnes"], pixabay_api_key="k",
+                                agnes_api_key="a", visual_mode="hybrid", hybrid_image_every=2,
+                                upload=False)
+    r = P.Studio(s).make()
+
+    assert r.ok, r.error
+    assert [(source, kind) for source, kind, _ in rendered] == [
+        ("pixabay", "video"), ("agnes", "image"), ("pixabay", "video")]
+    assert all(downloaded for _, _, downloaded in rendered)
+    meta = json.loads((r.folder / "metadata.json").read_text(encoding="utf-8"))
+    assert meta["visual_mode"] == "hybrid"
+    assert [v["source"] for v in meta["visuals"]] == ["pixabay", "agnes", "pixabay"]
+    assert meta["visual_selection"][1]["chosen"]["source"] == "agnes"
+    assert "hybrid" in meta["visual_selection"][1]["reason"]
+    assert "Visuals: 2 video, 1 generated image, 0 stock photos, 0 fallback background" in caplog.text
+    info = ffmpeg.probe(r.video)
+    assert (info["width"], info["height"]) == (360, 640) and info["has_audio"]
+
+
+@needs_ffmpeg
 def test_schedule_and_quota_queue(online, monkeypatch):
     s, _ = online
     monkeypatch.setattr(P.youtube, "upload", lambda settings, video, body: {"id": "v"})
     s = s.with_overrides(publish_times=["09:00", "21:00"], keep_videos=True, daily_upload_limit=1)
     studio = P.Studio(s)
     first = studio.make()
+    _approve_for_test(studio, first)
+    assert studio.upload_record(first.record_id, first) == "scheduled"
     assert first.status == "scheduled" and first.publish_at
     second = studio.make()
+    _approve_for_test(studio, second)
+    assert studio.upload_record(second.record_id, second) == "queued"
     assert second.status == "queued" and second.video.exists()
     assert [row["id"] for row in studio.history.pending_uploads()] == [second.record_id]
 
@@ -127,7 +253,12 @@ def test_youtube_refusal_pauses_uploads_until_the_reset(online, monkeypatch):
         raise P.youtube.QuotaExceeded("uploadLimitExceeded")
     monkeypatch.setattr(P.youtube, "upload", refuse)
     studio = P.Studio(s.with_overrides(keep_videos=True))
-    first, second = studio.make(), studio.make()
+    first = studio.make()
+    _approve_for_test(studio, first)
+    assert studio.upload_record(first.record_id, first) == "queued"
+    second = studio.make()
+    _approve_for_test(studio, second)
+    assert studio.upload_record(second.record_id, second) == "queued"
     assert first.status == second.status == "queued" and len(calls) == 1  # the second one was not even tried
     assert studio.quota_left() == 0                                     # so autopilot sleeps instead of piling up
     assert len(studio.history.pending_uploads()) == 2

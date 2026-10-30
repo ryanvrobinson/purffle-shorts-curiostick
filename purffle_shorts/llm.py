@@ -11,13 +11,17 @@ import json
 import logging
 import os
 import re
+import time
 from dataclasses import dataclass
 from typing import Any
+
+import requests
 
 from .config import Settings
 from .utils import PermanentError, http, raise_for_status, with_retries
 
 log = logging.getLogger("purffle")
+_LLM_REQUEST_TIMEOUT = (5, 45)
 
 
 class LLMError(RuntimeError):
@@ -26,6 +30,13 @@ class LLMError(RuntimeError):
 
 class LLMConfigError(LLMError):
     """Missing key, unknown provider, etc. — stop instead of retrying every video."""
+
+
+class LLMNotConfigured(LLMConfigError):
+    """No LLM provider has credentials (auto mode found nothing, Ollama is not running).
+
+    Unlike other configuration errors this is not the user's mistake to fix before continuing: the pipeline
+    can still write a simple script offline, so callers may catch it and fall back instead of failing."""
 
 
 @dataclass(frozen=True)
@@ -122,7 +133,7 @@ def resolve_provider_name(settings: Settings) -> str:
         return found[0]
     if _ollama_up(ollama_url()):
         return "ollama"
-    raise LLMConfigError(
+    raise LLMNotConfigured(
         "No LLM is configured. Set one API key in .env (OPENAI_API_KEY, ANTHROPIC_API_KEY, GEMINI_API_KEY, "
         "GROQ_API_KEY, OPENROUTER_API_KEY, DEEPSEEK_API_KEY, MISTRAL_API_KEY, ...), run Ollama locally, "
         "or try the no-key demo:  python -m purffle_shorts demo"
@@ -130,24 +141,82 @@ def resolve_provider_name(settings: Settings) -> str:
 
 
 def extract_json(text: str) -> dict[str, Any]:
-    """Parse a JSON object out of a model reply that may include code fences or chatter."""
+    """Parse a JSON object out of a model reply that may include code fences or chatter.
+
+    Handles:
+    - Code fences (```json ... ```)
+    - Trailing commas in objects/arrays
+    - Multiple JSON objects (takes the first complete one)
+    - JSON with comments (strips // and /* */ comments)
+    - Unescaped newlines in strings
+    """
     t = text.strip()
+    # Remove code fences
     t = re.sub(r"^```(?:json)?\s*|\s*```$", "", t, flags=re.I | re.S).strip()
+
+    # Try direct parse first
     try:
         val = json.loads(t)
         if isinstance(val, dict):
             return val
     except json.JSONDecodeError:
         pass
+
+    # Try to find and extract a JSON object
     start, end = t.find("{"), t.rfind("}")
     if start != -1 and end > start:
         chunk = t[start:end + 1]
-        try:
-            return json.loads(chunk)
-        except json.JSONDecodeError:
-            # Trailing commas are the most common model mistake.
-            return json.loads(re.sub(r",\s*([}\]])", r"\1", chunk))
-    raise LLMError(f"Model did not return JSON: {text[:200]!r}")
+        # Try parsing with various fixes
+        for fix_func in [
+            lambda x: x,  # No fix
+            lambda x: re.sub(r",\s*([}\]])", r"\1", x),  # Fix trailing commas
+            lambda x: re.sub(r"//.*", "", x),  # Remove // comments
+            lambda x: re.sub(r"/\*.*?\*/", "", x, flags=re.DOTALL),  # Remove /* */ comments
+            lambda x: re.sub(r"(?<!\\)\n", "\\n", x),  # Escape unescaped newlines in strings
+            lambda x: re.sub(r"(?<!\\)\t", "\\t", x),  # Escape unescaped tabs
+        ]:
+            try:
+                fixed = fix_func(chunk)
+                val = json.loads(fixed)
+                if isinstance(val, dict):
+                    return val
+            except json.JSONDecodeError:
+                continue
+
+    # As a last resort, try to find any valid JSON object in the text
+    # Look for balanced braces
+    brace_count = 0
+    potential_starts = []
+    for i, ch in enumerate(t):
+        if ch == '{':
+            if brace_count == 0:
+                potential_starts.append(i)
+            brace_count += 1
+        elif ch == '}':
+            brace_count -= 1
+            if brace_count == 0 and potential_starts:
+                for start_idx in potential_starts:
+                    candidate = t[start_idx:i+1]
+                    try:
+                        val = json.loads(candidate)
+                        if isinstance(val, dict):
+                            return val
+                    except json.JSONDecodeError:
+                        # Try with fixes
+                        for fix_func in [
+                            lambda x: re.sub(r",\s*([}\]])", r"\1", x),
+                            lambda x: re.sub(r"//.*", "", x),
+                            lambda x: re.sub(r"/\*.*?\*/", "", x, flags=re.DOTALL),
+                        ]:
+                            try:
+                                val = json.loads(fix_func(candidate))
+                                if isinstance(val, dict):
+                                    return val
+                            except json.JSONDecodeError:
+                                continue
+                potential_starts = []
+
+    raise LLMError("Model did not return valid JSON (response content was not a complete JSON object)")
 
 
 class Provider:
@@ -185,13 +254,23 @@ class OpenAICompatible(Provider):
             payload["response_format"] = {"type": "json_object"}
         headers = {"Content-Type": "application/json"}
         if self.api_key:
-            headers["Authorization"] = f"Bearer {self.api_key}"
+            headers["Authorization"] = "Bearer " + self.api_key
         if self.name == "openrouter":
             headers["HTTP-Referer"] = "https://github.com/Chamanrajragu/purffle-shorts"
             headers["X-Title"] = "PurffleShorts"
         try:
-            r = http().post(f"{self.base_url}/chat/completions", json=payload, headers=headers, timeout=180)
+            started = time.perf_counter()
+            r = http().post(f"{self.base_url}/chat/completions", json=payload, headers=headers,
+                            timeout=_LLM_REQUEST_TIMEOUT)
+            elapsed = time.perf_counter() - started
+            log.debug("%s HTTP %d in %.2fs", self, r.status_code, elapsed)
             raise_for_status(r, f"{self}")
+        except requests.Timeout as e:
+            elapsed = time.perf_counter() - started
+            raise LLMError(
+                f"{self}: request timed out after {elapsed:.1f}s "
+                f"(connect/read limits {_LLM_REQUEST_TIMEOUT[0]}s/{_LLM_REQUEST_TIMEOUT[1]}s)"
+            ) from e
         except PermanentError as e:
             if "response_format" in payload and "response_format" in str(e):
                 self._json_mode = False  # endpoint doesn't support JSON mode; rely on prompt + parser
@@ -199,11 +278,24 @@ class OpenAICompatible(Provider):
             raise
         data = r.json()
         try:
-            content = data["choices"][0]["message"]["content"]
+            choice = data["choices"][0]
+            message = choice["message"]
+            finish_reason = choice.get("finish_reason")
+            content = message.get("content")
         except (KeyError, IndexError, TypeError) as e:
-            raise LLMError(f"{self}: unexpected response {str(data)[:200]}") from e
-        if not content:
-            raise LLMError(f"{self}: empty reply (finish_reason={data['choices'][0].get('finish_reason')})")
+            raise LLMError(f"{self}: unexpected response shape (HTTP {r.status_code})") from e
+        if not isinstance(choice, dict) or not isinstance(message, dict):
+            raise LLMError(f"{self}: unexpected response shape (HTTP {r.status_code})")
+        if isinstance(content, list):
+            content = "".join(
+                part["text"] for part in content
+                if isinstance(part, dict) and isinstance(part.get("text"), str)
+            )
+        if not isinstance(content, str) or not content.strip():
+            reasoning_note = "; reasoning_content is not final output" if message.get("reasoning_content") else ""
+            raise LLMError(f"{self}: empty reply (finish_reason={finish_reason}{reasoning_note})")
+        log.debug("%s finish_reason=%s usage=%s content_length=%d",
+                  self, finish_reason, data.get("usage"), len(content))
         return content
 
 
@@ -307,16 +399,32 @@ class LLM:
                       max_tokens: int = 4000) -> dict[str, Any]:
         errors = []
         for p in self.providers:
-            def _call(p=p):
-                text = p.complete(system, user, schema=schema if schema is not None else {}, max_tokens=max_tokens,
-                                  temperature=self.settings.llm_temperature)
-                return extract_json(text)
-            try:
-                result = with_retries(_call, attempts=2, base_delay=3, label=f"LLM {p}")
-                if p is not self.providers[0]:
-                    log.info("Used fallback LLM %s", p)
-                return result
-            except Exception as e:  # try the next provider
-                errors.append(f"{p}: {e}")
-                log.warning("LLM %s failed: %s", p, e)
+            limits = [max_tokens]
+            if max_tokens < 16000:
+                limits.append(min(max_tokens * 2, 16000))
+            for attempt, token_limit in enumerate(limits):
+                def _call(p=p, token_limit=token_limit):
+                    try:
+                        return p.complete(system, user, schema=schema if schema is not None else {},
+                                          max_tokens=token_limit, temperature=self.settings.llm_temperature)
+                    except LLMError as e:
+                        if "empty reply" in str(e).lower():
+                            raise PermanentError(str(e)) from e
+                        raise
+                try:
+                    text = with_retries(_call, attempts=1, label=f"LLM {p}")
+                    result = extract_json(text)
+                    if p is not self.providers[0]:
+                        log.info("Used fallback LLM %s", p)
+                    return result
+                except Exception as e:
+                    message = str(e).lower()
+                    is_incomplete = ("empty reply" in message or "model did not return valid json" in message)
+                    if attempt == 0 and is_incomplete and len(limits) > 1:
+                        log.warning("LLM %s returned an empty or invalid JSON response; retrying once with "
+                                    "%d output tokens", p, limits[1])
+                        continue
+                    errors.append(f"{p}: {e}")
+                    log.warning("LLM %s failed: %s", p, e)
+                    break
         raise LLMError("All LLM providers failed:\n  " + "\n  ".join(errors))

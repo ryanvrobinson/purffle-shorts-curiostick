@@ -8,7 +8,7 @@ Add it to your client's MCP config (it speaks MCP over stdio, standard library o
                                        "env": {"PURFFLE_HOME": "/path/to/your/purffle/folder"}}}}
 
 PURFFLE_HOME is the folder that holds your .env, credentials and output (defaults to the current folder).
-Uploading only happens when the client asks for it explicitly (upload: true).
+Generation always creates a draft. Publication requires a separate upload_video call with explicit approval.
 """
 
 from __future__ import annotations
@@ -18,10 +18,11 @@ import logging
 import sys
 import traceback
 from dataclasses import replace
+from pathlib import Path
 from typing import Any
 
 from . import __version__
-from .config import Settings
+from .config import MAX_TARGET_SECONDS, MIN_TARGET_SECONDS, Settings, clamp_target_seconds
 
 log = logging.getLogger("purffle")
 
@@ -34,32 +35,33 @@ _STYLE = {"type": "string", "enum": ["auto", "facts", "story", "listicle", "myth
 TOOLS: list[dict] = [
     {"name": "make_short",
      "description": "Write, voice and render a complete short video (script, voice, footage, captions, music) and "
-                    "return where it was saved. Takes 1-3 minutes. Does NOT upload unless upload is true.",
+                    "return where it was saved as a draft. Takes 1-3 minutes. Publishing requires a separate "
+                    "explicit upload_video call.",
      "inputSchema": {"type": "object", "properties": {
          "topic": {"type": "string", "description": "What the video is about. Empty = the app picks a topic."},
          "url": {"type": "string", "description": "Make the video from this web page (article, blog post)."},
          "style": _STYLE,
          "language": {"type": "string", "description": "Language code, e.g. en, es, hi, ta, fr, ja."},
-         "duration_seconds": {"type": "integer", "minimum": 10, "maximum": 170},
+         "duration_seconds": {"type": "integer", "minimum": MIN_TARGET_SECONDS, "maximum": MAX_TARGET_SECONDS},
          "aspect": {"type": "string", "enum": ["9:16", "16:9", "1:1", "4:5"]},
          "script": {"type": "object", "description": "A script from draft_script (optionally edited) to render "
                                                      "exactly, instead of writing a new one."},
          "also_languages": {"type": "array", "items": {"type": "string"},
                             "description": "Also make translated copies, e.g. [\"es\", \"hi\"]."},
-         "upload": {"type": "boolean", "description": "Upload to YouTube when done. Default false."},
          "demo": {"type": "boolean", "description": "No-key demo: sample script and generated backgrounds."}}}},
     {"name": "draft_script",
      "description": "Write (and self-review) a video script without rendering it. Returns the script JSON, which "
                     "can be edited and passed to make_short.",
      "inputSchema": {"type": "object", "properties": {
          "topic": {"type": "string"}, "url": {"type": "string"}, "style": _STYLE,
-         "language": {"type": "string"}, "duration_seconds": {"type": "integer", "minimum": 10, "maximum": 170}}}},
+         "language": {"type": "string"},
+         "duration_seconds": {"type": "integer", "minimum": MIN_TARGET_SECONDS, "maximum": MAX_TARGET_SECONDS}}}},
     {"name": "clip_video",
      "description": "Cut a long video (local file path, or URL if yt-dlp is installed) into short vertical clips "
                     "of its best moments, with captions. Only for videos the user owns or may reuse.",
      "inputSchema": {"type": "object", "required": ["source"], "properties": {
          "source": {"type": "string"}, "count": {"type": "integer", "minimum": 1, "maximum": 10},
-         "crop": {"type": "string", "enum": ["center", "blur"]}, "upload": {"type": "boolean"}}}},
+         "crop": {"type": "string", "enum": ["center", "blur"]}}}},
     {"name": "plan_ideas",
      "description": "Brainstorm specific video ideas and add them to the idea queue that the autopilot uses first.",
      "inputSchema": {"type": "object", "properties": {
@@ -68,8 +70,11 @@ TOOLS: list[dict] = [
      "description": "List recent videos with id, status, title, YouTube link and retention score.",
      "inputSchema": {"type": "object", "properties": {"limit": {"type": "integer", "minimum": 1, "maximum": 100}}}},
     {"name": "upload_video",
-     "description": "Upload (or schedule, if publish times are set) a rendered video to YouTube by its id.",
-     "inputSchema": {"type": "object", "required": ["id"], "properties": {"id": {"type": "integer"}}}},
+     "description": "Publish a reviewed video to YouTube. Call only after the user explicitly approves this "
+                    "specific upload; set approved=true to record that approval.",
+     "inputSchema": {"type": "object", "required": ["id", "approved"], "properties": {
+         "id": {"type": "integer"},
+         "approved": {"type": "boolean", "description": "True only after explicit user approval for this video."}}}},
 ]
 
 
@@ -82,7 +87,7 @@ class Server:
         from .config import aspect_resolution
         s = self.settings.with_overrides(
             style=a.get("style") or None, language=(a.get("language") or "").lower() or None,
-            target_seconds=max(10, min(170, int(a["duration_seconds"]))) if a.get("duration_seconds") else None)
+            target_seconds=clamp_target_seconds(a["duration_seconds"]) if a.get("duration_seconds") else None)
         if a.get("aspect") and aspect_resolution(a["aspect"]):
             s = replace(s, resolution=aspect_resolution(a["aspect"]))
         if a.get("demo"):
@@ -97,7 +102,7 @@ class Server:
         script = script_from_data(a["script"], s) if isinstance(a.get("script"), dict) else None
         r = studio.make(a.get("topic") or None, url=a.get("url") or None, script=script,
                         style=s.style if s.style in STYLES else None,
-                        upload=bool(a.get("upload")) and not s.offline, languages=a.get("also_languages") or [])
+                        upload=False, languages=a.get("also_languages") or [])
         if not r.ok:
             raise RuntimeError(r.error or "the video failed")
         lines = [_describe(r)] + [_describe(v) for v in r.variants]
@@ -112,7 +117,7 @@ class Server:
         from .clipper import make_clips
         from .pipeline import Studio
         results = make_clips(Studio(self.settings), a["source"], count=int(a.get("count") or 3),
-                             crop=a.get("crop") or "center", upload=bool(a.get("upload")))
+                             crop=a.get("crop") or "center", upload=False)
         return "\n\n".join(_describe(r) for r in results) or "No clips were made."
 
     def plan_ideas(self, a: dict) -> str:
@@ -138,7 +143,36 @@ class Server:
 
     def upload_video(self, a: dict) -> str:
         from .pipeline import Studio
-        status = Studio(self.settings).upload_record(int(a["id"]))
+        studio = Studio(self.settings)
+        record = studio.history.get(int(a["id"]))
+        if not record:
+            return f"Video #{a['id']}: missing"
+        if a.get("approved") is not True:
+            raise ValueError("set approved=true only after reviewing this video's preview, script, captions, "
+                             "source warnings, metadata, visibility and schedule")
+        from .history import now_iso
+
+        approved_at = now_iso()
+        metadata_path = Path(record["folder"]) / "metadata.json" if record.get("folder") else None
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8")) if (
+            metadata_path and metadata_path.exists()) else {}
+        approval = {
+            "approved_at": approved_at,
+            "platform": "youtube",
+            "video_path": record.get("video_path"),
+            "title": record.get("title"),
+            "description": record.get("description"),
+            "tags": record.get("tags"),
+            "visibility": self.settings.privacy,
+            "source_references": (metadata.get("research") or {}).get("references", []),
+        }
+        if not studio.history.approve_video(int(a["id"]), approved_at, approval):
+            return f"Video #{a['id']}: already published or approval could not be saved"
+        if metadata_path:
+            metadata["approval_status"] = "approved"
+            metadata["approval"] = approval
+            metadata_path.write_text(json.dumps(metadata, indent=2, ensure_ascii=False), encoding="utf-8")
+        status = studio.upload_record(int(a["id"]))
         return f"Video #{a['id']}: {status}"
 
     # ---------------------------------------------------------------- protocol

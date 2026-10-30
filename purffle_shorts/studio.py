@@ -25,7 +25,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from . import __version__
-from .config import ASPECTS, Settings, aspect_resolution
+from .config import ASPECTS, Settings, aspect_resolution, clamp_target_seconds
+from .history import now_iso
 
 log = logging.getLogger("purffle")
 
@@ -143,7 +144,7 @@ class StudioServer:
         }
         if p.get("duration"):
             try:
-                ov["target_seconds"] = max(10, min(170, int(p["duration"])))
+                ov["target_seconds"] = clamp_target_seconds(p["duration"])
             except (TypeError, ValueError):
                 pass
         if p.get("aspect") in ASPECTS:
@@ -206,7 +207,7 @@ class StudioServer:
         if job.kind == "clip":
             from .clipper import make_clips
             results = make_clips(studio, str(p.get("source") or ""), count=int(p.get("count") or 3),
-                                 crop=p.get("crop") or "center", upload=bool(p.get("upload")),
+                                 crop=p.get("crop") or "center", upload=False,
                                  min_seconds=int(p.get("min_seconds") or 20), max_seconds=int(p.get("max_seconds") or 58))
             job.result = {"clips": [_result(r) for r in results]}
             return any(r.ok for r in results)
@@ -215,7 +216,7 @@ class StudioServer:
         langs = p.get("also_langs")
         if isinstance(langs, str):
             langs = [x.strip().lower() for x in langs.split(",") if x.strip()]
-        r = studio.make(p.get("topic") or None, source=p.get("source") or None, upload=bool(p.get("upload")),
+        r = studio.make(p.get("topic") or None, source=p.get("source") or None, upload=False,
                         style=s.style if s.style != "auto" else None, script=script, url=p.get("url") or None,
                         languages=[str(x)[:8] for x in (langs or [])][:6])
         job.result = _result(r)
@@ -510,6 +511,31 @@ def _handler(app: StudioServer, bound_host: str):
             m = re.fullmatch(r"/api/upload/(\d+)", path)
             if m:
                 rec = h.get(int(m.group(1)))
+                if body.get("approve") is not True:
+                    return self._json({"error": "explicit per-video approval is required"}, 400)
+                if not rec:
+                    return self._json({"error": "video record not found"}, 404)
+                approved_at = now_iso()
+                metadata_path = Path(rec["folder"]) / "metadata.json" if rec.get("folder") else None
+                metadata = json.loads(metadata_path.read_text(encoding="utf-8")) if (
+                    metadata_path and metadata_path.exists()) else {}
+                research = metadata.get("research") or {}
+                approval = {
+                    "approved_at": approved_at,
+                    "platform": "youtube",
+                    "video_path": rec.get("video_path"),
+                    "title": rec.get("title"),
+                    "description": rec.get("description"),
+                    "tags": rec.get("tags"),
+                    "visibility": app.settings.privacy,
+                    "source_references": research.get("references", []),
+                }
+                if not h.approve_video(int(rec["id"]), approved_at, approval):
+                    return self._json({"error": "video is already published or approval could not be saved"}, 409)
+                if metadata_path:
+                    metadata["approval_status"] = "approved"
+                    metadata["approval"] = approval
+                    metadata_path.write_text(json.dumps(metadata, indent=2, ensure_ascii=False), encoding="utf-8")
                 label = f"Upload: {rec['title']}" if rec else f"Upload #{m.group(1)}"
                 return self._json({"job": app.submit("upload", {"id": int(m.group(1))}, label).id})
             m = re.fullmatch(r"/api/videos/(\d+)/delete", path)

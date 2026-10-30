@@ -1,3 +1,9 @@
+﻿import os
+from io import BytesIO
+
+import pytest
+from PIL import Image
+
 from purffle_shorts import media as M
 from purffle_shorts.config import Settings
 
@@ -42,13 +48,16 @@ def test_pexels_videos_parse(monkeypatch):
     assert sess.params[0]["orientation"] == "portrait"
 
 
-def test_pixabay_prefers_medium(monkeypatch):
-    data = {"hits": [{"id": 3, "duration": 9, "user": "bob", "videos": {
+def test_pixabay_prefers_medium_and_exposes_tags(monkeypatch):
+    data = {"hits": [{"id": 3, "duration": 9, "user": "bob", "tags": "octopus, underwater, coral",
+                      "pageURL": "https://pixabay.com/videos/x-3/", "videos": {
         "large": {"url": "L", "width": 3840, "height": 2160},
         "medium": {"url": "Md", "width": 1920, "height": 1080},
         "small": {"url": "", "width": 0, "height": 0}}}]}
     monkeypatch.setattr(M, "http", lambda: S(data))
-    assert M.pixabay_videos("x", "k")[0].url == "Md"
+    item = M.pixabay_videos("x", "k")[0]
+    assert item.url == "Md"
+    assert item.extra["tags"] == ["octopus", "underwater", "coral"]
     assert M.pixabay_videos("x", "k", prefer_4k=True)[0].url == "L"
 
 
@@ -64,10 +73,130 @@ def test_simplify_query():
     assert M.simplify_query("The octopus in the deep ocean") == "octopus deep"
 
 
-def test_no_footage_falls_back_to_generated(tmp_path):
+def test_no_footage_falls_back_to_generated(tmp_path, caplog):
+    import logging
     v = M.Visuals(Settings(visual_sources=["local"], media_dir=str(tmp_path / "none")))
-    item = v.for_scene(0, "octopus", "octopus", "sea", 3.0, tmp_path)
+    with caplog.at_level(logging.WARNING):
+        item = v.for_scene(0, "octopus", "octopus", "sea", 3.0, tmp_path)
     assert item.kind == "generated"
+    assert "no real visual" in caplog.text and "animated gradient" in caplog.text
+    assert v.reports[0]["chosen"] is None and "no usable stock" in v.reports[0]["reason"]
+
+
+class FetchResp:
+    def __init__(self, data, status=200):
+        self._data, self.status_code, self.text = data, status, ""
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise RuntimeError(f"HTTP {self.status_code}")
+
+    def iter_content(self, chunk_size=65536):
+        for i in range(0, len(self._data), chunk_size):
+            yield self._data[i:i + chunk_size]
+
+
+class FetchSession:
+    def __init__(self, data, status=200):
+        self.data, self.status, self.calls = data, status, []
+
+    def get(self, url, headers=None, timeout=None, stream=False):
+        self.calls.append({"url": url, "headers": headers or {}, "stream": stream})
+        return FetchResp(self.data, self.status)
+
+
+def _noise_png() -> bytes:
+    image = Image.frombytes("RGB", (200, 200), os.urandom(200 * 200 * 3))
+    buf = BytesIO()
+    image.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def test_pixabay_download_sends_referer_and_accepts_a_real_image(tmp_path, monkeypatch):
+    sess = FetchSession(_noise_png())
+    monkeypatch.setattr(M, "http", lambda: sess)
+    v = M.Visuals(Settings(visual_sources=["pixabay"], pixabay_api_key="k"))
+    item = M.MediaItem("pixabay-photo", "42", "image", url="https://cdn.pixabay.com/photo/x.jpg")
+    out = v._fetch(item, tmp_path, 0)
+    assert out.path.exists() and out.path.stat().st_size > 10000
+    assert out.extra["validated"] is True
+    assert sess.calls[0]["stream"] is True
+    assert "Referer" in sess.calls[0]["headers"] and "User-Agent" in sess.calls[0]["headers"]
+
+
+def test_pixabay_download_rejects_tiny_file(tmp_path, monkeypatch):
+    monkeypatch.setattr(M, "http", lambda: FetchSession(b"nope"))
+    v = M.Visuals(Settings(visual_sources=["pixabay"], pixabay_api_key="k"))
+    item = M.MediaItem("pixabay-photo", "43", "image", url="https://cdn.pixabay.com/photo/x.jpg")
+    with pytest.raises(RuntimeError, match="invalid file"):
+        v._fetch(item, tmp_path, 0)
+
+
+def test_download_validation_rejects_an_html_error_page(tmp_path, monkeypatch):
+    path = tmp_path / "fake.mp4"
+    path.write_bytes(b"<html>" * 4000)
+    monkeypatch.setattr(M.ffmpeg, "probe", lambda _: (_ for _ in ()).throw(RuntimeError("no stream")))
+    with pytest.raises(RuntimeError, match="unreadable"):
+        M.validate_download("video", path)
+
+
+def test_relevance_uses_tags_not_photographer_credit():
+    v = M.Visuals(Settings())
+    good = M.MediaItem("pixabay", "1", "video", credit="Ann", extra={"tags": ["octopus", "coral"]})
+    bad = M.MediaItem("pixabay", "2", "video", credit="Octopus Photographer", extra={"tags": ["beach", "sunset"]})
+    kept = v._filter_relevant([good, bad], "octopus swimming", "octopus")
+    assert [i.id for i in kept] == ["1"]
+
+
+def test_stock_video_is_selected_before_agnes_even_when_agnes_is_listed_first(tmp_path, monkeypatch):
+    candidate = M.MediaItem("pixabay", "17", "video", url="https://example.invalid/clip.mp4",
+                            width=1080, height=1920, duration=8, extra={"tags": ["octopus"]})
+    monkeypatch.setattr(M, "pixabay_videos", lambda *args, **kwargs: [candidate])
+    monkeypatch.setattr(M, "pixabay_photos", lambda *args, **kwargs: [])
+    agnes_calls = []
+    monkeypatch.setattr(M, "agnes_image", lambda *args, **kwargs: agnes_calls.append(args))
+    v = M.Visuals(Settings(visual_sources=["agnes", "pixabay"], pixabay_api_key="k", agnes_api_key="a"))
+    monkeypatch.setattr(v, "_fetch", lambda item, *args: item)
+
+    selected = v.for_scene(0, "octopus", "octopus", "ocean", 4.0, tmp_path)
+
+    assert selected.source == "pixabay" and selected.kind == "video"
+    assert agnes_calls == []
+    assert v.reports[0]["chosen"]["kind"] == "video"
+    assert "video" in v.reports[0]["reason"]
+
+
+def test_stock_photo_used_when_no_videos_and_reason_is_reported(tmp_path, monkeypatch, caplog):
+    photo = M.MediaItem("pixabay-photo", "22", "image", url="https://example.invalid/p.jpg",
+                        width=1080, height=1920, extra={"tags": ["octopus"]})
+    monkeypatch.setattr(M, "pixabay_videos", lambda *args, **kwargs: [])
+    monkeypatch.setattr(M, "pixabay_photos", lambda *args, **kwargs: [photo])
+    v = M.Visuals(Settings(visual_sources=["pixabay"], pixabay_api_key="k"))
+    monkeypatch.setattr(v, "_fetch", lambda item, *args: item)
+
+    with caplog.at_level("WARNING"):
+        selected = v.for_scene(0, "octopus", "octopus", "ocean", 4.0, tmp_path)
+
+    assert selected.kind == "image"
+    assert "no suitable stock video" in v.reports[0]["reason"]
+    assert "no suitable stock video" in caplog.text
+
+
+def test_missing_stock_key_is_reported_and_ai_fallback_is_explicit(tmp_path, monkeypatch, caplog):
+    def fake_agnes(prompt, dest, key, model, orientation):
+        dest.write_bytes(b"image")
+        return dest
+
+    monkeypatch.setattr(M, "agnes_image", fake_agnes)
+    v = M.Visuals(Settings(visual_sources=["pixabay", "agnes"], agnes_api_key="a"))
+
+    with caplog.at_level("WARNING"):
+        selected = v.for_scene(0, "octopus", "octopus", "ocean", 4.0, tmp_path)
+
+    assert selected.source == "agnes"
+    assert "PIXABAY_API_KEY is not set" in caplog.text
+    assert "no usable stock video or photo" in v.reports[0]["reason"]
+    assert "generated an AI image" in v.reports[0]["reason"]
 
 
 def test_pollinations_payment_required_stops_asking(monkeypatch, tmp_path, caplog):
@@ -81,3 +210,195 @@ def test_pollinations_payment_required_stops_asking(monkeypatch, tmp_path, caplo
     items = [v.for_scene(i, "cat", "a cat", "cats", 3.0, tmp_path) for i in range(4)]
     assert calls == ["pk_x"] and all(i.kind == "generated" for i in items)
     assert "POLLINATIONS_API_KEY" in caplog.text and caplog.text.count("refused") == 1
+
+
+def _png_bytes(size: tuple[int, int] = (512, 512)) -> bytes:
+    buf = BytesIO()
+    Image.new("RGB", size, "#FF7A18").save(buf, "PNG")
+    return buf.getvalue()
+
+
+def test_agnes_image_posts_bearer_key_and_writes_base64(monkeypatch, tmp_path):
+    import base64
+
+    payload = _png_bytes()
+
+    class PostResponse:
+        status_code = 200
+        text = ""
+
+        def json(self):
+            return {"data": [{"b64_json": base64.b64encode(payload).decode()}]}
+
+    class PostSession:
+        def __init__(self):
+            self.call = None
+
+        def post(self, url, json=None, headers=None, timeout=None):
+            self.call = {"url": url, "json": json, "headers": headers, "timeout": timeout}
+            return PostResponse()
+
+    session = PostSession()
+    monkeypatch.setattr(M, "http", lambda: session)
+    dest = tmp_path / "scene.png"
+    result = M.agnes_image("cinematic octopus", dest, "test-key", "agnes-image-2.5-flash", "portrait")
+
+    assert result == dest
+    assert dest.read_bytes() == payload
+    assert session.call["url"] == "https://apihub.agnes-ai.com/v1/images/generations"
+    assert session.call["headers"]["Authorization"] == "Bearer test-key"
+    assert session.call["json"]["model"] == "agnes-image-2.5-flash"
+    assert session.call["json"]["size"] == "1024x1536"
+
+
+def test_generated_image_validation_rejects_non_images(tmp_path):
+    path = tmp_path / "not-an-image.png"
+    path.write_bytes(b"<html>payment required</html>" * 100)
+    with pytest.raises(RuntimeError, match="unreadable"):
+        M.validate_generated_image(path)
+
+
+def test_generated_image_validation_rejects_tiny_images(tmp_path):
+    path = tmp_path / "tiny.png"
+    Image.frombytes("RGB", (128, 128), os.urandom(128 * 128 * 3)).save(path, "PNG")
+    with pytest.raises(RuntimeError, match="below.*minimum"):
+        M.validate_generated_image(path)
+
+
+def test_generated_image_validation_accepts_a_real_image(tmp_path):
+    path = tmp_path / "scene.png"
+    path.write_bytes(_png_bytes((512, 512)))
+    assert M.validate_generated_image(path) == (512, 512)
+
+
+def test_agnes_is_selected_as_a_generated_visual(monkeypatch, tmp_path):
+    calls = []
+
+    def fake_agnes(prompt, dest, key, model, orientation):
+        calls.append((prompt, key, model, orientation))
+        dest.write_bytes(b"image")
+        return dest
+
+    monkeypatch.setattr(M, "agnes_image", fake_agnes)
+    settings = Settings(visual_sources=["agnes"], agnes_api_key="test-key")
+    visual = M.Visuals(settings)
+    item = visual.for_scene(0, "octopus", "detailed octopus", "ocean life", 3.0, tmp_path)
+
+    assert item.source == "agnes"
+    assert item.kind == "image"
+    assert item.path.exists()
+    assert calls and calls[0][1] == "test-key"
+
+
+def test_ai_is_used_only_after_stock_sources_are_exhausted(monkeypatch, tmp_path):
+    candidate = M.MediaItem("pixabay", "17", "video", url="https://example.invalid/clip.mp4",
+                            width=1080, height=1920, duration=5, extra={"tags": ["neutron"]})
+    monkeypatch.setattr(M, "pixabay_videos", lambda *args, **kwargs: [candidate])
+    monkeypatch.setattr(M, "pixabay_photos", lambda *args, **kwargs: [])
+    visual = M.Visuals(Settings(visual_sources=["agnes", "pixabay"], pixabay_api_key="fake-pixabay-key"))
+    monkeypatch.setattr(visual, "_fetch", lambda item, *args: item)
+
+    selected = visual.for_scene(0, "neutron star", "neutron star", "space", 3.0, tmp_path)
+
+    assert selected.source == "pixabay"
+
+
+def test_hybrid_mode_alternates_pixabay_clips_and_agnes_images(monkeypatch, tmp_path):
+    def videos(query, *args, **kwargs):
+        return [M.MediaItem("pixabay", f"v-{query}", "video", url=f"https://example.invalid/{query}.mp4",
+                            width=1080, height=1920, duration=5, extra={"tags": query.split()})]
+
+    prompts = []
+
+    def agnes(prompt, dest, *args, **kwargs):
+        prompts.append(prompt)
+        dest.write_bytes(b"fake-image")
+        return dest
+
+    monkeypatch.setattr(M, "pixabay_videos", videos)
+    monkeypatch.setattr(M, "pixabay_photos", lambda *args, **kwargs: [])
+    monkeypatch.setattr(M, "agnes_image", agnes)
+    visual = M.Visuals(Settings(visual_sources=["pixabay", "agnes"], pixabay_api_key="fake-pixabay-key",
+                                agnes_api_key="fake-agnes-key", visual_mode="hybrid", hybrid_image_every=2))
+    monkeypatch.setattr(visual, "_fetch", lambda item, *args: item)
+    jobs = [(f"ocean {i}", f"prompt {i}", 3.0, f"narration {i}") for i in range(5)]
+
+    selected = visual.for_scenes(jobs, "ocean", tmp_path)
+
+    assert [(m.source, m.kind) for m in selected] == [
+        ("pixabay", "video"), ("agnes", "image"), ("pixabay", "video"),
+        ("agnes", "image"), ("pixabay", "video")]
+    assert len(prompts) == 2
+    assert "prompt 1" in prompts[0] and "narration 1" in prompts[0]
+    assert "prompt 3" in prompts[1] and "narration 3" in prompts[1]
+    assert visual.reports[1]["reason"].startswith("hybrid mode")
+    assert visual.reports[1]["chosen"]["source"] == "agnes"
+
+
+def test_hybrid_ai_failure_falls_back_to_stock(monkeypatch, tmp_path, caplog):
+    candidate = M.MediaItem("pixabay", "18", "video", url="https://example.invalid/clip.mp4",
+                            width=1080, height=1920, duration=5, extra={"tags": ["ocean"]})
+    monkeypatch.setattr(M, "pixabay_videos", lambda *args, **kwargs: [candidate])
+    monkeypatch.setattr(M, "pixabay_photos", lambda *args, **kwargs: [])
+
+    def fail(*args, **kwargs):
+        raise RuntimeError("quota exceeded")
+
+    monkeypatch.setattr(M, "agnes_image", fail)
+    visual = M.Visuals(Settings(visual_sources=["pixabay", "agnes"], pixabay_api_key="fake-pixabay-key",
+                                agnes_api_key="fake-agnes-key", visual_mode="hybrid"))
+    monkeypatch.setattr(visual, "_fetch", lambda item, *args: item)
+
+    selected = visual.for_scene(0, "ocean", "ocean", "ocean", 3.0, tmp_path, prefer_image=True,
+                                narration="An octopus has three hearts.")
+
+    assert selected.source == "pixabay"
+    assert visual.reports[0]["chosen"]["source"] == "pixabay"
+    assert "hybrid AI image unavailable" in visual.reports[0]["reason"]
+    assert "falling back to stock footage" in caplog.text
+
+
+def test_hybrid_missing_ai_key_reports_and_uses_stock(monkeypatch, tmp_path, caplog):
+    candidate = M.MediaItem("pixabay", "19", "video", url="https://example.invalid/clip.mp4",
+                            width=1080, height=1920, duration=5, extra={"tags": ["ocean"]})
+    monkeypatch.setattr(M, "pixabay_videos", lambda *args, **kwargs: [candidate])
+    monkeypatch.setattr(M, "pixabay_photos", lambda *args, **kwargs: [])
+    monkeypatch.setattr(M, "agnes_image", lambda *args, **kwargs: pytest.fail("must not call Agnes without a key"))
+    visual = M.Visuals(Settings(visual_sources=["pixabay", "agnes"], pixabay_api_key="fake-pixabay-key",
+                                agnes_api_key="", visual_mode="hybrid"))
+    monkeypatch.setattr(visual, "_fetch", lambda item, *args: item)
+
+    selected = visual.for_scene(0, "ocean", "ocean", "ocean", 3.0, tmp_path, prefer_image=True)
+
+    assert selected.source == "pixabay"
+    assert "AGNES_API_KEY is not set" in caplog.text
+    assert "hybrid AI image unavailable" in visual.reports[0]["reason"]
+
+
+def test_stock_download_failure_tries_another_candidate_before_ai(monkeypatch, tmp_path):
+    candidates = [
+        M.MediaItem("pixabay", "20", "video", url="https://example.invalid/a.mp4",
+                    width=1080, height=1920, duration=5, extra={"tags": ["ocean"]}),
+        M.MediaItem("pixabay", "21", "video", url="https://example.invalid/b.mp4",
+                    width=1080, height=1920, duration=5, extra={"tags": ["ocean"]}),
+    ]
+    downloads = []
+
+    def fetch(item, *args):
+        downloads.append(item.id)
+        if len(downloads) == 1:
+            raise RuntimeError("403 from CDN")
+        return item
+
+    monkeypatch.setattr(M, "pixabay_videos", lambda *args, **kwargs: candidates)
+    monkeypatch.setattr(M, "pixabay_photos", lambda *args, **kwargs: [])
+    monkeypatch.setattr(M, "agnes_image", lambda *args, **kwargs: pytest.fail("stock retry should succeed"))
+    visual = M.Visuals(Settings(visual_sources=["pixabay", "agnes"], pixabay_api_key="fake-pixabay-key",
+                                agnes_api_key="fake-agnes-key"))
+    monkeypatch.setattr(visual, "_fetch", fetch)
+
+    selected = visual.for_scene(0, "ocean", "ocean", "ocean", 3.0, tmp_path)
+
+    assert len(downloads) == 2
+    assert selected.id == downloads[1] and selected.kind == "video"
+    assert any(a["result"] == "download-failed" for a in visual.reports[0]["attempts"])

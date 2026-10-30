@@ -40,6 +40,11 @@ VIDEO_COLUMNS = {
     "score": "INTEGER",            # Script Doctor retention score, 0-100
     "parent_id": "INTEGER",        # the original video when this one is a translated copy
     "views": "INTEGER", "likes": "INTEGER", "comments": "INTEGER", "stats_at": "TEXT",
+    "approval_status": "TEXT NOT NULL DEFAULT 'pending'",
+    "approved_at": "TEXT",
+    "approval_json": "TEXT",
+    "research_json": "TEXT",
+    "review_json": "TEXT",
 }
 
 
@@ -92,6 +97,21 @@ class History:
             return
         sets = ", ".join(f"{k} = ?" for k in fields)
         self._exec(f"UPDATE videos SET {sets} WHERE id = ?", (*fields.values(), vid))
+
+    def approve_video(self, vid: int, approved_at: str, approval: dict) -> bool:
+        """Persist explicit per-video publication approval without changing render state."""
+        with self._db() as c:
+            row = c.execute(
+                "SELECT status, youtube_id, approval_status FROM videos WHERE id = ?", (vid,)
+            ).fetchone()
+            if (not row or row["youtube_id"] or row["status"] in ("uploaded", "scheduled")
+                    or row["approval_status"] == "approved"):
+                return False
+            c.execute(
+                "UPDATE videos SET approval_status = 'approved', approved_at = ?, approval_json = ? WHERE id = ?",
+                (approved_at, json.dumps(approval, ensure_ascii=False), vid),
+            )
+            return True
 
     def get(self, vid: int) -> dict | None:
         rows = self._all("SELECT * FROM videos WHERE id = ?", (vid,))

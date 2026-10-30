@@ -19,6 +19,23 @@ def test_parse_resolution_fallback():
     assert parse_resolution("garbage") == (1080, 1920)
 
 
+def test_hybrid_visual_env_settings(monkeypatch):
+    monkeypatch.setenv("VISUAL_MODE", "Hybrid")
+    monkeypatch.setenv("HYBRID_IMAGE_EVERY", "3")
+    s = Settings.from_env()
+    assert s.visual_mode == "hybrid"
+    assert s.hybrid_image_every == 3
+    monkeypatch.setenv("HYBRID_IMAGE_EVERY", "1")
+    assert Settings.from_env().hybrid_image_every == 2
+
+
+def test_target_seconds_is_clamped_to_the_supported_range(monkeypatch):
+    assert Settings(target_seconds=10).target_seconds == 15
+    assert Settings(target_seconds=500).target_seconds == 170
+    monkeypatch.setenv("TARGET_SECONDS", "10")
+    assert Settings.from_env().target_seconds == 15
+
+
 def test_watermark_defaults_to_channel():
     assert Settings(channel_name="Chan").watermark_text == "Chan"
     assert Settings(watermark="none").watermark_text == ""
@@ -37,6 +54,18 @@ def test_history_roundtrip(tmp_path):
     h.mark_topic("Trend:X")
     assert h.topic_used("trend:x")
     assert h.recent_titles() == ["T"]
+
+
+def test_approval_persists_across_history_reopen(tmp_path):
+    path = tmp_path / "h.db"
+    h = History(path)
+    vid = h.add_video(title="Review me", status="rendered")
+    assert h.approve_video(vid, "2026-10-21T12:00:00+00:00", {"platform": "youtube"})
+    reopened = History(path).get(vid)
+    assert reopened["approval_status"] == "approved"
+    assert reopened["approved_at"] == "2026-10-21T12:00:00+00:00"
+    assert reopened["approval_json"] == '{"platform": "youtube"}'
+    assert not h.approve_video(vid, "later", {})
 
 
 def test_redact_hides_keys_in_urls():
@@ -63,6 +92,20 @@ def test_env_file_is_read_from_the_working_folder(tmp_path, monkeypatch):
     monkeypatch.delenv("PURFFLE_TEST_FROM_CWD", raising=False)
     load_env()
     assert os.environ["PURFFLE_TEST_FROM_CWD"] == "yes"
+
+
+def test_agnes_key_is_loaded_from_cwd_env_without_exposing_it(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("AGNES_API_KEY", raising=False)
+    (tmp_path / ".env").write_text("AGNES_API_KEY=test-only-placeholder\n", encoding="utf-8")
+    assert Settings.from_env().agnes_api_key == "test-only-placeholder"
+
+
+def test_nonempty_process_agnes_key_overrides_env_file(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".env").write_text("AGNES_API_KEY=dotenv-placeholder\n", encoding="utf-8")
+    monkeypatch.setenv("AGNES_API_KEY", "process-placeholder")
+    assert Settings.from_env().agnes_api_key == "process-placeholder"
 
 
 def test_env_example_works_as_a_docker_env_file(monkeypatch):

@@ -5,9 +5,11 @@ import pytest
 from purffle_shorts.config import Settings
 from purffle_shorts.script import (
     Script,
+    ScriptQualityError,
     build_prompt,
     normalize,
     offline_script,
+    review_prompt,
     review_script,
     scene_plan,
     script_from_data,
@@ -77,6 +79,9 @@ def test_prompt_carries_format_rules_and_channel_insights():
     assert "text message" in user and '"Me"' in user and "What performed best: X" in user
     _, user = build_prompt("cats", "facts", Settings(), [])
     assert 'speaker is always "A"' in user
+    assert "name the subject and its concrete consequence" in user
+    _, rewrite = review_prompt(_draft(), Settings(), True)
+    assert "scientifically" in rewrite and "defensible question or consequence" in rewrite
 
 
 def _draft(words=10, n=4):
@@ -96,8 +101,80 @@ def test_doctor_rewrite_is_used_when_sane():
 
 def test_doctor_rewrite_with_wrong_length_is_ignored():
     llm = FakeLLM({"score": 40, "issues": ["too long"], "script": {"title": "Bloated", "scenes": _scenes(30, 20)}})
-    out = review_script(llm, _draft(), Settings(target_seconds=16))
-    assert out.title == "Draft" and out.score == 40
+    with pytest.raises(ScriptQualityError, match="rendering was stopped"):
+        review_script(llm, _draft(), Settings(target_seconds=16))
+    assert len(llm.calls) == 2
+
+
+def test_doctor_stops_after_bounded_attempts_if_score_stays_low():
+    replies = iter([
+        {"score": 45, "issues": ["The hook is vague"], "script": None},
+        {"score": 68, "issues": ["The opening still lacks a concrete consequence"], "script": None},
+    ])
+    llm = FakeLLM(lambda user: next(replies))
+    with pytest.raises(ScriptQualityError, match="68.*70.*2 bounded review"):
+        review_script(llm, _draft(), Settings(script_quality_threshold=70))
+    assert len(llm.calls) == 2
+
+
+def test_final_low_score_stops_make_before_rendering(tmp_path, monkeypatch):
+    from purffle_shorts import pipeline
+    from purffle_shorts.script import SCRIPT_SCHEMA
+
+    data = {
+        "topic": "neutron stars",
+        "title": "A neutron star question",
+        "hook_text": "WHAT HAPPENS?",
+        "scenes": [
+            {"narration": "Neutron stars are compact remnants formed after some massive stars collapse.",
+             "search_query": "neutron star", "image_prompt": "neutron star in space"}
+            for _ in range(5)
+        ],
+        "description": "A science explanation.",
+        "hashtags": [],
+        "tags": [],
+        "category": "science",
+    }
+
+    class FakeLLM:
+        label = "fake:model"
+
+        def __init__(self):
+            self.reviews = 0
+
+        def complete_json(self, system, user, schema=None, max_tokens=4000):
+            if schema is SCRIPT_SCHEMA:
+                return data
+            self.reviews += 1
+            return {"score": 45, "issues": ["The hook is vague"], "script": data}
+
+    settings = Settings(target_seconds=16, script_review="rewrite", output_dir=str(tmp_path / "out"),
+                        data_dir=str(tmp_path / "data"))
+    studio = pipeline.Studio(settings)
+    llm = FakeLLM()
+    studio._llm = llm
+    monkeypatch.setattr(studio, "produce", lambda *args, **kwargs: pytest.fail("low-score script was rendered"))
+
+    result = studio.make(topic="neutron stars", upload=False)
+
+    assert not result.ok and "below the 70-point threshold" in result.error
+    assert llm.reviews == 2
+
+
+def test_low_score_gets_one_bounded_second_review():
+    better = {"title": "Specific", "hook_text": "A precise hook", "scenes": _scenes(5, 9)}
+
+    def replies(user):
+        if len(llm.calls) == 1:
+            return {"score": 45, "issues": ["The hook is vague"], "script": better}
+        assert "same subject" in user
+        return {"score": 82, "issues": [], "script": better}
+
+    llm = FakeLLM(replies)
+    out = review_script(llm, _draft(), Settings(target_seconds=16, script_quality_threshold=70))
+
+    assert out.title == "Specific" and out.score == 82
+    assert len(llm.calls) == 2
 
 
 def test_doctor_failure_never_fails_the_video():

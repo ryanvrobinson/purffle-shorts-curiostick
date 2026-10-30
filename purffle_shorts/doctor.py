@@ -55,7 +55,7 @@ def checks(s: Settings) -> list[dict]:
                 "few minutes, so most scenes fall back to gradients. Set POLLINATIONS_API_KEY")
             continue
         need = {"pexels": s.pexels_api_key, "pixabay": s.pixabay_api_key, "openai-images": s.openai_api_key,
-                "pollinations": s.pollinations_api_key}.get(src, "n/a")
+                "pollinations": s.pollinations_api_key, "agnes": s.agnes_api_key}.get(src, "n/a")
         usable += bool(need)
         add(True if need else None, f"Visual source {src}",
             "key found" if need and need != "n/a" else ("no key needed" if need == "n/a" else "API key missing"))

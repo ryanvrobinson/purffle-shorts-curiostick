@@ -118,7 +118,8 @@ def test_translated_copy_reuses_the_footage(fast, monkeypatch, tmp_path):
     searches = []
     real = P.Visuals.for_scenes
     monkeypatch.setattr(P.Visuals, "for_scenes", lambda self, *a: searches.append(a) or real(self, *a))
-    s = fast.with_overrides(offline=False, visual_sources=["local"], media_dir=str(tmp_path / "none"))
+    s = fast.with_overrides(offline=False, visual_sources=["local"], media_dir=str(tmp_path / "none"),
+                            script_quality_threshold=0)
     studio = P.Studio(s)
     r = studio.make("cats", languages=["es", "en"])
     assert r.ok, r.error

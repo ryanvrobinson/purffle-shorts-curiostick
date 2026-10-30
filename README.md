@@ -41,9 +41,9 @@ uvx --from git+https://github.com/Chamanrajragu/purffle-shorts purffle-shorts de
 
 ## 🤖 What is PurffleShorts?
 
-PurffleShorts is a **YouTube Shorts automation tool** for faceless channels. Start it and it keeps going: fresh topic, retention-focused script that a second AI pass reviews and tightens, natural AI voiceover, relevant footage, captions synced to each spoken word, a polished render, and an upload or scheduled release. It stays inside YouTube's daily API quota.
+PurffleShorts is a **YouTube Shorts production tool** for faceless channels. It can plan topics, draft and review scripts, generate narration and visuals, sync captions, and render a video locally. Every video remains a draft until you review and explicitly approve its upload or schedule.
 
-Beyond the autopilot, it is a small studio: draft a script and edit any line before rendering, make **two-voice dialogues**, **text-message stories** and **Reddit-style stories**, turn an article or a Reddit post into a Short, **clip a podcast into Shorts** (an Opus Clip-style workflow that runs on your computer), publish the same video in **several languages**, plan a week of ideas in one go, and let the channel's own view counts steer new scripts.
+Beyond draft production, it is a small studio: draft a script and edit any line before rendering, make **two-voice dialogues**, **text-message stories** and **Reddit-style stories**, turn an article or a Reddit post into a Short, **clip a podcast into Shorts** (an Opus Clip-style workflow that runs on your computer), prepare translations, plan ideas, and optionally use channel view counts to inform new scripts.
 
 It is made for **content creators**, **faceless YouTube channels**, **educators** and **marketers** who want short-form video at volume without editing by hand. It runs on your own computer (macOS, Windows, Linux or Docker), you pick every model, and the vertical 9:16 MP4s work for **TikTok** and **Instagram Reels** too.
 
@@ -51,7 +51,7 @@ It is made for **content creators**, **faceless YouTube channels**, **educators*
 
 ## 🎯 Use cases
 
-- **A faceless channel on autopilot.** Pick a niche (space, history, animals, money tips), set three publish times a day and leave it running. Ideas from Trends, Wikipedia, Reddit, RSS or your list are never reused, the AI is told to avoid your recent titles, and every script is reviewed before it is voiced.
+- **A faceless channel production workflow.** Pick a niche (space, history, animals, money tips), plan ideas from available sources, and render drafts for human review. Similar recent titles are avoided; factual claims and citations still require independent verification before publication.
 - **Text-message and Reddit-style story videos** for Shorts, TikTok and Reels: the AI writes a fictional chat or a first-person post, two voices or one narrator read it, and the chat screen or post card is animated for you. A Reddit post link works as the source too.
 - **Podcast, interview and stream clips.** `clip episode.mp4 --count 5` transcribes the video, lets the AI pick the moments that stand on their own and returns captioned vertical clips, with no per-minute fees.
 - **Articles, blog posts and notes into video.** `make --url https://…` or `--from-file notes.md` turns your own writing into a Short.
@@ -218,12 +218,12 @@ flowchart LR
 |------|-------------|
 | 1. **Topic** | Queued ideas first, then your niches, today's Google Trends, Wikipedia "On this day", Reddit TIL (best-effort, since Reddit rate-limits anonymous requests) or `topics.txt`, skipping anything already made and news about deaths, violence or elections |
 | 2. **Script** | The LLM writes a hook-first script split into scenes, each with its own stock-footage query and AI-image prompt, plus title, description, hashtags, tags and category, all in one JSON reply. With `LEARN_FROM_STATS`, your best and worst performers are part of the prompt |
-| 3. **Review** | The Script Doctor scores it for retention and rewrites weak lines (`SCRIPT_REVIEW=rewrite`, the default). A rewrite that misses the target length is ignored, and a failed review never fails the video |
+| 3. **Review** | The Script Doctor scores it for retention and rewrites weak lines (`SCRIPT_REVIEW=rewrite`, the default). A rewrite that misses the target length is ignored; if two bounded reviews still score below the configured threshold, rendering stops with a clear error |
 | 4. **Voice** | Neural TTS speaks the script and returns per-word timestamps (or they are aligned/estimated). Dialogues and chats are voiced line by line with two voices |
 | 5. **Footage** | Each scene gets its own clip: Pexels / Pixabay video (portrait preferred), photos with Ken Burns motion, your own `media/` folder, or AI images, with an animated gradient as the last resort |
 | 6. **Captions** | 2–3-word captions appear exactly when spoken, with the current word highlighted; chat stories show messages popping in on a phone screen instead, and Reddit-style stories open on a post card |
 | 7. **Render** | Scenes are cover-cropped to the output shape, colour-graded and joined with transitions; hook title, watermark, progress bar, end CTA, ducked music and −14 LUFS loudness are added in one final ffmpeg encode |
-| 8. **Publish** | Uploaded now, or scheduled into your next free time slot, with the synthetic-media disclosure set; queued automatically when the daily quota is used up |
+| 8. **Review & publish** | Review the generated video and metadata, then individually approve a YouTube upload or schedule; drafts are not auto-published |
 
 ---
 
@@ -321,7 +321,7 @@ purffle-shorts clip talk.mp4 --count 5 --crop blur  # whole picture over a blurr
 purffle-shorts clip "https://…" --count 3           # URLs need: pip install yt-dlp
 ```
 
-It works like Opus Clip or Vidyo.ai, but locally and without per-minute fees. The video is transcribed with word timings, and the LLM reads the timestamped transcript and picks moments of 20–58 s (`--min-seconds`, `--max-seconds`) that open with a hook and end on a complete thought, with a title, hashtags and a retention score for each. Each clip is cut on sentence boundaries, cropped to 9:16, captioned word by word with a hook title, and loudness-normalised. Without an LLM it still works, with moments spread evenly over the video instead. Clips upload like any other video when `UPLOAD=true`; add `--no-upload` to only cut them. Only clip videos you own or have permission to reuse.
+It works like Opus Clip or Vidyo.ai, but locally and without per-minute fees. The video is transcribed with word timings, and the LLM reads the timestamped transcript and picks moments of 20–58 s (`--min-seconds`, `--max-seconds`) that open with a hook and end on a complete thought, with a title, hashtags and a retention score for each. Each clip is cut on sentence boundaries, cropped to 9:16, captioned word by word with a hook title, and loudness-normalised. Without an LLM it still works, with moments spread evenly over the video instead. Clips are rendered as drafts; review and publish each one separately with `upload --id N`. Only clip videos you own or have permission to reuse.
 
 ---
 
@@ -341,7 +341,7 @@ LEARN_FROM_STATS=true
 YOUTUBE_API_KEY=...        # optional: reads public stats without asking for more OAuth access
 ```
 
-`purffle-shorts stats` (and the Studio's Channel page) reads view, like and comment counts of the videos PurffleShorts uploaded: one API unit per 50 videos. With `LEARN_FROM_STATS=true` the autopilot refreshes them twice a day and shows the LLM your best and worst performers (public for 48 hours or more) when it writes and plans. Without `YOUTUBE_API_KEY`, run `auth` once more to grant read access.
+`purffle-shorts stats` (and the Studio's Channel page) can read view, like and comment counts of uploaded videos. With `LEARN_FROM_STATS=true`, new ideas may be informed by this data. Without `YOUTUBE_API_KEY`, run `auth` again to grant read access.
 
 ---
 
@@ -366,7 +366,7 @@ Set `LLM_PROVIDER` and `LLM_MODEL` in `.env`, or pass `--provider` / `--model`. 
 
 `python -m purffle_shorts providers` shows which providers have a key and whether Ollama / LM Studio are running.
 
-**Script Doctor** (`SCRIPT_REVIEW`): `rewrite` (default) scores every script and uses the improved version, `score` only records the score and the problems, `off` skips the extra call (`--no-review`). It adds one LLM call per video.
+**Script Doctor** (`SCRIPT_REVIEW`): `rewrite` (default) scores every script and uses the improved version, `score` only records the score and the problems, `off` skips review (`--no-review`). `SCRIPT_QUALITY_THRESHOLD` (default `70`, or `--quality-threshold`) sets the minimum score; rewrite mode makes at most one additional bounded review/rewrite when the score is lower. If the final valid score remains below threshold, the script is not rendered; lower the threshold or revise the script before rendering.
 
 > **Facts need a capable model.** In testing, a 3B local model wrote a confident but wrong claim ("flamingos get their colour from carrots"). Use a larger model for fact-based formats, or check `script.json`, fix it, and re-render with `--script`.
 
@@ -387,7 +387,8 @@ Set `LLM_PROVIDER` and `LLM_MODEL` in `.env`, or pass `--provider` / `--model`. 
 - `LANGUAGE=es` (or `hi`, `ta`, `fr`, `pt`, `ja`, …) switches the script, the voice and the caption font together. Tamil, Hindi, Arabic, Thai and similar scripts are rendered through libass so they are shaped correctly.
 - `pip install faster-whisper` gives precise word timing for engines without native timestamps (`ALIGN=auto`).
 - The second speaker in dialogues and chats uses `TTS_VOICE_B`, or a contrasting voice picked for the language.
-- If the chosen engine fails, the video falls back to the free edge voice instead of failing.
+- `TTS_PRONUNCIATIONS` fixes spoken terms without changing captions: `TTS_PRONUNCIATIONS="GPU=gee pee you;VRAM=vee ram"` (semicolon-separated `term=replacement`).
+- If Edge TTS fails, the video logs the upstream error (including HTTP 403) and tries the free offline OS voice. Other engines retain their Edge fallback.
 
 ---
 
@@ -395,8 +396,9 @@ Set `LLM_PROVIDER` and `LLM_MODEL` in `.env`, or pass `--provider` / `--model`. 
 
 | Setting | Options |
 |---|---|
-| `CAPTION_STYLE` | `bold` (yellow active word) · `boxed` (active word in a colour box) · `neon` (glow) · `clean` · `karaoke` · `minimal` |
+| `CAPTION_STYLE` | `kinetic` (cream text, orange active word, dust exit) · `bold` · `boxed` (active word in a colour box) · `neon` (glow) · `clean` · `karaoke` · `minimal` |
 | `CAPTION_POSITION` | `upper` · `center` · `lower` |
+| `CAPTION_EXIT` | `auto` (dust for kinetic/bold) · `none` · `dust` · `dissolve`; tune with `CAPTION_EXIT_SECONDS`, or set `CAPTION_REDUCED_EFFECTS=true` on slower machines |
 | `COLOR_GRADE` | `none` · `vivid` · `cinematic` · `warm` · `cool` · `bw` |
 | `TRANSITION` | `random` · `none` · `fade` · `slideup` · `smoothleft` · `circleopen` · `zoomin` · … |
 | Overlays | Hook title (`HOOK_OVERLAY`), watermark (`WATERMARK`, defaults to `CHANNEL_NAME`, which is PurffleStudios until you change it; `none` hides it), progress bar (`PROGRESS_BAR`), end call-to-action (`END_CTA`) |
@@ -406,7 +408,13 @@ Set `LLM_PROVIDER` and `LLM_MODEL` in `.env`, or pass `--provider` / `--model`. 
 
 The caption font is downloaded once from Google Fonts (Anton for Latin scripts, Noto Sans for other scripts). Set `CAPTION_FONT=/path/font.ttf` to use your own.
 
-**Visual sources** (`VISUAL_SOURCES`, tried in order per scene): `pexels`, `pixabay`, `local` (your `media/` folder, matched by filename keywords), `openai-images` (gpt-image-1 / DALL·E 3), `pollinations` (AI images). Searches and AI images follow the output shape (portrait, landscape or square).
+**Visual sources** (`VISUAL_SOURCES`, tried in order per scene): `pexels`, `pixabay`, `local` (your `media/` folder, matched by filename keywords), `openai-images` (gpt-image-1 / DALL·E 3), `pollinations` (AI images), `agnes` (Agnes AI image generation). Searches and AI images follow the output shape (portrait, landscape or square).
+
+> **Agnes AI images:** set `AGNES_API_KEY` in your environment and add `agnes` to `VISUAL_SOURCES` (for example `VISUAL_SOURCES=agnes,pexels,pixabay`). The default model is `agnes-image-2.5-flash`; override it with `AGNES_IMAGE_MODEL`. Agnes requests use `https://apihub.agnes-ai.com/v1/images/generations`. Keep the API key private and out of source control. To check the endpoint without spending credits, run `python scripts/agnes_smoke.py`; add `--live` only when you intend to make one billable request.
+
+If Agnes is unavailable or its key is missing, a diagnostic is logged and the next configured visual source is tried.
+
+**Hybrid visuals:** `--visual-mode hybrid` keeps the stock-first rule for most scenes but reserves every Nth scene (default: every second scene, starting with scene 2) for a topic-specific AI image. Configure both a stock source and an AI source, for example `VISUAL_SOURCES=pixabay,agnes` (or `--visuals pixabay,agnes`). Use `HYBRID_IMAGE_EVERY` / `--hybrid-image-every` to change the interval (minimum 2). If the AI provider is missing or fails, that scene falls back to stock footage and the log says so. The default `VISUAL_MODE=auto` preserves the previous stock-first behaviour.
 
 > **Pollinations without a key is no longer practical for whole videos.** Tested on 29 September 2026: the first request returned an image, the next ones answered HTTP 402 "payment required", roughly one image every few minutes. When that happens PurffleShorts stops asking for the rest of that video and those scenes fall back to the next source. `POLLINATIONS_API_KEY` is sent as a Bearer token for keyed access; that path has not been tested here. Pexels and Pixabay keys are free and are the dependable choice.
 
@@ -414,11 +422,13 @@ The caption font is downloaded once from Google Fonts (Anton for Latin scripts, 
 
 ## 📅 Publishing & scheduling
 
+- **Review is the default.** `make`, `run`, and `daily` generate local drafts and do not publish, even if a legacy `UPLOAD=true` setting remains. `upload --id N` displays the video, script, captions, metadata, factual/rights warnings and quality checks, then requires you to type `PUBLISH` for that specific video. `upload --pending` applies the same review individually to each queued/rendered item. No unattended bulk publication is enabled.
+- `upload --id N --dry-run` (or `upload --pending --dry-run`) performs the local review and quality checks without recording approval, uploading, or scheduling.
 - `YT_PRIVACY=public|unlisted|private`.
-- `PUBLISH_TIMES=09:00,14:00,19:00` with `TIMEZONE=Asia/Kolkata` uploads each video as private and schedules it into the next free slot. Render in bulk, release on schedule.
-- **Paced and quota-aware.** `YT_DAILY_LIMIT=6` uploads a day by default. That is a pace you choose, not the API's ceiling: uploads now have their own API bucket of 100 a day at 1 unit each ([Google's quota table](https://developers.google.com/youtube/v3/determine_quota_cost), updated 15 September 2026). Extra videos are queued, and so are videos YouTube refuses because the project or the channel hit a limit (`quotaExceeded`, `uploadLimitExceeded`); after a refusal nothing else is tried that day. On autopilot the queue is uploaded first after the reset at midnight Pacific time, and production waits instead of piling up. Without autopilot, run `upload --pending` after the reset.
+- `PUBLISH_TIMES=09:00,14:00,19:00` with `TIMEZONE=Asia/Kolkata` proposes the next available time slot. If configured, the review summary displays that time before the upload request; YouTube's API schedules the video as private. Without publish times, the configured visibility is used for immediate publication.
+- **Paced and quota-aware.** `YT_DAILY_LIMIT=6` is a local safety limit, not a guarantee of API quota. Videos exceeding it remain queued. Publishing them requires another per-video review with `upload --pending`.
 - `SYNTHETIC_MEDIA=true` sets YouTube's *altered or synthetic content* disclosure. `MADE_FOR_KIDS`, `PLAYLIST_ID` and category (chosen by the AI) are set too.
-- Each video's folder holds `short.mp4` (`video.mp4` for 16:9), `cover.jpg`, `captions.srt`, `script.json` and `metadata.json` (including the retention score), ready to cross-post to TikTok or Reels. `KEEP_VIDEOS=false` deletes the MP4 after a successful upload.
+- Each video's folder holds `short.mp4` (`video.mp4` for 16:9), `cover.jpg`, `captions.srt`, `script.json` and `metadata.json` (including the retention score). Factual warnings require human verification; the AI review score is not a fact check. `KEEP_VIDEOS=false` deletes the MP4 after a successful upload.
 - **Notifications:** `NOTIFY_WEBHOOK=https://discord.com/api/webhooks/…` (or a Slack incoming webhook, or any URL for JSON) posts a message when a video is rendered, uploaded, scheduled, queued or fails.
 
 ---
@@ -507,7 +517,7 @@ Run `auth` once on your own computer so `token.json` exists in the mounted folde
 ## ❓ FAQ
 
 **Is PurffleShorts free?**<br>
-Yes. It is MIT-licensed and runs on your own computer. The default voices, Ollama models, faster-whisper and the Pexels and Pixabay APIs cost nothing. You only pay for paid APIs you choose to use, such as OpenAI, Claude or ElevenLabs. The Script Doctor adds one LLM call per video (`SCRIPT_REVIEW=off` to skip it).
+Yes. It is MIT-licensed and runs on your own computer. The default voices, Ollama models, faster-whisper and the Pexels and Pixabay APIs cost nothing. You only pay for paid APIs you choose to use, such as OpenAI, Claude or ElevenLabs. The Script Doctor normally adds one LLM call and can add one more when a rewrite-mode score is below its threshold (`SCRIPT_REVIEW=off` to skip review).
 
 **Can it make text-message stories, Reddit story videos or two-person conversations?**<br>
 Yes: `--style chat` renders an animated phone screen with messages popping in as each side's voice reads them, `--style reddit` opens on a Reddit-style post card and then tells the story with captions, and `--style dialogue` voices two people with name tags on the captions.
@@ -534,7 +544,7 @@ Yes: OpenAI GPT models (including GPT-5 and the o-series), Anthropic Claude, Goo
 It uploads to YouTube only. Every video is a standard MP4 (9:16, or 1:1 / 4:5 for feeds) with a cover image, subtitles and metadata, so you can post the same file to TikTok and Reels yourself.
 
 **How many Shorts can it upload per day?**<br>
-Six by default (`YT_DAILY_LIMIT`). You can raise it: the YouTube API now gives uploads their own bucket of 100 a day. Posting many videos at once rarely helps a channel, so the default stays modest. Anything over the limit waits in a queue and uploads after the daily reset.
+Six by default (`YT_DAILY_LIMIT`), as a local pacing limit. Actual API quota depends on the Google Cloud project and can change. Videos over the local limit remain queued for later manual review.
 
 **Can I write or fix the script myself?**<br>
 Yes. Edit any video's `script.json` (or write one like [`examples/flamingos.json`](https://github.com/Chamanrajragu/purffle-shorts/blob/main/examples/flamingos.json)) and run `make --script file.json`.
@@ -612,7 +622,7 @@ purffle-shorts/
 | `clip` says it needs a transcript | `pip install faster-whisper` (or set `OPENAI_API_KEY`); URLs also need `pip install yt-dlp` |
 | `Setting problem: X='…'` | A number setting in `.env` has a typo; the message names it and its default |
 | `YouTube is not authorized` | Run `python -m purffle_shorts auth` |
-| Videos stay `queued` | Your `YT_DAILY_LIMIT` or one of YouTube's limits was reached. Autopilot uploads them after midnight Pacific; otherwise run `upload --pending` after the reset (or raise `YT_DAILY_LIMIT`) |
+| Videos stay `queued` | Your `YT_DAILY_LIMIT` or one of YouTube's limits was reached. Review and retry them with `upload --pending` when the limit clears. |
 | A video failed and the log is too short | Run with `-v` for full tracebacks (also written to `data/logs/purffle.log`) |
 | Wrong-looking non-Latin captions | Install an ffmpeg with libass (Homebrew and apt builds include it); `doctor` shows whether yours has it |
 

@@ -7,6 +7,7 @@ SHORTS_CAPTION_FONTSIZE, SHORTS_BATCH_SIZE, SHORTS_BATCH_DELAY, GOOGLE_CLIENT_SE
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass, field, fields, replace
 from pathlib import Path
 
@@ -52,6 +53,17 @@ def _list(val: str) -> list[str]:
     return [v.strip() for v in val.replace(";", ",").split(",") if v.strip()]
 
 
+def _pronunciations(val: str) -> dict[str, str]:
+    """Parse ``term=spoken form;term=...`` (semicolons only: replacement text may contain commas)."""
+    out: dict[str, str] = {}
+    for part in re.split(r"[;\n]+", val or ""):
+        term, sep, spoken = part.partition("=")
+        term, spoken = term.strip(), spoken.strip()
+        if sep and term and spoken:
+            out[term] = spoken
+    return out
+
+
 class ConfigError(ValueError):
     """A setting has a value that can't be used (reported once, before any work starts)."""
 
@@ -75,9 +87,25 @@ def _float(name: str, default: float, *aliases: str) -> float:
 # Aspect presets: 9:16 is a Short/Reel/TikTok, 16:9 a regular YouTube video, 1:1 and 4:5 feed posts.
 ASPECTS = {"9:16": (1080, 1920), "16:9": (1920, 1080), "1:1": (1080, 1080), "4:5": (1080, 1350)}
 
+# One duration contract for the CLI, Studio, MCP server, environment and quality gate.
+MIN_TARGET_SECONDS = 15
+MAX_TARGET_SECONDS = 170
+
 
 def aspect_resolution(aspect: str) -> tuple[int, int] | None:
     return ASPECTS.get(aspect.strip().replace("x", ":").replace("/", ":"))
+
+
+def clamp_target_seconds(value: int | float | str) -> int:
+    """Clamp a requested video length to the supported range."""
+    return max(MIN_TARGET_SECONDS, min(MAX_TARGET_SECONDS, int(float(value))))
+
+
+def duration_window(target_seconds: int | float | str) -> tuple[int, int]:
+    """Acceptable rendered duration for a target: the shared ±30% window, never impossible."""
+    target = clamp_target_seconds(target_seconds)
+    return (max(MIN_TARGET_SECONDS, int(target * 0.7)),
+            min(MAX_TARGET_SECONDS, int(target * 1.3)))
 
 
 def parse_resolution(value: str, default: tuple[int, int] = (1080, 1920)) -> tuple[int, int]:
@@ -114,6 +142,7 @@ class Settings:
     llm_temperature: float = 0.9
     anthropic_effort: str = ""        # low|medium|high|xhigh|max (blank = API default)
     script_review: str = "rewrite"    # off|score|rewrite — the Script Doctor's second pass
+    script_quality_threshold: int = 70
     learn_from_stats: bool = False    # show the LLM which of your videos got the most / fewest views
 
     # --- voice ----------------------------------------------------------------------------
@@ -123,12 +152,16 @@ class Settings:
     tts_rate: str = "+8%"             # edge-tts speaking rate
     tts_model: str = ""               # engine-specific model (e.g. gpt-4o-mini-tts, eleven_multilingual_v2)
     tts_instructions: str = "Energetic, curious storyteller voice for a YouTube Short. Natural pacing."
+    tts_pronunciations: dict[str, str] = field(default_factory=dict)  # spoken text only; captions keep the term
     align: str = "auto"               # auto|none|faster-whisper|openai — word timing for engines without it
 
     # --- visuals --------------------------------------------------------------------------
     visual_sources: list[str] = field(default_factory=lambda: ["pexels", "pixabay"])
+    visual_mode: str = "auto"          # auto|hybrid; hybrid alternates stock clips and AI stills
+    hybrid_image_every: int = 2        # hybrid: every Nth scene is an AI image (min 2)
     media_dir: str = "media"
     image_model: str = "gpt-image-1"
+    agnes_image_model: str = "agnes-image-2.5-flash"
     visual_style: str = "cinematic, dramatic lighting, highly detailed, vertical composition"
     prefer_4k: bool = False
 
@@ -146,12 +179,28 @@ class Settings:
     hook_overlay: bool = True
     watermark: str = ""               # blank = channel name; "none" = off
     end_cta: str = "Follow for more!"
-    caption_style: str = "bold"       # bold|boxed|neon|clean|karaoke|minimal
+    caption_style: str = "kinetic"    # kinetic|bold|boxed|neon|clean|karaoke|minimal
     caption_position: str = "center"  # upper|center|lower
+    caption_exit: str = "auto"        # auto|none|dust|dissolve
+    caption_exit_seconds: float = 0.18
+    caption_reduced_effects: bool = False
     caption_font: str = ""
     caption_fontsize: int = 0         # 0 = auto
     caption_max_words: int = 3
     caption_uppercase: bool = True
+    # --- premium caption design (see overlays.CaptionDesign; all optional, all backwards compatible) ---
+    caption_font_family: str = ""     # inter|sans|... ; blank = follow the style (Anton for kinetic)
+    caption_bold: bool = False        # draw with the bold face when the font family has one
+    caption_scale: float = 1.0        # multiplies the caption font size
+    caption_line_height: float = 1.18  # line box as a multiple of the font size
+    caption_spacing: float = 0.01     # letter spacing as a fraction of the font size
+    caption_align: str = "center"     # center|left|right
+    caption_safe_margin: float = 0.08  # min. distance from the left/right/top/bottom edges
+    caption_emphasis: str = "auto"    # auto|off|all — which words get the emphasis treatment
+    caption_emphasis_max: int = 2     # at most this many emphasised words per caption
+    caption_emphasis_color: str = ""  # blank = the style's active colour
+    caption_contrast: str = "auto"    # auto|never|safe — charcoal scrim for readability over footage
+    caption_transition_stagger: float = 0.35  # 0..1: how far the exit overlaps the next caption
     music_dir: str = "music"
     music_file: str = "back.mp3"
     music_volume: float = 0.14
@@ -159,10 +208,10 @@ class Settings:
     loudness_lufs: float = -14.0
 
     # --- YouTube --------------------------------------------------------------------------
-    upload: bool = True
+    upload: bool = False          # videos stay in review until explicitly uploaded
     privacy: str = "public"           # public|unlisted|private
     publish_times: list[str] = field(default_factory=list)  # e.g. 09:00,14:00,19:00 -> scheduled
-    timezone: str = ""
+    timezone: str = "Asia/Kolkata"
     daily_upload_limit: int = 6       # a pace; the API gives uploads their own bucket of 100 a day
     made_for_kids: bool = False
     synthetic_media: bool = True      # YouTube "altered or synthetic content" disclosure
@@ -187,8 +236,17 @@ class Settings:
     pixabay_api_key: str = ""
     elevenlabs_api_key: str = ""
     pollinations_api_key: str = ""
+    agnes_api_key: str = ""
 
     offline: bool = False             # demo mode: no network LLM, generated visuals
+
+    def __post_init__(self) -> None:
+        if self.target_seconds:
+            self.target_seconds = clamp_target_seconds(self.target_seconds)
+        self.visual_mode = (self.visual_mode or "auto").strip().lower()
+        if self.visual_mode not in {"auto", "hybrid"}:
+            raise ConfigError(f"VISUAL_MODE={self.visual_mode!r}: choose auto or hybrid")
+        self.hybrid_image_every = max(2, int(self.hybrid_image_every))
 
     @property
     def width(self) -> int:
@@ -238,6 +296,7 @@ class Settings:
 
     @classmethod
     def from_env(cls) -> Settings:
+        load_env()
         d = cls()
         aspect = _env("ASPECT")
         resolution = parse_resolution(_env("RESOLUTION", "1080x1920", "SHORTS_RESOLUTION"))
@@ -267,6 +326,7 @@ class Settings:
             llm_temperature=_float("LLM_TEMPERATURE", d.llm_temperature),
             anthropic_effort=_env("ANTHROPIC_EFFORT").lower(),
             script_review=_env("SCRIPT_REVIEW", d.script_review).lower(),
+            script_quality_threshold=_int("SCRIPT_QUALITY_THRESHOLD", d.script_quality_threshold),
             learn_from_stats=_bool(_env("LEARN_FROM_STATS", "false")),
             tts_engine=_env("TTS_ENGINE", d.tts_engine).lower(),
             tts_voice=_env("TTS_VOICE"),
@@ -274,8 +334,11 @@ class Settings:
             tts_rate=_env("TTS_RATE", d.tts_rate),
             tts_model=_env("TTS_MODEL"),
             tts_instructions=_env("TTS_INSTRUCTIONS", d.tts_instructions),
+            tts_pronunciations=_pronunciations(_env("TTS_PRONUNCIATIONS")),
             align=_env("ALIGN", d.align).lower(),
             visual_sources=[v.lower() for v in _list(_env("VISUAL_SOURCES", "pexels,pixabay"))],
+            visual_mode=_env("VISUAL_MODE", d.visual_mode),
+            hybrid_image_every=_int("HYBRID_IMAGE_EVERY", d.hybrid_image_every),
             media_dir=_env("MEDIA_DIR", d.media_dir),
             image_model=_env("IMAGE_MODEL", d.image_model),
             visual_style=_env("VISUAL_STYLE", d.visual_style),
@@ -295,19 +358,35 @@ class Settings:
             end_cta=os.getenv("END_CTA", d.end_cta).strip(),  # set END_CTA= (empty) to disable
             caption_style=_env("CAPTION_STYLE", d.caption_style).lower(),
             caption_position=_env("CAPTION_POSITION", d.caption_position).lower(),
+            caption_exit=_env("CAPTION_EXIT", d.caption_exit).lower(),
+            caption_exit_seconds=max(0.0, min(0.5, _float("CAPTION_EXIT_SECONDS", d.caption_exit_seconds))),
+            caption_reduced_effects=_bool(_env("CAPTION_REDUCED_EFFECTS", str(d.caption_reduced_effects))),
             caption_font=_env("CAPTION_FONT"),
             caption_fontsize=_int("CAPTION_FONTSIZE", 0, "SHORTS_CAPTION_FONTSIZE"),
             caption_max_words=max(1, _int("CAPTION_MAX_WORDS", d.caption_max_words)),
             caption_uppercase=_bool(_env("CAPTION_UPPERCASE", "true")),
+            caption_font_family=_env("CAPTION_FONT_FAMILY").lower(),
+            caption_bold=_bool(_env("CAPTION_BOLD", str(d.caption_bold))),
+            caption_scale=max(0.4, min(2.5, _float("CAPTION_SCALE", d.caption_scale))),
+            caption_line_height=max(0.9, min(2.0, _float("CAPTION_LINE_HEIGHT", d.caption_line_height))),
+            caption_spacing=max(0.0, min(0.2, _float("CAPTION_SPACING", d.caption_spacing))),
+            caption_align=_env("CAPTION_ALIGN", d.caption_align).lower(),
+            caption_safe_margin=max(0.0, min(0.3, _float("CAPTION_SAFE_MARGIN", d.caption_safe_margin))),
+            caption_emphasis=_env("CAPTION_EMPHASIS", d.caption_emphasis).lower(),
+            caption_emphasis_max=max(0, _int("CAPTION_EMPHASIS_MAX", d.caption_emphasis_max)),
+            caption_emphasis_color=_env("CAPTION_EMPHASIS_COLOR"),
+            caption_contrast=_env("CAPTION_CONTRAST", d.caption_contrast).lower(),
+            caption_transition_stagger=max(0.0, min(1.0, _float("CAPTION_TRANSITION_STAGGER",
+                                                              d.caption_transition_stagger))),
             music_dir=_env("MUSIC_DIR", d.music_dir),
             music_file=_env("MUSIC_FILE", d.music_file),
             music_volume=max(0.0, _float("MUSIC_VOLUME", d.music_volume, "SHORTS_MUSIC_VOLUME")),
             music_ducking=_bool(_env("MUSIC_DUCKING", "true")),
             loudness_lufs=_float("LOUDNESS_LUFS", d.loudness_lufs),
-            upload=_bool(_env("UPLOAD", "true")),
+            upload=_bool(_env("UPLOAD", "false")),
             privacy=_env("YT_PRIVACY", d.privacy).lower(),
             publish_times=_list(_env("PUBLISH_TIMES")),
-            timezone=_env("TIMEZONE"),
+            timezone=_env("TIMEZONE", d.timezone),
             daily_upload_limit=_int("YT_DAILY_LIMIT", d.daily_upload_limit),
             made_for_kids=_bool(_env("MADE_FOR_KIDS", "false")),
             synthetic_media=_bool(_env("SYNTHETIC_MEDIA", "true")),
@@ -326,11 +405,15 @@ class Settings:
             pixabay_api_key=_env("PIXABAY_API_KEY"),
             elevenlabs_api_key=_env("ELEVENLABS_API_KEY", "", "XI_API_KEY"),
             pollinations_api_key=_env("POLLINATIONS_API_KEY"),
+            agnes_api_key=_env("AGNES_API_KEY"),
+            agnes_image_model=_env("AGNES_IMAGE_MODEL", d.agnes_image_model),
             youtube_api_key=_env("YOUTUBE_API_KEY"),
             notify_webhook=_env("NOTIFY_WEBHOOK"),
         )
         if s.script_review not in ("off", "score", "rewrite"):
             s.script_review = {"false": "off", "no": "off", "0": "off", "true": "rewrite"}.get(s.script_review, "rewrite")
+        if not 0 <= s.script_quality_threshold <= 100:
+            raise ConfigError("SCRIPT_QUALITY_THRESHOLD must be between 0 and 100")
         return s
 
 

@@ -1,4 +1,4 @@
-"""Command line: `purffle-shorts <command>` or `python -m purffle_shorts <command>`."""
+﻿"""Command line: `purffle-shorts <command>` or `python -m purffle_shorts <command>`."""
 
 from __future__ import annotations
 
@@ -10,7 +10,17 @@ import sys
 from pathlib import Path
 
 from . import __version__
-from .config import ASPECTS, ConfigError, Settings, aspect_resolution, load_env, parse_resolution
+from .config import (
+    ASPECTS,
+    MAX_TARGET_SECONDS,
+    MIN_TARGET_SECONDS,
+    ConfigError,
+    Settings,
+    aspect_resolution,
+    clamp_target_seconds,
+    load_env,
+    parse_resolution,
+)
 
 log = logging.getLogger("purffle")
 
@@ -22,9 +32,19 @@ def setup_logging(settings: Settings, verbose: bool = False, stream=None) -> Non
     fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", "%H:%M:%S")
     console = logging.StreamHandler(stream or sys.stdout)
     console.setFormatter(fmt)
-    if hasattr(sys.stdout, "reconfigure"):
+    # Force UTF-8 encoding on Windows
+    if sys.platform.startswith("win"):
+        if hasattr(sys.stdout, "reconfigure"):
+            try:
+                sys.stdout.reconfigure(encoding="utf-8")
+                sys.stderr.reconfigure(encoding="utf-8")
+            except Exception:
+                pass
+        # Also set the console code page to UTF-8
         try:
-            sys.stdout.reconfigure(encoding="utf-8")
+            import ctypes
+            ctypes.windll.kernel32.SetConsoleOutputCP(65001)
+            ctypes.windll.kernel32.SetConsoleCP(65001)
         except Exception:
             pass
     logs = settings.data_path / "logs"
@@ -47,18 +67,29 @@ def _common(p: argparse.ArgumentParser) -> None:
     g.add_argument("--niche", action="append", help="niche to pick topics from (repeatable)")
     g.add_argument("--style", help="facts|story|listicle|myth|quiz|motivational|news|explainer|dialogue|chat|reddit|auto")
     g.add_argument("--lang", dest="language", help="language code, e.g. en, es, hi, ta, fr, ja")
-    g.add_argument("--duration", dest="target_seconds", type=int, help="target length in seconds (15-170)")
+    g.add_argument("--duration", dest="target_seconds", type=int,
+                   help=f"target length in seconds ({MIN_TARGET_SECONDS}-{MAX_TARGET_SECONDS})")
     g.add_argument("--provider", dest="llm_provider", help="LLM provider (see `providers`)")
     g.add_argument("--model", dest="llm_model", help="LLM model name")
     g.add_argument("--tts", dest="tts_engine", help="edge|openai|elevenlabs|kokoro|coqui|system|silent")
     g.add_argument("--voice", dest="tts_voice", help="voice name/id (comma list = rotate)")
     g.add_argument("--voice-b", dest="tts_voice_b", help="second speaker's voice (dialogue and chat formats)")
     g.add_argument("--no-review", action="store_true", help="skip the Script Doctor's second pass")
+    g.add_argument("--quality-threshold", dest="script_quality_threshold", type=int,
+                   help="minimum Script Doctor score; rewrite mode stops if one bounded retry still misses (0-100)")
     g.add_argument("--also-lang", help="also make translated copies, e.g. es,hi (same footage)")
-    g.add_argument("--visuals", help="comma list: pexels,pixabay,local,openai-images,pollinations")
+    g.add_argument("--visuals", help="comma list: pexels,pixabay,local,openai-images,pollinations,agnes")
+    g.add_argument("--visual-mode", choices=["auto", "hybrid"],
+                   help="auto=stock-first with AI fallback; hybrid=alternate stock clips and AI images")
+    g.add_argument("--hybrid-image-every", type=int,
+                   help="hybrid mode: make every Nth scene an AI image (min 2, default 2)")
     r = p.add_argument_group("look & output")
-    r.add_argument("--caption-style", help="bold|boxed|neon|clean|karaoke|minimal")
+    r.add_argument("--caption-style", help="kinetic|bold|boxed|neon|clean|karaoke|minimal")
     r.add_argument("--caption-position", help="upper|center|lower")
+    r.add_argument("--caption-exit", help="auto|none|dust|dissolve")
+    r.add_argument("--caption-exit-seconds", type=float, help="exit animation length (default 0.18)")
+    r.add_argument("--caption-reduced-effects", action="store_true", default=None,
+                   help="disable dust and pop-in motion (lower CPU)")
     r.add_argument("--grade", dest="color_grade", help="none|vivid|cinematic|warm|cool|bw")
     r.add_argument("--transition", help="random|none|fade|slideup|circleopen|...")
     r.add_argument("--aspect", choices=list(ASPECTS), help="9:16 Short/Reel, 16:9 YouTube, 1:1 or 4:5 feed")
@@ -79,12 +110,15 @@ def build_settings(args: argparse.Namespace) -> Settings:
     s = Settings.from_env()
     ov = {k: getattr(args, k, None) for k in (
         "style", "language", "target_seconds", "llm_provider", "llm_model", "tts_engine", "tts_voice",
-        "tts_voice_b", "caption_style", "caption_position", "color_grade", "transition", "fps", "video_encoder",
-        "privacy")}
+        "tts_voice_b", "script_quality_threshold", "caption_style", "caption_position", "caption_exit",
+        "caption_exit_seconds", "caption_reduced_effects", "color_grade", "transition", "visual_mode",
+        "hybrid_image_every", "fps", "video_encoder", "privacy")}
     if getattr(args, "niche", None):
         ov["niches"] = args.niche
     if getattr(args, "visuals", None):
         ov["visual_sources"] = [v.strip().lower() for v in args.visuals.split(",") if v.strip()]
+    if getattr(args, "hybrid_image_every", None) is not None and args.hybrid_image_every < 2:
+        raise ConfigError("--hybrid-image-every must be at least 2 (hybrid means both videos and images)")
     if getattr(args, "aspect", None):
         ov["resolution"] = aspect_resolution(args.aspect)
     if getattr(args, "resolution", None):
@@ -101,13 +135,17 @@ def build_settings(args: argparse.Namespace) -> Settings:
         ov["publish_times"] = [t.strip() for t in args.publish_times.split(",") if t.strip()]
     s = s.with_overrides(**ov)
     if s.target_seconds:
-        s.target_seconds = max(10, min(170, s.target_seconds))
+        s.target_seconds = clamp_target_seconds(s.target_seconds)
+    if not 0 <= s.script_quality_threshold <= 100:
+        raise ConfigError("--quality-threshold must be between 0 and 100")
     return s
 
 
 # ------------------------------------------------------------------------------------------ commands
 def cmd_run(args, s: Settings) -> int:
     from .pipeline import Studio
+    # Generation/automation must not publish future videos without an individual review.
+    s = s.with_overrides(upload=False)
     if args.batch:
         s.batch_size = args.batch
     if args.workers:
@@ -120,6 +158,8 @@ def cmd_run(args, s: Settings) -> int:
 
 def cmd_make(args, s: Settings) -> int:
     from .pipeline import Studio
+    # --make always creates a reviewable draft; publishing is a separate explicit command.
+    s = s.with_overrides(upload=False)
     studio = Studio(s)
     ok = 0
     for _ in range(max(1, args.count or 1)):
@@ -133,10 +173,10 @@ def cmd_make(args, s: Settings) -> int:
 
 def print_result(r) -> None:
     if not r.ok:
-        print(f"\n✘ {r.language + ' ' if r.language else ''}failed: {r.error}")
+        print(f"\nâœ˜ {r.language + ' ' if r.language else ''}failed: {r.error}")
         return
     score = f"\n  retention score: {r.score}/100" if r.score is not None else ""
-    print(f"\n✔ {r.title}\n  folder: {r.folder}\n  status: {r.status}{score}"
+    print(f"\nâœ” {r.title}\n  folder: {r.folder}\n  status: {r.status}{score}"
           + (f"\n  https://youtube.com/shorts/{r.youtube_id}" if r.youtube_id else ""))
 
 
@@ -146,9 +186,9 @@ def cmd_demo(args, s: Settings) -> int:
     print("Demo: offline script + free neural voice + generated backgrounds. No API keys used.\n")
     r = Studio(s).make(args.topic, style=s.style if s.style != "auto" else None)
     if r.ok:
-        print(f"\n✔ Demo video: {r.video}\n  (cover.jpg, captions.srt and metadata.json are next to it)")
+        print(f"\nâœ” Demo video: {r.video}\n  (cover.jpg, captions.srt and metadata.json are next to it)")
         return 0
-    print(f"\n✘ Demo failed: {r.error}")
+    print(f"\nâœ˜ Demo failed: {r.error}")
     return 1
 
 
@@ -156,19 +196,164 @@ def cmd_upload(args, s: Settings) -> int:
     from .pipeline import Studio
     studio = Studio(s)
     if args.pending:
-        n = studio.flush_queue(include_rendered=True)
-        print(f"Uploaded {n} video(s). Remaining today: {max(0, studio.quota_left())}")
-        return 0
+        records = studio.history.pending_uploads(("queued", "rendered"))
+        if not records:
+            print("No rendered or queued videos are waiting for review.")
+            return 0
+        completed = 0
+        for rec in records:
+            reviewed = _review_upload(
+                rec, s, studio.history.scheduled_times(), studio.history, dry_run=args.dry_run)
+            if not reviewed:
+                print(f"Skipped video #{rec['id']}.")
+                continue
+            if args.dry_run:
+                completed += 1
+                print(f"Dry run passed for video #{rec['id']}; no approval or upload was made.")
+                continue
+            status = studio.upload_record(rec["id"])
+            if status in ("uploaded", "scheduled"):
+                completed += 1
+            elif status == "queued":
+                print(f"Video #{rec['id']} remains queued; the upload limit has been reached.")
+            elif status == "approval-required":
+                print(f"Video #{rec['id']} lacks a saved approval; it was not uploaded.")
+            else:
+                print(f"Video #{rec['id']} was not uploaded (status: {status}).")
+        if args.dry_run:
+            print(f"Dry run passed for {completed} of {len(records)} video(s); nothing was uploaded or scheduled.")
+        else:
+            print(f"Uploaded or scheduled {completed} video(s). Remaining today: {max(0, studio.quota_left())}")
+        return 0 if completed or not records else 1
     if args.id:
-        return 0 if studio.upload_record(args.id) in ("uploaded", "scheduled") else 1
+        rec = studio.history.get(args.id)
+        if not rec:
+            print(f"Video #{args.id} was not found.")
+            return 1
+        if not _review_upload(rec, s, studio.history.scheduled_times(), studio.history, dry_run=args.dry_run):
+            print("Upload cancelled.")
+            return 1
+        if args.dry_run:
+            print(f"Dry run passed for video #{args.id}; no approval or upload was made.")
+            return 0
+        status = studio.upload_record(args.id)
+        if status == "approval-required":
+            print("Upload blocked: approval could not be verified.")
+        return 0 if status in ("uploaded", "scheduled") else 1
     print("Use --pending (everything not yet uploaded) or --id N (see `history`).")
     return 2
+
+
+def _review_upload(rec: dict, s: Settings, scheduled_times: list[str] | None = None, history=None,
+                   dry_run: bool = False) -> bool:
+    """Show a per-video publication summary and require an explicit confirmation."""
+    import json
+
+    from . import youtube
+    from .quality import run_quality_checks
+
+    folder = Path(rec["folder"]) if rec.get("folder") else None
+    video = Path(rec["video_path"]) if rec.get("video_path") else None
+    print(f"\n--- Review video #{rec['id']} before YouTube publishing ---")
+    if rec.get("youtube_id") or rec.get("status") in ("uploaded", "scheduled"):
+        print("Failed check: this record already has a YouTube upload; refusing to create a duplicate.")
+        return False
+    print(f"Title: {rec.get('title') or '(missing)'}")
+    print(f"File: {video or '(missing)'}")
+    print(f"Account: authorized account in {s.token_file} (verify the account in your browser)")
+    print(f"Visibility: {s.privacy}")
+    publish_at = youtube.next_publish_slot(s, scheduled_times or [], None)
+    print(f"Publication: {publish_at.isoformat() if publish_at else 'immediately after upload'}")
+
+    metadata = {}
+    if folder and (folder / "metadata.json").exists():
+        metadata = json.loads((folder / "metadata.json").read_text(encoding="utf-8"))
+    print(f"Thumbnail concept: {metadata.get('thumbnail_concept', 'not generated')}")
+    print(f"Description:\n{rec.get('description') or '(missing)'}")
+    print(f"Hashtags/tags: {rec.get('tags') or '[]'}")
+    print(f"Topic source: {metadata.get('source') or rec.get('source') or 'not recorded'}")
+    research = metadata.get("research") or {}
+    source_references = research.get("references") or metadata.get("source_references") or []
+    print(f"Source references: {json.dumps(source_references, ensure_ascii=False) if source_references else 'not recorded'}")
+    for warning in research.get("warnings", []):
+        print(f"Factual verification warning: {warning}")
+    print(f"Thumbnail/preview: {folder / 'cover.jpg' if folder else '(missing)'}")
+
+    script_path = folder / "script.json" if folder else None
+    if script_path and script_path.exists():
+        script = json.loads(script_path.read_text(encoding="utf-8"))
+        print("Narration:")
+        for scene in script.get("scenes", []):
+            print(f"  - {scene.get('narration', '')}")
+    else:
+        print("Narration: unavailable (script.json not found)")
+    captions = folder / "captions.srt" if folder else None
+    if captions and captions.exists():
+        print(f"Captions ({captions}):\n{captions.read_text(encoding='utf-8')}")
+    else:
+        print("Captions: not found")
+
+    visual_sources = sorted({str(item.get("source", "unknown")) for item in metadata.get("visuals", [])
+                             if isinstance(item, dict)})
+    print(f"Visual asset sources: {', '.join(visual_sources) if visual_sources else 'not recorded'}")
+    print("Factual warning: AI review is not independent fact-checking; verify factual claims and citations.")
+    if visual_sources:
+        print("Rights warning: confirm each asset's license and permitted use before publishing.")
+    else:
+        print("Rights warning: asset provenance is incomplete; do not publish until verified.")
+
+    if not video or not folder:
+        print("Failed check: video path or project folder is missing.")
+        return False
+    report = run_quality_checks(video, folder, s)
+    for check in report.checks:
+        print(f"[{'PASS' if check.passed else 'FAIL'}] {check.name}: {check.message}")
+    if not report.passed:
+        print(f"Publishing blocked: {report.summary}")
+        return False
+
+    if dry_run:
+        print("Dry-run checks passed; no approval, upload, or schedule was created.")
+        return True
+
+    try:
+        answer = input("Type PUBLISH to approve this video for YouTube now: ")
+    except EOFError:
+        return False
+    if answer.strip() != "PUBLISH":
+        return False
+    if history is None:
+        print("Failed check: approval cannot be persisted; refusing to publish.")
+        return False
+
+    from .history import now_iso
+
+    approved_at = now_iso()
+    approval = {
+        "approved_at": approved_at,
+        "platform": "youtube",
+        "video_path": str(video),
+        "title": rec.get("title"),
+        "description": rec.get("description"),
+        "tags": rec.get("tags"),
+        "visibility": s.privacy,
+        "publish_at": publish_at.isoformat() if publish_at else None,
+        "source_references": source_references,
+    }
+    if not history.approve_video(int(rec["id"]), approved_at, approval):
+        print("Failed check: approval could not be saved for this video.")
+        return False
+    metadata["approval_status"] = "approved"
+    metadata["approval"] = approval
+    (folder / "metadata.json").write_text(json.dumps(metadata, indent=2, ensure_ascii=False), encoding="utf-8")
+    print(f"Approval recorded at {approved_at}.")
+    return True
 
 
 def cmd_auth(args, s: Settings) -> int:
     from . import youtube
     youtube.get_credentials(s, interactive=True, extra_scopes=youtube.auth_scopes(s))
-    print(f"✔ YouTube authorized. Token saved to {s.token_file}")
+    print(f"âœ” YouTube authorized. Token saved to {s.token_file}")
     return 0
 
 
@@ -219,13 +404,13 @@ def cmd_voices(args, s: Settings) -> int:
 
 def cmd_doctor(args, s: Settings) -> int:
     from .doctor import checks
-    print(f"PurffleShorts {__version__} — environment check\n")
+    print(f"PurffleShorts {__version__} â€” environment check\n")
     results = checks(s)
     for c in results:
-        mark = {True: "✔", False: "✘", None: "•"}[c["ok"]]
+        mark = {True: "âœ”", False: "âœ˜", None: "â€¢"}[c["ok"]]
         print(f" {mark} {c['label']}{': ' + c['detail'] if c['detail'] else ''}")
     ok = all(c["ok"] is not False for c in results)
-    print("\nAll good." if ok else "\nFix the ✘ items above, then run again.")
+    print("\nAll good." if ok else "\nFix the âœ˜ items above, then run again.")
     return 0 if ok else 1
 
 
@@ -277,7 +462,7 @@ def cmd_clip(args, s: Settings) -> int:
     from .clipper import make_clips
     from .pipeline import Studio
     results = make_clips(Studio(s), args.source, count=args.count, crop=args.crop,
-                         min_seconds=args.min_seconds, max_seconds=args.max_seconds)
+                         min_seconds=args.min_seconds, max_seconds=args.max_seconds, upload=False)
     for r in results:
         print_result(r)
     return 0 if any(r.ok for r in results) else 1
@@ -307,6 +492,34 @@ def cmd_mcp(args, s: Settings) -> int:
     return 0
 
 
+def cmd_daily(args, s: Settings) -> int:
+    """Run the daily automation: one video per day with quality gate and upload safeguards."""
+    from .automation import DailyAutomation
+
+    automation = DailyAutomation(
+        s,
+        dry_run=args.dry_run,
+        skip_quality=args.skip_quality,
+        skip_upload=True,
+        skip_instagram=not args.instagram,
+    )
+    result = automation.run_once()
+
+    if result.ok:
+        if result.video_result:
+            print(f"âœ… Daily run completed: {result.video_result.title}")
+            if result.uploaded:
+                print("  â†’ Uploaded to YouTube")
+            if result.instagram_published:
+                print("  â†’ Published to Instagram Reels")
+        else:
+            print(f"âœ… Daily run: {result.error}")
+        return 0
+    else:
+        print(f"âŒ Daily run failed: {result.error}")
+        return 1
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="purffle-shorts", description="Autonomous AI YouTube Shorts studio.")
     p.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
@@ -320,6 +533,15 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--workers", type=int, help="videos made in parallel")
     r.add_argument("--delay", type=int, help="seconds between batches")
     r.set_defaults(func=cmd_run)
+
+    daily = sub.add_parser("daily", help="run the daily automation (one video per day with quality gate)")
+    _common(daily)
+    daily.add_argument("--dry-run", action="store_true", help="verify config only, no generation/upload")
+    daily.add_argument("--skip-quality", action="store_true", help="skip quality gate checks")
+    daily.add_argument("--skip-upload", action="store_true",
+                       help="deprecated; daily runs always stop at review and never publish")
+    daily.add_argument("--instagram", action="store_true", help="enable Instagram Reels publishing")
+    daily.set_defaults(func=cmd_daily)
 
     m = sub.add_parser("make", help="make one video now")
     _common(m)
@@ -372,6 +594,7 @@ def build_parser() -> argparse.ArgumentParser:
     _common(up)
     up.add_argument("--pending", action="store_true", help="upload everything not yet on YouTube")
     up.add_argument("--id", type=int, help="upload one video by history id")
+    up.add_argument("--dry-run", action="store_true", help="run review and quality checks without approval or upload")
     up.set_defaults(func=cmd_upload)
 
     for name, func, helptext in [("auth", cmd_auth, "connect your YouTube channel (OAuth)"),

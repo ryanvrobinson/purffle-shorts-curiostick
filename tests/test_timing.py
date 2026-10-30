@@ -1,5 +1,6 @@
 from purffle_shorts.timing import (
     Word,
+    _dangling,
     caption_chunks,
     estimate_timings,
     scene_timeline,
@@ -51,8 +52,28 @@ def test_scene_timeline_merges_tiny_scenes():
 def test_caption_chunks_break_on_punctuation_and_limits():
     words = estimate_timings("An octopus has three hearts. Its blood is blue.".split(), 4.0)
     chunks = caption_chunks(words, max_words=3)
-    assert all(len(c.words) <= 3 for c in chunks)
-    assert any(c.text.endswith("hearts.") for c in chunks)
+    # Sentences stay whole: a sentence-closing word may finish a phrase one word over the soft limit.
+    assert [c.text for c in chunks] == ["An octopus has three hearts.", "Its blood is blue."]
+    assert all(len(c.words) <= 5 for c in chunks)
+    for a, b in zip(chunks, chunks[1:]):
+        assert a.end <= b.start + 1e-6
+
+
+def test_caption_chunks_never_end_on_a_dangling_word():
+    text = ("The study of the reef in the Pacific surprised the team of divers today. "
+            "It was one of the best days of my life.")
+    words = estimate_timings(text.split(), 8.0)
+    chunks = caption_chunks(words, max_words=3)
+    for c in chunks:
+        assert not _dangling(c.words[-1].text), c.text
+    assert all(len(c.words) <= 5 for c in chunks)  # never more than max_words + 2
+
+
+def test_caption_chunks_never_emit_a_subframe_caption():
+    words = estimate_timings("Go. Now. Wait. Here. Stop. Yes. No. Go again please.".split(), 6.0)
+    chunks = caption_chunks(words, max_words=3, total=6.0)
+    for c in chunks:
+        assert c.end > c.start and c.end - c.start >= 0.05, c.text
     for a, b in zip(chunks, chunks[1:]):
         assert a.end <= b.start + 1e-6
 
@@ -65,4 +86,17 @@ def test_tokenize_no_space_languages():
 
 def test_srt_format():
     text = srt(caption_chunks([Word("Hi", 0.0, 0.5), Word("there.", 0.5, 1.0)], max_words=3))
-    assert text.startswith("1\n00:00:00,000 --> 00:00:01,")
+    # New timing behavior: chunks extend to next chunk start or +0.4s for last chunk
+    assert "00:00:00,000 -->" in text
+    assert "Hi" in text
+    assert "there." in text
+
+
+def test_srt_handles_non_breaking_hyphen():
+    """Regression test for Windows Unicode encoding error with U+2011 (non-breaking hyphen)."""
+    # U+2011 is a non-breaking hyphen that caused 'charmap' codec can't encode character '\\u2011'
+    words = [Word("test\u2011hyphen", 0.0, 1.0)]
+    chunks = caption_chunks(words, max_words=3)
+    text = srt(chunks)
+    assert "\u2011" in text  # non-breaking hyphen preserved
+    assert "test\u2011hyphen" in text

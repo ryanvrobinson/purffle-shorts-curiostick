@@ -1,5 +1,10 @@
 """Word timing: estimate it, transfer it from an aligner onto the script's own words, split the
-narration into scenes and caption chunks."""
+narration into scenes and caption chunks.
+
+Time convention (shared by every module): all times, durations and boundaries are in **seconds**
+(floats), measured from the start of the narration track. A ``Word``'s ``start``/``end`` and a
+``Chunk``'s ``start``/``end`` are absolute positions on that single timeline, which is the only
+authoritative timeline for the render."""
 
 from __future__ import annotations
 
@@ -171,30 +176,86 @@ class Chunk:
         return self.words[0].speaker if self.words else "A"
 
 
-def caption_chunks(words: list[Word], max_words: int = 3, max_chars: int = 20, total: float | None = None) -> list[Chunk]:
-    """Group words into short on-screen captions. Breaks at sentence ends, long pauses and length limits."""
+# Function words a caption should never end on (they belong with what follows).
+DANGLING_ENDINGS = frozenset({
+    "a", "an", "the", "and", "or", "but", "nor", "so", "yet",
+    "in", "on", "at", "to", "for", "of", "with", "by", "from", "as", "into", "onto", "over", "under",
+    "is", "was", "were", "are", "am", "be", "been", "being", "has", "have", "had", "do", "does", "did",
+    "will", "would", "could", "should", "may", "might", "must", "can", "shall", "than", "then",
+    "this", "that", "these", "those", "my", "your", "his", "her", "its", "our", "their",
+})
+_SENTENCE_END = ".!?"
+_MINOR_BREAK = ",;:"
+_TRIM = ".,!?;:\"'“”‘’()[]"
+
+
+def _dangling(text: str) -> bool:
+    """True when ``text`` is a function word that must not end a caption on its own."""
+    return text.lower().strip().strip(_TRIM).strip() in DANGLING_ENDINGS
+
+
+def _merge_short_chunks(chunks: list[Chunk], max_words: int) -> list[Chunk]:
+    """Fold a one-word caption that would flash for a couple of frames into the caption before it."""
+    out: list[Chunk] = []
+    for c in chunks:
+        if out:
+            prev = out[-1]
+            if (len(c.words) == 1 and (c.end - c.start) < 0.2 and c.speaker == prev.speaker
+                    and len(prev.words) + 1 <= max_words + 1):
+                prev.words.extend(c.words)
+                prev.end = c.end
+                continue
+        out.append(c)
+    return out
+
+
+def caption_chunks(words: list[Word], max_words: int = 5, max_chars: int = 40,
+                   total: float | None = None) -> list[Chunk]:
+    """Group words into short on-screen captions (all times in seconds).
+
+    A caption is flushed *before* the next word when the phrase is complete: the previous word ended
+    a sentence, a pause in the voice is long, the speaker changes, or the caption reached its length
+    limit. A length limit is relaxed by one word when the caption would otherwise end on a dangling
+    function word (so phrases never break like "the study of"), and a sentence-closing word is always
+    allowed to finish its phrase. A one-word caption shorter than a couple of frames is merged into
+    its neighbour so it never flickers. Every returned chunk keeps the exact script wording.
+    """
+    max_words = max(1, max_words)
     chunks: list[Chunk] = []
     cur: list[Word] = []
 
-    def flush():
+    def flush() -> None:
         if cur:
             chunks.append(Chunk(list(cur), cur[0].start, cur[-1].end))
             cur.clear()
 
     for w in words:
         if cur:
-            gap = w.start - cur[-1].end
-            chars = sum(len(x.text) + 1 for x in cur) + len(w.text)
-            if len(cur) >= max_words or chars > max_chars or gap > 0.45 or w.speaker != cur[-1].speaker:
+            prev = cur[-1]
+            gap = w.start - prev.end
+            chars_if_added = sum(len(x.text) + 1 for x in cur) + len(w.text)
+            word_closes = w.text[-1:] in _SENTENCE_END
+            # Grow past the soft limit only to rescue a dangling word (possibly a short run of them)
+            # or to finish a sentence; never grow past one word over the limit.
+            rescue = len(cur) <= max_words + 1 and (_dangling(prev.text) or word_closes)
+            at_limit = len(cur) >= max_words and not rescue
+            too_long = chars_if_added > max_chars and len(cur) >= 2 and not rescue
+            if (w.speaker != prev.speaker or gap > 0.45 or prev.text[-1:] in _SENTENCE_END
+                    or at_limit or too_long
+                    or (prev.text[-1:] in _MINOR_BREAK and len(cur) >= 2)):
                 flush()
         cur.append(w)
-        if w.text[-1:] in ".!?;:" or (w.text[-1:] == "," and len(cur) >= 2):
-            flush()
+
     flush()
-    # Each chunk stays on screen until the next one starts (no flicker between words).
+    chunks = _merge_short_chunks(chunks, max_words)
+    # Hold each caption on screen until the next one starts (no flicker between words); keep a small
+    # tail when the next caption is far away, and never let a caption end before it begins.
     for k in range(len(chunks) - 1):
         nxt = chunks[k + 1].start
-        chunks[k].end = nxt if nxt - chunks[k].end < 0.6 else chunks[k].end + 0.25
+        if nxt - chunks[k].end < 0.6:
+            chunks[k].end = max(nxt, chunks[k].start + 0.05)
+        else:
+            chunks[k].end = chunks[k].end + 0.25
     if chunks:
         end = chunks[-1].end + 0.4
         chunks[-1].end = min(end, total) if total else end

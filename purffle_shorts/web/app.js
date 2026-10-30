@@ -224,7 +224,7 @@ function payload(extra = {}) {
     style: f.style === "auto" ? "" : f.style, language: f.language, duration: f.duration, aspect: f.aspect,
     caption_style: f.caption_style, caption_position: f.caption_position, grade: f.grade, transition: f.transition,
     tts: f.tts, voice: f.voice, voice_b: f.voice_b, provider: f.provider, model: f.model, review: f.review,
-    also_langs: f.also_langs, music: f.music, upload: f.upload && S.info.upload && !f.offline, offline: f.offline,
+    also_langs: f.also_langs, music: f.music, upload: false, offline: f.offline,
     visuals: f.visuals,
   };
   if (f.mode === "topic") p.topic = f.topic.trim();
@@ -319,7 +319,7 @@ function drawForm() {
   </section>
 
   <section class="card">
-    <h2>AI & publishing</h2>
+    <h2>AI</h2>
     <div class="grid2">
       <div class="field"><label>AI model provider</label>${sel("provider", provs, f.provider)}</div>
       <div class="field"><label>Model</label><input type="text" data-f="model" value="${esc(f.model)}" placeholder="provider default"></div>
@@ -327,9 +327,9 @@ function drawForm() {
     <div class="field"><label>Script Doctor</label>${seg("review", [["off", "Off"], ["score", "Score only"], ["rewrite", "Score & rewrite"]], f.review)}<p class="hint">A second AI pass grades the hook and pacing, then rewrites weak lines.</p></div>
     <div class="field"><label>Also make it in</label><input type="text" data-f="also_langs" value="${esc(f.also_langs)}" placeholder="e.g. es, hi, pt — translated copies, same footage"></div>
     <div class="grid2">
-      <label class="switch"><input type="checkbox" data-f="upload"${f.upload ? " checked" : ""}${S.info.upload ? "" : " disabled"}><span>Upload to YouTube<small>${S.info.upload ? `${S.info.privacy}, or scheduled` : "disabled in .env (UPLOAD=false)"}</small></span></label>
       <label class="switch"><input type="checkbox" data-f="offline"${f.offline ? " checked" : ""}><span>Demo mode<small>No keys: sample script, generated backgrounds</small></span></label>
     </div>
+    <p class="hint">New videos are drafts. Review and publish them separately from the Library.</p>
   </section>
 
   <div class="go-row">
@@ -439,7 +439,7 @@ function drawEditor() {
       <div class="list">
         <div class="item"><span class="chip accent">1</span><div class="grow"><b>Draft script</b><small>The AI writes it, the Script Doctor scores and improves it, and you edit any line before rendering.</small></div></div>
         <div class="item"><span class="chip accent">2</span><div class="grow"><b>Create video</b><small>Voice, footage, word-synced captions, music and render in one go — about a minute.</small></div></div>
-        <div class="item"><span class="chip accent">3</span><div class="grow"><b>Publish</b><small>Upload or schedule from the Library, or turn on upload here.</small></div></div>
+        <div class="item"><span class="chip accent">3</span><div class="grow"><b>Review & publish</b><small>Preview the finished draft, verify its claims and assets, then upload it from the Library.</small></div></div>
       </div></section>`;
     return;
   }
@@ -587,7 +587,12 @@ async function openVideo(id) {
   $("#drawer").hidden = false;
   document.body.style.overflow = "hidden";
   const up = $("#d-up");
-  if (up) up.onclick = async () => { up.disabled = true; try { await post("/api/upload/" + id); toast("Upload queued — follow it in Queue.", "info"); tick(); } catch (e) { toast(esc(e.message), "bad"); } };
+  if (up) up.onclick = async () => {
+    if (!confirm(`Review "${v.title}" before publishing to YouTube? Check the preview, script, captions and asset rights. Current visibility: ${S.info.privacy}.`)) return;
+    up.disabled = true;
+    try { await post("/api/upload/" + id, { approve: true }); toast("Upload queued — follow it in Queue.", "info"); tick(); }
+    catch (e) { toast(esc(e.message), "bad"); up.disabled = false; }
+  };
   const ed = $("#d-edit");
   if (ed) ed.onclick = () => {
     S.draft = Object.assign({}, sc, { title: (sc.title || "").replace(/\s*#shorts$/i, "") });
@@ -722,7 +727,7 @@ function viewClip() {
         <div class="field"><label>Clips</label><div class="range-row"><input type="range" id="c-n" min="1" max="10" value="${c.count}"><output id="c-out">${c.count}</output></div></div>
         <div class="field"><label>Framing</label>${seg("crop", [["center", "Fill (crop)"], ["blur", "Fit + blur"]], c.crop)}</div>
       </div>
-      <div class="field"><label class="switch"><input type="checkbox" id="c-up"${c.upload ? " checked" : ""}${S.info.upload ? "" : " disabled"}><span>Upload the clips when done</span></label></div>
+      <p class="hint">Clips are drafts. Review and upload them individually from the Library.</p>
       <div class="actions end"><button class="btn primary" id="c-go" type="button">${I.scissors}Find the best moments</button></div>
     </section>
     <section class="card"><h2>How it works</h2><div class="list">
@@ -734,14 +739,13 @@ function viewClip() {
   const save = () => store.set("clip", c);
   $("#c-n").oninput = e => { c.count = +e.target.value; $("#c-out").textContent = c.count; save(); };
   $("#c-src").oninput = e => { c.source = e.target.value; save(); };
-  $("#c-up").onchange = e => { c.upload = e.target.checked; save(); };
   $("#main").addEventListener("click", e => {
     const b = e.target.closest("[data-seg=crop]");
     if (b) { c.crop = b.dataset.v; $$("[data-seg=crop]").forEach(x => x.setAttribute("aria-pressed", String(x.dataset.v === c.crop))); save(); }
   });
   $("#c-go").onclick = async () => {
     if (!c.source.trim()) return toast("Give a video file path or URL.", "bad");
-    try { await post("/api/clip", { source: c.source.trim(), count: c.count, crop: c.crop, upload: c.upload }); toast("Clipping… follow it in Queue.", "info"); tick(); }
+    try { await post("/api/clip", { source: c.source.trim(), count: c.count, crop: c.crop, upload: false }); toast("Clipping… follow it in Queue.", "info"); tick(); }
     catch (e) { toast(esc(e.message), "bad"); }
   };
 }

@@ -19,10 +19,11 @@ import logging
 import random
 import re
 import xml.etree.ElementTree as ET
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from html.parser import HTMLParser
 from pathlib import Path
+from urllib.parse import quote
 
 from .config import Settings
 from .history import History
@@ -44,6 +45,7 @@ class Topic:
     context: str = ""
     style: str = ""
     idea_id: int | None = None
+    source_references: list[dict[str, str]] = field(default_factory=list)
 
 
 def _weighted_sources(settings: Settings) -> list[tuple[str, float]]:
@@ -85,14 +87,19 @@ def from_trends(settings: Settings, history: History) -> Topic | None:
     ns = {"ht": "https://trends.google.com/trending/rss"}
     for item in root.iter("item"):
         title = (item.findtext("title") or "").strip()
+        news_items = item.findall("ht:news_item", ns)
         news = [((n.findtext("ht:news_item_title", namespaces=ns) or "") + " — " +
                  (n.findtext("ht:news_item_snippet", namespaces=ns) or "")).strip(" —")
-                for n in item.findall("ht:news_item", ns)]
+                for n in news_items]
         blob = " ".join([title, *news])
         key = f"trend:{title}"
         if not title or history.topic_used(key) or SENSITIVE.search(blob):
             continue
-        return Topic(title, "trending", key=key, context="\n".join(news[:3]))
+        refs = [{"title": n.findtext("ht:news_item_title", namespaces=ns) or title,
+                 "url": n.findtext("ht:news_item_url", namespaces=ns) or ""}
+                for n in news_items]
+        refs = [ref for ref in refs if ref["url"]]
+        return Topic(title, "trending", key=key, context="\n".join(news[:3]), source_references=refs)
     return None
 
 
@@ -111,7 +118,13 @@ def from_wikipedia(settings: Settings, history: History) -> Topic | None:
             continue
         pages = ev.get("pages") or []
         extract = next((p.get("extract", "") for p in pages if p.get("extract")), "")
-        return Topic(f"On this day in {year}: {text}", "wikipedia", key=key, context=extract[:1500])
+        refs = [{"title": p.get("title", ""), "url": p.get("content_urls", {}).get("desktop", {}).get("page", "")}
+                for p in pages if p.get("title")]
+        if not refs and pages and pages[0].get("title"):
+            refs = [{"title": pages[0]["title"],
+                     "url": f"https://{lang}.wikipedia.org/wiki/{quote(pages[0]['title'].replace(' ', '_'))}"}]
+        return Topic(f"On this day in {year}: {text}", "wikipedia", key=key, context=extract[:1500],
+                     source_references=refs)
     return None
 
 
@@ -126,7 +139,9 @@ def from_reddit(settings: Settings, history: History) -> Topic | None:
         key = f"reddit:{entry.findtext('a:id', default=raw, namespaces=ns)}"
         if not title or history.topic_used(key) or SENSITIVE.search(title):
             continue
-        return Topic(title, "reddit", key=key, context=raw)
+        link = (entry.findtext("a:link", default="", namespaces=ns) or "").strip()
+        return Topic(title, "reddit", key=key, context=raw,
+                     source_references=[{"title": title, "url": link}] if link else [])
     return None
 
 
@@ -158,7 +173,8 @@ def from_rss(settings: Settings, history: History) -> Topic | None:
             key = f"rss:{link or title}"
             if not title or history.topic_used(key) or SENSITIVE.search(f"{title} {summary}"):
                 continue
-            return Topic(title, "rss", key=key, context=summary[:2500])
+            return Topic(title, "rss", key=key, context=summary[:2500],
+                         source_references=[{"title": title, "url": link}] if link else [])
     return None
 
 
@@ -241,7 +257,8 @@ def from_reddit_post(url: str) -> Topic:
     body = re.sub(r"\s*submitted by\s+/u/\S+.*$", "", body, flags=re.I | re.S).strip()
     if not title:
         raise ValueError(f"{url}: couldn't read that Reddit post")
-    return Topic(title, "url", key=f"url:{m.group(0)}", context=f"{title}\n\n{body}"[:6000], style="reddit")
+    return Topic(title, "url", key=f"url:{m.group(0)}", context=f"{title}\n\n{body}"[:6000], style="reddit",
+                 source_references=[{"title": title, "url": m.group(0)}])
 
 
 def from_url(url: str) -> Topic:
@@ -256,7 +273,8 @@ def from_url(url: str) -> Topic:
     title, text = extract_article(r.text)
     if len(text) < 200:
         raise ValueError(f"{url}: couldn't find readable article text on that page")
-    return Topic(title or url, "url", key=f"url:{url}", context=text[:6000])
+    return Topic(title or url, "url", key=f"url:{url}", context=text[:6000],
+                 source_references=[{"title": title or url, "url": url}])
 
 
 def from_document(path: str | Path) -> Topic:
@@ -270,7 +288,8 @@ def from_document(path: str | Path) -> Topic:
         title = first[:90]
     if len(text.strip()) < 40:
         raise ValueError(f"{p}: not enough text to make a video from")
-    return Topic(title or p.stem, "document", key=f"doc:{p.name}", context=text[:6000])
+    return Topic(title or p.stem, "document", key=f"doc:{p.name}", context=text[:6000],
+                 source_references=[{"title": title or p.name, "url": str(p.resolve())}])
 
 
 def pick_topic(settings: Settings, history: History, explicit: str | None = None,

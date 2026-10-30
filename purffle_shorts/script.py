@@ -90,6 +90,8 @@ REVIEW_SCHEMA = {
     "properties": {
         "score": {"type": "integer"},
         "issues": {"type": "array", "items": {"type": "string"}},
+        "blocking_issues": {"type": "array", "items": {"type": "string"}},
+        "advisory_issues": {"type": "array", "items": {"type": "string"}},
         "script": SCRIPT_SCHEMA,
     },
     "required": ["score", "issues", "script"],
@@ -97,7 +99,12 @@ REVIEW_SCHEMA = {
 }
 SCORE_SCHEMA = {
     "type": "object",
-    "properties": {"score": {"type": "integer"}, "issues": {"type": "array", "items": {"type": "string"}}},
+    "properties": {
+        "score": {"type": "integer"},
+        "issues": {"type": "array", "items": {"type": "string"}},
+        "blocking_issues": {"type": "array", "items": {"type": "string"}},
+        "advisory_issues": {"type": "array", "items": {"type": "string"}},
+    },
     "required": ["score", "issues"],
     "additionalProperties": False,
 }
@@ -127,7 +134,8 @@ class Script:
     language: str = "en"
     cast: list[str] = field(default_factory=list)
     score: int | None = None           # Script Doctor retention score (0-100)
-    review: list[str] = field(default_factory=list)  # what the Script Doctor found
+    review: list[str] = field(default_factory=list)  # everything the Script Doctor found
+    blocking: list[str] = field(default_factory=list)  # factual/safety problems that must stop a render
 
     @property
     def narration(self) -> str:
@@ -223,6 +231,8 @@ Language: {lang} for narration, title, hook_text, cast and description. search_q
 {ctx}{ins}{avoid_block}Rules:
 - Total narration about {words} words (~{settings.target_seconds} seconds spoken), split into about {n_scenes} scenes.
 {_format_rules(style)}- Scene 1 is the hook: a bold claim or question that stops the scroll in under 2 seconds. Never "In this video", never a greeting.
+- Make the opening specific immediately: name the subject and its concrete consequence, or ask a precise question the video will answer. Avoid vague phrases such as "a cosmic transformation."
+- Keep the hook scientifically accurate. Frame hypothetical scenarios as hypotheticals, and do not imply an outcome is certain when it is not.
 - Every line earns its place: concrete details, numbers, names. Only well-established facts; no made-up statistics.
 - The last scene lands the payoff, then a short call to action (max 8 words), e.g. asking viewers to comment or follow.
 - Narration is spoken by a voice: no emojis, hashtags, labels, brackets or stage directions.
@@ -337,6 +347,7 @@ def normalize(data: dict, subject: str, style: str, language: str) -> Script:
         cast=cast,
         score=int(score) if isinstance(score, (int, float)) else None,
         review=[str(x) for x in data.get("review") or []][:8],
+        blocking=[str(x) for x in data.get("blocking") or data.get("blocking_issues") or []][:5],
     )
 
 
@@ -366,13 +377,16 @@ def write_script(llm, subject: str, settings: Settings, *, source: str = "niche"
 def review_prompt(script: Script, settings: Settings, rewrite: bool) -> tuple[str, str]:
     words, n_scenes = scene_plan(script.style, settings.target_seconds)
     lang = LANGUAGES.get(script.language, script.language)
-    draft = {k: v for k, v in script.to_dict().items() if k not in ("style", "language", "score", "review")}
+    draft = {k: v for k, v in script.to_dict().items()
+             if k not in ("style", "language", "score", "review", "blocking")}
     system = ("You are a ruthless YouTube Shorts retention editor. You know that viewers decide in 1-2 "
               "seconds and swipe away at any slow moment. You reply with a single JSON object and nothing else.")
     task = (f"""Then rewrite it into the strongest version you can. Keep the same subject, format, language ({lang}),
-the same JSON structure and about {words} words in about {n_scenes} scenes. Fix every issue you listed:
-sharpen the hook, cut filler, make vague lines concrete, remove any claim that may not be true, keep the
-payoff for the end, end with a short call to action. Put the rewritten script in "script".
+    the same JSON structure and about {words} words in about {n_scenes} scenes. Preserve scene order and a
+    coherent progression from hook to payoff. Make the opening a specific, scientifically
+    defensible question or consequence. Fix every issue you listed: sharpen the hook, cut filler, make
+    vague lines concrete, remove any claim that may not be true, keep the payoff for the end, and end with a
+    short call to action. Do not invent facts, statistics, studies, or certainty. Put the rewritten script in "script".
 Format rules to keep:
 {_format_rules(script.style)}""" if rewrite else
             'Return only "score" and "issues".')
@@ -383,45 +397,97 @@ Format rules to keep:
 Score it 0-100 for how well it will hold viewers to the end: hook strength in the first 2 seconds (most
 important), curiosity gaps, pacing, specificity, payoff, and accuracy risk. Be strict: 85+ is rare.
 List the concrete problems in "issues" (max 5, short sentences, most important first).
+Put any problem that could make the video false, unsafe, self-contradictory or unusable in
+"blocking_issues" (for example invented statistics, a study or quote nobody can verify, dangerous advice,
+a claim that contradicts another scene, or a missing payoff). Put pacing/style notes in "advisory_issues".
+Every issue must also appear in "issues"; if there are no blocking issues, return an empty list.
 {task}"""
     return system, user
 
 
+class ScriptQualityError(RuntimeError):
+    """The bounded Script Doctor rewrite did not meet the configured minimum score."""
+
+
 def review_script(llm, script: Script, settings: Settings) -> Script:
-    """Score the script and (in rewrite mode) replace it with the improved version. Never fails the video:
-    if the review call or its rewrite is unusable, the original script is kept."""
+    """Score the script and (in rewrite mode) replace it with the improved version.
+
+    A failed first review keeps the draft; a rewrite-mode score that stays below the threshold after the
+    bounded retry raises ScriptQualityError so the draft is not silently rendered as acceptable.
+    """
     mode = settings.script_review
     if llm is None or mode == "off":
         return script
     rewrite = mode == "rewrite"
-    system, user = review_prompt(script, settings, rewrite)
-    try:
-        data = llm.complete_json(system, user, REVIEW_SCHEMA if rewrite else SCORE_SCHEMA, max_tokens=5000)
-    except Exception as e:
-        log.warning("Script Doctor skipped: %s", e)
-        return script
-    try:
-        score = max(0, min(100, int(data.get("score"))))
-    except (TypeError, ValueError):
-        score = None
-    issues = [str(i).strip() for i in data.get("issues") or [] if str(i).strip()][:5]
-    result = script
-    if rewrite and isinstance(data.get("script"), dict):
+    threshold = settings.script_quality_threshold
+    current = script
+    attempts = 2 if rewrite else 1
+    for attempt in range(attempts):
+        system, user = review_prompt(current, settings, rewrite)
         try:
-            better = normalize(data["script"], script.topic, script.style, script.language)
-            target = scene_plan(script.style, settings.target_seconds)[0]
-            n = word_count(better.narration, script.language)
-            if 0.5 * target <= n <= 1.7 * target:
-                result = better
-            else:
-                log.warning("Script Doctor rewrite ignored: %d words for a %d-word target", n, target)
-        except ValueError as e:
-            log.warning("Script Doctor rewrite ignored: %s", e)
-    result.score, result.review = score, issues
-    changed = "rewritten" if result is not script else "kept"
-    log.info("Script Doctor: %s/100, %s%s", score if score is not None else "?", changed,
-             f" — {issues[0]}" if issues else "")
-    return result
+            data = llm.complete_json(system, user, REVIEW_SCHEMA if rewrite else SCORE_SCHEMA, max_tokens=5000)
+        except Exception as e:
+            log.warning("Script Doctor attempt %d/%d skipped: %s", attempt + 1, attempts, e)
+            if current.blocking:
+                raise ScriptQualityError(
+                    "Script Doctor found blocking factual/safety problems and could not verify a fix: "
+                    + "; ".join(current.blocking)
+                ) from e
+            if rewrite and current.score is not None and current.score < threshold:
+                raise ScriptQualityError(
+                    f"Script Doctor could not complete its bounded retry; score {current.score} remains below "
+                    f"the {threshold}-point threshold, so rendering was stopped."
+                ) from e
+            return current
+        if not isinstance(data, dict):
+            log.warning("Script Doctor returned an unusable response; keeping the current script")
+            if current.blocking:
+                raise ScriptQualityError(
+                    "Script Doctor found blocking factual/safety problems and returned no usable verification: "
+                    + "; ".join(current.blocking)
+                )
+            if rewrite and current.score is not None and current.score < threshold:
+                raise ScriptQualityError(
+                    f"Script Doctor returned no usable retry; score {current.score} remains below the "
+                    f"{threshold}-point threshold, so rendering was stopped."
+                )
+            return current
+        try:
+            score = max(0, min(100, int(data.get("score"))))
+        except (TypeError, ValueError):
+            score = None
+        issues = [str(i).strip() for i in data.get("issues") or [] if str(i).strip()][:5]
+        result = current
+        if rewrite and isinstance(data.get("script"), dict):
+            try:
+                better = normalize(data["script"], current.topic, current.style, current.language)
+                target = scene_plan(current.style, settings.target_seconds)[0]
+                n = word_count(better.narration, current.language)
+                if 0.75 * target <= n <= 1.3 * target:
+                    result = better
+                else:
+                    log.warning("Script Doctor rewrite ignored: %d words for a %d-word target", n, target)
+            except ValueError as e:
+                log.warning("Script Doctor rewrite ignored: %s", e)
+        score = score if score is not None else current.score
+        result.score, result.review = score, issues
+        if score is not None and score < threshold:
+            if rewrite and attempt == 0:
+                log.warning("Script Doctor score %d is below the %d-point threshold; requesting one more "
+                            "bounded review/rewrite attempt", score, threshold)
+                current = result
+                continue
+            if rewrite:
+                raise ScriptQualityError(
+                    f"Script Doctor score {score} remains below the {threshold}-point threshold after "
+                    f"{attempt + 1} bounded review(s); rendering was stopped."
+                )
+            log.warning("Script Doctor score %d is below the %d-point threshold", score, threshold)
+        changed = "rewritten" if result is not current else "kept"
+        log.info("Script Doctor: %s/100, %s%s", score if score is not None else "?", changed,
+                 f" — {issues[0]}" if issues else "")
+        return result
+    return current
 
 
 # --------------------------------------------------------------------------------------------------
@@ -429,7 +495,8 @@ def review_script(llm, script: Script, settings: Settings) -> Script:
 # --------------------------------------------------------------------------------------------------
 def translate_script(llm, script: Script, language: str) -> Script:
     lang = LANGUAGES.get(language, language)
-    src = {k: v for k, v in script.to_dict().items() if k not in ("style", "language", "score", "review")}
+    src = {k: v for k, v in script.to_dict().items()
+           if k not in ("style", "language", "score", "review", "blocking")}
     system = ("You are a native-level translator and YouTube Shorts adapter. You reply with a single JSON "
               "object and nothing else.")
     user = f"""Adapt this YouTube Short into {lang}.
@@ -482,11 +549,11 @@ _DEMO = {
     "hook_text": "THIS ANIMAL HAS 3 HEARTS",
     "scenes": [
         ("An octopus has three hearts, and one of them stops when it swims.", "octopus swimming"),
-        ("Its blood is blue, because it carries oxygen with copper instead of iron.", "blue ocean water"),
+        ("Its blood is blue, because it carries oxygen with copper instead of iron.", "octopus blood blue"),
         ("Most of its neurons are not in its head. They are spread through its eight arms.", "octopus tentacles"),
         ("Each arm can taste what it touches, using thousands of sensors in its suckers.", "octopus suckers closeup"),
-        ("And it changes color in a split second to vanish against the reef.", "coral reef fish"),
-        ("Which fact surprised you most? Follow for more.", "deep sea diver"),
+        ("And it changes color in a split second to vanish against the reef.", "octopus camouflage color change"),
+        ("Which fact surprised you most? Follow for more.", "octopus"),
     ],
     "description": "Three hearts, blue blood and arms that can taste. The octopus might be the strangest "
                    "animal on Earth. Which fact surprised you most?",
@@ -497,13 +564,13 @@ _DEMO = {
 
 _DEMO_DIALOGUE = [
     ("A", "Wait, octopuses have three hearts?", "octopus swimming"),
-    ("B", "Three. And one of them stops beating every time it swims.", "octopus underwater"),
-    ("A", "That can't be healthy.", "coral reef"),
+    ("B", "Three. And one of them stops beating every time it swims.", "octopus swimming underwater"),
+    ("A", "That can't be healthy.", "octopus heart anatomy"),
     ("B", "It's why they'd rather crawl. Swimming wears them out.", "octopus crawling"),
-    ("A", "Okay, but why is their blood blue?", "blue ocean water"),
-    ("B", "Copper. Their blood carries oxygen with copper instead of iron.", "deep sea"),
-    ("A", "So they're basically aliens.", "jellyfish glowing"),
-    ("B", "Pretty much. Follow for more ocean weirdness.", "ocean waves"),
+    ("A", "Okay, but why is their blood blue?", "octopus blood blue"),
+    ("B", "Copper. Their blood carries oxygen with copper instead of iron.", "copper blood cells"),
+    ("A", "So they're basically aliens.", "octopus alien-like"),
+    ("B", "Pretty much. Follow for more ocean weirdness.", "octopus"),
 ]
 
 _DEMO_REDDIT = [
@@ -523,12 +590,12 @@ _DEMO_CHAT = [
     ("B", "yeah why", "aquarium fish"),
     ("A", "the octopus tank. look at it", "octopus tank"),
     ("B", "it's empty??", "empty aquarium"),
-    ("A", "it's not empty. look closer", "coral reef"),
-    ("B", "omg it's on the glass. it was the same color as the rock", "octopus camouflage"),
-    ("A", "they can change color in under a second", "octopus color"),
-    ("B", "that's actually terrifying", "dark ocean"),
+    ("A", "it's not empty. look closer", "octopus camouflage"),
+    ("B", "omg it's on the glass. it was the same color as the rock", "octopus camouflage glass"),
+    ("A", "they can change color in under a second", "octopus color change"),
+    ("B", "that's actually terrifying", "octopus closeup"),
     ("A", "wait till you hear it has three hearts", "octopus swimming"),
-    ("B", "ok follow for part 2", "ocean waves"),
+    ("B", "ok follow for part 2", "octopus"),
 ]
 
 
@@ -566,9 +633,16 @@ def offline_script(subject: str, settings: Settings, style: str = "facts") -> Sc
         "And one small fact changes how you see the whole thing.",
         "Would you have guessed that? Follow for more.",
     ]
+    # Give every scene a slightly different search so stock footage doesn't repeat: the same subject with a
+    # rotating visual modifier. The offline writer can't extract real nouns, but this keeps queries filmable.
+    modifiers = ["closeup", "background", "detail", "wide shot", "slow motion"]
+    scenes = [{"narration": n,
+               "search_query": f"{s} {modifiers[i % len(modifiers)]}",
+               "image_prompt": f"{s}, {modifiers[i % len(modifiers)]}"}
+              for i, n in enumerate(lines)]
     data = {
         "topic": s, "title": f"The Truth About {s.title()}", "hook_text": "YOU WON'T EXPECT THIS",
-        "scenes": [{"narration": n, "search_query": s, "image_prompt": s} for n in lines],
+        "scenes": scenes,
         "description": f"A quick look at {s}. What would you add?",
         "hashtags": ["#facts"], "tags": [s, "facts"], "category": "education",
     }
