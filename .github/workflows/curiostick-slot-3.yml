@@ -137,7 +137,7 @@ jobs:
                 sys.exit(0 if row else 1)
             except Exception:
                 sys.exit(1)
-            PY
+          PY
             then
               echo "Slot ${SLOT} for ${RUN_DATE} already recorded on remote; nothing to push."
               exit 0

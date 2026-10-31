@@ -393,12 +393,14 @@ def write_script(llm, subject: str, settings: Settings, *, source: str = "niche"
 def review_prompt(script: Script, settings: Settings, rewrite: bool) -> tuple[str, str]:
     words, n_scenes = scene_plan(script.style, settings.target_seconds)
     lang = LANGUAGES.get(script.language, script.language)
+    lo, hi = int(0.75 * words), int(1.3 * words)
     draft = {k: v for k, v in script.to_dict().items()
              if k not in ("style", "language", "score", "review", "blocking")}
     system = ("You are a ruthless YouTube Shorts retention editor. You know that viewers decide in 1-2 "
               "seconds and swipe away at any slow moment. You reply with a single JSON object and nothing else.")
     task = (f"""Then rewrite it into the strongest version you can. Keep the same subject, format, language ({lang}),
-    the same JSON structure and about {words} words in about {n_scenes} scenes. Preserve scene order and a
+    the same JSON structure and between {lo} and {hi} words (target {words}) in {n_scenes} scenes. Do not pad or cut
+    scenes to hit the count; keep the same information density. Preserve scene order and a
     coherent progression from hook to payoff. Make the opening a specific, scientifically
     defensible question or consequence. Fix every issue you listed: sharpen the hook, cut filler, make
     vague lines concrete, remove any claim that may not be true, keep the payoff for the end, and end with a
@@ -484,10 +486,17 @@ def review_script(llm, script: Script, settings: Settings) -> Script:
                 better = normalize(data["script"], current.topic, current.style, current.language)
                 target = scene_plan(current.style, settings.target_seconds)[0]
                 n = word_count(better.narration, current.language)
-                if 0.75 * target <= n <= 1.3 * target:
+                previous_score = current.score
+                if 0.75 * target <= n <= 1.3 * target and (
+                    score is None or previous_score is None or score >= previous_score
+                ):
                     result = better
                 else:
-                    log.warning("Script Doctor rewrite ignored: %d words for a %d-word target", n, target)
+                    log.warning(
+                        "Script Doctor rewrite ignored: %d words for a %d-word target or no score gain",
+                        n,
+                        target,
+                    )
             except ValueError as e:
                 log.warning("Script Doctor rewrite ignored: %s", e)
         score = score if score is not None else current.score

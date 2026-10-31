@@ -88,6 +88,19 @@ def _draft(words=10, n=4):
     return normalize({"title": "Draft", "hook_text": "HOOK", "scenes": _scenes(n, words)}, "cats", "facts", "en")
 
 
+def _full_script(scenes, title="X"):
+    return {
+        "title": title,
+        "hook_text": "HOOK",
+        "cast": [],
+        "scenes": scenes,
+        "description": "d",
+        "hashtags": ["#cats"],
+        "tags": ["cats"],
+        "category": "pets",
+    }
+
+
 def test_doctor_rewrite_is_used_when_sane():
     settings = Settings(target_seconds=16)  # 41-word target
     better = {"title": "Better", "hook_text": "WOW", "cast": [], "scenes": _scenes(5, 9), "description": "d",
@@ -175,6 +188,43 @@ def test_low_score_gets_one_bounded_second_review():
 
     assert out.title == "Specific" and out.score == 82
     assert len(llm.calls) == 2
+
+
+def test_undersized_rewrite_is_ignored_then_bounded_retry_succeeds():
+    """An undersized rewrite is ignored; the bounded retry with an in-range, higher-score rewrite wins."""
+    target = scene_plan("facts", 16)[0]  # 41-word target
+    lo, hi = int(0.75 * target), int(1.3 * target)  # 30 .. 53
+
+    def replies(user):
+        if len(llm.calls) == 1:
+            return {
+                "score": 45,
+                "issues": ["too short"],
+                "script": _full_script(_scenes(4, 5)),  # 20 words, below the 30-word floor
+            }
+        assert f"between {lo} and {hi} words" in user
+        return {"score": 82, "issues": [], "script": _full_script(_scenes(5, 9))}  # 45 words, in range
+
+    llm = FakeLLM(replies)
+    out = review_script(llm, _draft(), Settings(target_seconds=16, script_quality_threshold=70))
+
+    assert out.score == 82 and out.review == []
+    assert len(llm.calls) == 2  # one bounded retry happened
+
+
+def test_in_bounds_rewrite_without_score_gain_is_not_adopted():
+    """A rewrite inside the word bounds but with a lower score is rejected on the bounded retry."""
+    def replies(user):
+        if len(llm.calls) == 1:
+            return {"score": 60, "issues": ["ok"],
+                    "script": _full_script(_scenes(5, 9))}  # 45 words, score 60
+        return {"score": 55, "issues": ["worse"],
+                "script": _full_script(_scenes(5, 9), title="Second")}  # lower score, in bounds
+
+    llm = FakeLLM(replies)
+    with pytest.raises(ScriptQualityError, match="rendering was stopped"):
+        review_script(llm, _draft(), Settings(target_seconds=16, script_quality_threshold=70))
+    assert len(llm.calls) == 2  # bounded retry happened, lower-score rewrite not adopted
 
 
 def test_doctor_failure_never_fails_the_video():
