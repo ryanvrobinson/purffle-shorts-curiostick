@@ -83,6 +83,11 @@ def _common(p: argparse.ArgumentParser) -> None:
                    help="auto=stock-first with AI fallback; hybrid=alternate stock clips and AI images")
     g.add_argument("--hybrid-image-every", type=int,
                    help="hybrid mode: make every Nth scene an AI image (min 2, default 2)")
+    g.add_argument("--visual-choice", choices=["stock-first", "ai-first", "suitability", "agnes-only"],
+                   help="how to pick stock vs AI per scene: stock-first (default), ai-first, suitability (filmable->stock, concept->AI), agnes-only (Agnes for every scene; error if unavailable)")
+    g.add_argument("--research", action="store_true", help="enable claim-based fact verification for the script")
+    g.add_argument("--verify-facts", action="store_true", dest="research", help="alias for --research")
+    g.add_argument("--storyboard-only", action="store_true", help="write the script and stop before rendering (draft for review)")
     r = p.add_argument_group("look & output")
     r.add_argument("--caption-style", help="kinetic|bold|boxed|neon|clean|karaoke|minimal")
     r.add_argument("--caption-position", help="upper|center|lower")
@@ -112,7 +117,7 @@ def build_settings(args: argparse.Namespace) -> Settings:
         "style", "language", "target_seconds", "llm_provider", "llm_model", "tts_engine", "tts_voice",
         "tts_voice_b", "script_quality_threshold", "caption_style", "caption_position", "caption_exit",
         "caption_exit_seconds", "caption_reduced_effects", "color_grade", "transition", "visual_mode",
-        "hybrid_image_every", "fps", "video_encoder", "privacy")}
+        "hybrid_image_every", "fps", "video_encoder", "privacy", "visual_choice", "research")}
     if getattr(args, "niche", None):
         ov["niches"] = args.niche
     if getattr(args, "visuals", None):
@@ -163,11 +168,26 @@ def cmd_make(args, s: Settings) -> int:
     studio = Studio(s)
     ok = 0
     for _ in range(max(1, args.count or 1)):
-        r = studio.make(args.topic, source=args.source, script_file=args.script, url=args.url,
-                        document=args.from_file)
-        for x in [r, *r.variants]:
-            ok += x.ok
-            print_result(x)
+        if getattr(args, "storyboard_only", False):
+            # Storyboard only: draft the script (with research verification if enabled) and stop.
+            script, pick, writer = studio.draft(
+                args.topic, source=args.source, style=s.style if s.style != "auto" else None,
+                url=args.url, document=args.from_file)
+            print(f"\nStoryboard: {script.title}")
+            print(f"  Topic: {script.topic}  Style: {script.style}  Scenes: {len(script.scenes)}")
+            print(f"  Hook: {script.hook_text}")
+            print(f"  Score: {script.score}/100" if script.score is not None else "  Score: not reviewed")
+            for i, sc in enumerate(script.scenes, 1):
+                print(f"\n  Scene {i} ({sc.speaker}): {sc.narration}")
+                print(f"    Visual: {sc.visual_description or '(not set)'}  Source: {sc.visual_source or '(not set)'}")
+                print(f"    Search: {sc.search_query}  Image: {sc.image_prompt}")
+            ok = 1
+        else:
+            r = studio.make(args.topic, source=args.source, script_file=args.script, url=args.url,
+                            document=args.from_file)
+            for x in [r, *r.variants]:
+                ok += x.ok
+                print_result(x)
     return 0 if ok else 1
 
 
@@ -493,8 +513,34 @@ def cmd_mcp(args, s: Settings) -> int:
 
 
 def cmd_daily(args, s: Settings) -> int:
-    """Run the daily automation: one video per day with quality gate and upload safeguards."""
-    from .automation import DailyAutomation
+    """Run the daily automation: one video per day with quality gate and upload safeguards.
+
+    With --slot, runs one publishing slot instead: generate -> quality gate ->
+    (with --publish) schedule a private YouTube video for the slot's IST time.
+    Without --publish the slot run is a dry run that never touches YouTube.
+    """
+    from .automation import DailyAutomation, SLOT_LABELS, SlotAutomation
+
+    if args.slot is not None:
+        automation = SlotAutomation(
+            s, slot=args.slot, run_date=args.date,
+            dry_run=not args.publish, skip_quality=args.skip_quality,
+        )
+        result = automation.run_slot()
+        label = SLOT_LABELS[args.slot]
+        print(f"\nCurioStick slot {args.slot} ({label}) for {result.run_date}")
+        if result.publish_at_utc:
+            print(f"  Publish target: {result.publish_at_ist} = {result.publish_at_utc} UTC")
+        if result.dry_run:
+            print("  Dry run: no upload was made; use --publish to schedule for real.")
+        if result.skipped:
+            print(f"  Skipped: {result.skip_reason}")
+        if result.uploaded:
+            print(f"  Scheduled on YouTube: https://youtube.com/shorts/{result.youtube_id}")
+        if result.error:
+            print(f"  Error: {result.error}")
+            return 1
+        return 0
 
     automation = DailyAutomation(
         s,
@@ -540,6 +586,12 @@ def build_parser() -> argparse.ArgumentParser:
     daily.add_argument("--skip-quality", action="store_true", help="skip quality gate checks")
     daily.add_argument("--skip-upload", action="store_true",
                        help="deprecated; daily runs always stop at review and never publish")
+    daily.add_argument("--slot", type=int, choices=[1, 2, 3],
+                       help="publishing slot: 1 = 09:00 IST, 2 = 14:00 IST, 3 = 19:00 IST")
+    daily.add_argument("--date", metavar="YYYY-MM-DD",
+                       help="Asia/Kolkata date for the slot (default: today in --timezone)")
+    daily.add_argument("--publish", action="store_true",
+                       help="actually schedule the video on YouTube; without it the run is dry-run only")
     daily.add_argument("--instagram", action="store_true", help="enable Instagram Reels publishing")
     daily.set_defaults(func=cmd_daily)
 

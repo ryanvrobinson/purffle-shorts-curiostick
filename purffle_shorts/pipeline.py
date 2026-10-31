@@ -16,12 +16,13 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 
-from . import analytics, ffmpeg, notify, topics, tts, youtube
+from . import analytics, ffmpeg, notify, research, topics, tts, youtube
 from .config import Settings
 from .history import History, now_iso
 from .llm import LLM, LLMConfigError, LLMNotConfigured
 from .media import AI_SOURCES, MediaItem, Visuals
 from .overlays import ChatMessage, build_overlays
+from .quality import QualityGate
 from .render import extract_frame, render_video
 from .script import (
     CARD_STYLES,
@@ -205,6 +206,12 @@ class Studio:
             if llm is not None and s.script_review != "off":
                 self._step("review", "Script Doctor")
                 script = review_script(llm, script, s)
+            if llm is not None and s.research_verify:
+                self._step("research", "fact verification")
+                claims = research.extract_claims_from_script(script, s.language)
+                report = research.verify_script_claims(claims, pick, llm)
+                script.verification_report = report.to_dict()
+                log.info("Fact verification: %d claims, %s", len(report.claims), report.status)
         except BaseException:
             if pick.idea_id:
                 self.history.release_idea(pick.idea_id)
@@ -333,6 +340,15 @@ class Studio:
                 log.warning("Narration is %.1fs, about %.0f%% off the requested %ds target. Adjust the "
                             "script length (TARGET_SECONDS or the scene count) if this matters.",
                             info["duration"], abs(deviation) / s.target_seconds * 100, s.target_seconds)
+
+            # Phase 4: extended quality control
+            qc_report = QualityGate(s).check(Result(
+                ok=True, video=video, folder=folder, status="rendered"))
+            if not qc_report.passed:
+                log.warning("QC gate reported %d automated failure(s): %s",
+                            len(qc_report.automated_failures), qc_report.summary)
+                for adv in qc_report.heuristic_advisories:
+                    log.info("QC advisory (%s): %s", adv.name, adv.message)
             extract_frame(video, min(1.2, total / 3), folder / "cover.jpg")
             (folder / "captions.srt").write_text(srt(chunks), encoding="utf-8")
 
@@ -356,6 +372,9 @@ class Studio:
                 "factual_verification": "not_performed",
                 "warnings": research_warnings,
             }
+            if script.verification_report:
+                script_review["factual_verification"] = script.verification_report.get("status", "not_performed")
+                script_review["claims"] = script.verification_report.get("claims", [])
             meta = {
                 "title": title, "description": description, "tags": script.tags,
                 "category_id": script.category_id, "language": s.language,
@@ -366,12 +385,24 @@ class Studio:
                 "llm": writer, "score": script.score, "review": script.review, "cast": script.cast,
                 "research": research, "review_results": script_review, "approval_status": "pending",
                 "voice": f"{speech.engine}:{speech.voice}", "timing": speech.timing,
-                "visuals": [{"source": m.source, "id": m.id, "kind": m.kind, "query": m.query} for m in media],
+                "visuals": [{"source": m.source, "id": m.id, "kind": m.kind, "query": m.query,
+                             "credit": m.credit, "license": m.license, "source_url": m.source_url,
+                             "attribution": m.attribution_line} for m in media],
                 "visual_mode": s.visual_mode,
+                "visual_choice": s.visual_choice,
                 "visual_selection": selection,
+                "verification_report": script.verification_report,
                 "parent_id": parent_id, "created_at": now_iso(),
             }
             (folder / "metadata.json").write_text(json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8")
+
+            # Save attribution/credits file alongside the video.
+            credits_lines = []
+            for m in media:
+                if m.attribution_line:
+                    credits_lines.append(f"{m.query}: {m.attribution_line}")
+            if credits_lines:
+                (folder / "credits.txt").write_text("\n".join(credits_lines) + "\n", encoding="utf-8")
 
             rid = self.history.add_video(
                 subject=pick.subject, source=pick.source, topic=script.topic, style=script.style,
@@ -491,6 +522,106 @@ class Studio:
         if result:
             result.status, result.youtube_id, result.publish_at = status, vid, publish_iso
         return status
+
+    # ------------------------------------------------------------------ scheduled (non-interactive) upload
+    def upload_scheduled(self, rid: int, publish_at: datetime, result: Result | None = None,
+                         slot: int | None = None, run_date: str | None = None) -> str:
+        """Upload video ``rid`` as a private YouTube video scheduled to go public at ``publish_at``.
+
+        This is the dedicated non-interactive publishing path: no ``PUBLISH`` prompt, no
+        public upload. ``privacyStatus`` is ``private`` and ``publishAt`` is a future
+        timestamp for the assigned IST slot. Quality approval must already have happened
+        (the caller runs the quality gate first).
+
+        Returns one of: ``scheduled``, ``queued``, ``already-uploaded``, ``missing``, ``failed``.
+        """
+        from . import youtube as YT
+
+        rec = self.history.get(rid)
+        if not rec or not rec.get("video_path") or not Path(rec["video_path"]).exists():
+            log.error("Video #%s has no file to upload", rid)
+            return "missing"
+        if rec.get("youtube_id") or rec.get("status") in ("uploaded", "scheduled"):
+            log.warning("Video #%s already has a YouTube upload; refusing to create a duplicate", rid)
+            return "already-uploaded"
+        if self.quota_left() <= 0:
+            log.warning("Daily upload limit (%d) reached — video #%d not scheduled",
+                        self.s.daily_upload_limit, rid)
+            self.history.update_video(rid, status="queued")
+            if result:
+                result.status = "queued"
+            notify.send(self.s, "queued", title=rec["title"], detail="daily upload limit reached")
+            return "queued"
+
+        # Best-effort cross-runner idempotency: if this slot already has a video on the
+        # channel (e.g. the history database was not carried over to this runner), do not
+        # re-upload. This never blocks an upload if YouTube itself cannot be reached.
+        if slot is not None and run_date is not None:
+            try:
+                yt = YT.service(self.s, interactive=False)
+                found = YT.find_existing_video(yt, f"CurioStick Short slot {slot} {run_date}")
+            except YT.NotAuthorized:
+                found = None
+            except Exception as e:  # network/auth hiccups: local ledger remains the authority
+                log.warning("YouTube duplicate check could not run: %s", e)
+                found = None
+            if found:
+                log.warning("Slot %s on %s already has YouTube video %s; not re-uploading",
+                            slot, run_date, found)
+                self.history.update_video(
+                    rid, status="scheduled", youtube_id=found,
+                    uploaded_at=now_iso(), publish_at=YT.to_rfc3339(publish_at))
+                if result:
+                    result.status, result.youtube_id, result.publish_at = (
+                        "scheduled", found, YT.to_rfc3339(publish_at))
+                return "already-uploaded"
+
+        folder = Path(rec["folder"])
+        meta = json.loads((folder / "metadata.json").read_text()) if (folder / "metadata.json").exists() else {}
+        description = rec["description"] or ""
+        if slot is not None and run_date is not None:
+            description += (
+                f"\n\nCurioStick Short — slot {slot} | {run_date} (Asia/Kolkata)"
+                f"\nScheduled to go public at {publish_at.strftime('%H:%M IST')}."
+            )
+        body = YT.build_body(self.s, rec["title"], description,
+                             json.loads(rec["tags"] or "[]"), meta.get("category_id", "27"),
+                             meta.get("language", self.s.language), publish_at)
+        try:
+            resp = YT.upload(self.s, Path(rec["video_path"]), body)
+        except YT.QuotaExceeded:
+            log.warning("YouTube refused the upload (quota/upload limit) — video #%d queued until midnight Pacific", rid)
+            self._refused_on = quota_day_start()
+            self.history.update_video(rid, status="queued")
+            if result:
+                result.status = "queued"
+            notify.send(self.s, "queued", title=rec["title"], detail="YouTube's upload limit reached")
+            return "queued"
+        except YT.NotAuthorized:
+            raise
+        except Exception as e:
+            log.error("Scheduled upload of #%d failed: %s", rid, e)
+            self.history.update_video(rid, status="failed", error=str(e)[:500])
+            if result:
+                result.status, result.error = "upload-failed", str(e)
+            notify.send(self.s, "failed", title=rec["title"], detail=f"scheduled upload failed: {redact(e)}")
+            return "failed"
+
+        vid = resp.get("id")
+        publish_iso = YT.to_rfc3339(publish_at)
+        fields = dict(status="scheduled", youtube_id=vid, uploaded_at=now_iso(), publish_at=publish_iso)
+        if not self.s.keep_videos:
+            Path(rec["video_path"]).unlink(missing_ok=True)
+            fields["video_path"] = None
+        self.history.update_video(rid, **fields)
+        log.info("Scheduled: https://youtube.com/shorts/%s, public %s", vid,
+                 publish_at.strftime("%a %d %b %H:%M %Z"))
+        notify.send(self.s, "scheduled", title=rec["title"],
+                    url=f"https://youtube.com/shorts/{vid}",
+                    detail=f"public {publish_at.strftime('%a %d %b %H:%M %Z')}")
+        if result:
+            result.status, result.youtube_id, result.publish_at = "scheduled", vid, publish_iso
+        return "scheduled"
 
     def flush_queue(self, include_rendered: bool = False) -> int:
         statuses = ("queued", "rendered") if include_rendered else ("queued",)

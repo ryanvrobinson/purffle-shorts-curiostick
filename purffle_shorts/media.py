@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import quote
 
-from PIL import Image, UnidentifiedImageError
+from PIL import Image, ImageChops, ImageFilter, ImageStat, UnidentifiedImageError
 
 from . import ffmpeg
 from .config import Settings
@@ -31,6 +31,189 @@ MAX_DOWNLOAD_ATTEMPTS = 3  # per query before moving on; one bad CDN response mu
 ANIMALS = {"octopus", "octopi", "shark", "whale", "dolphin", "fish", "turtle", "crab", "jellyfish", "seal",
            "penguin", "cat", "dog", "bird", "insect", "spider", "snake", "lion", "tiger", "elephant"}
 
+# ------------------------------------------------------------------------------------------ visual choice modes
+VISUAL_CHOICE_STOCK_FIRST = "stock-first"   # current default behaviour
+VISUAL_CHOICE_AI_FIRST = "ai-first"         # try AI images before stock
+VISUAL_CHOICE_SUITABILITY = "suitability"   # filmable -> stock, concept -> AI
+VISUAL_CHOICE_AGNES_ONLY = "agnes-only"     # Agnes for every scene; error if unavailable
+
+VALID_VISUAL_CHOICES = {
+    VISUAL_CHOICE_STOCK_FIRST,
+    VISUAL_CHOICE_AI_FIRST,
+    VISUAL_CHOICE_SUITABILITY,
+    VISUAL_CHOICE_AGNES_ONLY,
+}
+
+# ------------------------------------------------------------------------------------------ Agnes image quality
+# Agnes API genuinely supports: model, prompt, size, n. Size options:
+#   portrait  -> 1024x1536   landscape -> 1536x1024   default -> 1024x1024
+# No negative_prompt, seed, guidance_scale or reference_image parameters are
+# confirmed, so they are deliberately NOT sent.
+AGNES_DEFAULT_MODEL = "agnes-image-2.5-flash"
+AGNES_PORTRAIT_SIZE = "1024x1536"   # 9:16-friendly (2:3 aspect)
+AGNES_MAX_RETRIES = 2               # max additional retries after first failure
+
+# Quality-control thresholds (pure-PIL heuristics, no vision model required).
+BLANK_VARIANCE_THRESHOLD = 8.0      # grayscale range below this = blank/near-blank
+BLUR_EDGE_STRENGTH_THRESHOLD = 6.0  # edge strength below this = too blurry
+MIN_PORTRAIT_ASPECT = 1.3           # height/width ratio considered "portrait enough"
+
+
+@dataclass
+class ImageQualityResult:
+    """Result of image quality control checks."""
+
+    passed: bool
+    score: float                      # 0-100 overall quality score
+    checks: dict                      # individual check name -> (passed, message)
+    reasons: list[str]                # human-readable failure reasons
+    dimensions: tuple[int, int] | None = None
+    file_size: int | None = None
+
+
+# Cinematic style modifiers applied per scene topic for visual identity.
+AGNES_STYLE_MODIFIERS = {
+    "documentary": "documentary cinematography, naturalistic lighting, authentic textures, film grain",
+    "cinematic": "cinematic color grading, dramatic chiaroscuro lighting, anamorphic depth, film still",
+    "scientific": "scientific documentary reconstruction, accurate detail, educational visual style",
+    "historical": "historical reconstruction, period-accurate architecture and costume, archival aesthetic",
+    "nature": "natural history documentary, wildlife cinematography, rich environmental detail",
+    "space": "space documentary, cosmic scale, nebula and stellar detail, telescope imagery",
+}
+
+
+def build_agnes_prompt(
+    narration: str,
+    visual_description: str = "",
+    scene_index: int = 0,
+    topic: str = "",
+    style_hint: str = "documentary",
+) -> str:
+    """Build a detailed, scene-aware prompt for Agnes image generation.
+
+    The prompt specifies subject, environment, action, camera, lighting,
+    textures, depth, composition and art direction — never just raw narration.
+    """
+    # Subject/environment: prefer the explicit visual description, fall back to narration.
+    # Include narration context so the image matches the scene's story.
+    subject = (visual_description or narration[:300]).strip()
+    narration_context = f" Scene narrative: {narration[:200]}." if narration and narration != subject else ""
+
+    # Cinematic base style for visual identity coherence.
+    style = AGNES_STYLE_MODIFIERS.get(
+        style_hint, AGNES_STYLE_MODIFIERS["documentary"]
+    )
+
+    # Camera perspective rotates by scene index to avoid repetitive angles.
+    camera_by_index = [
+        "eye-level medium shot, balanced composition",
+        "low-angle wide shot, dramatic foreground, leading lines",
+        "close-up detail shot, shallow depth of field, sharp focus on subject",
+        "high-angle establishing shot, expansive environment, atmospheric perspective",
+        "over-the-shoulder medium shot, intimate framing, natural eye contact",
+        "dutch angle dynamic shot, tension and movement, cinematic composition",
+    ]
+    camera = camera_by_index[scene_index % len(camera_by_index)]
+
+    # Lighting varies by scene for visual distinctness.
+    lighting_by_index = [
+        "soft golden hour lighting, warm rim light, gentle shadows",
+        "cool blue hour lighting, high contrast, deep shadows, moody atmosphere",
+        "bright natural daylight, even illumination, clear visibility",
+        "dramatic spotlighting, volumetric god rays, cinematic contrast",
+        "diffused overcast lighting, soft shadows, neutral tones",
+        "moody twilight lighting, subtle color grading, atmospheric haze",
+    ]
+    lighting = lighting_by_index[scene_index % len(lighting_by_index)]
+
+    prompt = (
+        f"{subject}{narration_context}. {style}. {camera}. {lighting}. "
+        f"Realistic textures and fine surface details, "
+        f"clear depth with distinct foreground, midground and background elements, "
+        f"vertical 9:16 portrait composition optimized for mobile documentary Shorts, "
+        f"professional documentary art direction, cinematic still frame. "
+        f"No text, no letters, no watermark, no UI elements, no signatures."
+    )
+    return prompt
+
+
+def _improve_prompt_for_retry(prompt: str, reason: str, attempt: int) -> str:
+    """Improve a prompt based on a rejection reason, avoiding identical resubmission."""
+    additions = {
+        "blank": " high-contrast vivid lighting, saturated colors, well-exposed scene",
+        "blurry": " sharp focus, crisp edges, high detail, clear subject definition",
+        "composition": " centered subject, strong vertical composition, clear foreground-background separation",
+        "corrupt": " high-quality photorealistic rendering, clean image data",
+        "dimensions": " portrait orientation, tall vertical composition, 9:16 aspect",
+        "unsuitable": " professional documentary photography, detailed cinematic shot",
+    }
+    addition = additions.get(reason, " cinematic documentary quality, high detail")
+    return f"{prompt}. {addition} (refined attempt {attempt + 1})"
+
+# Keywords that suggest a scene depicts a real, filmable place or subject (stock footage is appropriate).
+FILMABLE_KEYWORDS = {
+    "ocean", "sea", "beach", "coast", "island", "lake", "river", "waterfall", "mountain", "mountains",
+    "valley", "canyon", "desert", "forest", "jungle", "woods", "cave", "glacier", "volcano", "reef",
+    "city", "town", "village", "street", "road", "bridge", "building", "temple", "ruins", "castle",
+    "waterfall", "park", "garden", "farm", "field", "meadow", "countryside", "savanna", "tundra",
+    "iceberg", "glacier", "cliff", "canyon", "archipelago", "lagoon", "marsh", "swamp", "delta",
+    "street", "avenue", "plaza", "skyline", "downtown", "harbor", "port", "dock", "lighthouse",
+    "airport", "station", "market", "bazaar", "canyon", "gorge", "plateau", "steppe", "prairie",
+    "animal", "wildlife", "lion", "elephant", "tiger", "bear", "wolf", "deer", "whale", "dolphin",
+    "shark", "octopus", "turtle", "bird", "eagle", "penguin", "fish", "coral", "reef",
+    "snow", "rain", "storm", "sunset", "sunrise", "fog", "mist", "cloud", "sky", "night", "day",
+    "weather", "season", "autumn", "winter", "spring", "summer", "leaf", "flower", "tree",
+}
+
+# Keywords that suggest an unfilmable concept or scientific cutaway (AI image is appropriate).
+CONCEPT_KEYWORDS = {
+    "atom", "molecule", "cell", "dna", "gene", "neuron", "synapse", "organ", "heart", "lung",
+    "brain", "blood", "vein", "artery", "capillary", "mitochondria", "ribosome", "protein",
+    "virus", "bacteria", "microbe", "germ", "particle", "photon", "electron", "proton", "neutron",
+    "quark", "black hole", "galaxy", "nebula", "supernova", "quasar", "pulsar", "dark matter",
+    "dimension", "timeline", "paradox", "quantum", "relativity", "gravity", "force", "energy",
+    "radiation", "frequency", "wave", "spectrum", "magnetic", "electric", "circuit", "chip",
+    "nanobot", "nanotech", "microscope", "telescope", "satellite", "orbit", "eclipse",
+    "constellation", "asteroid", "comet", "meteor", "exoplanet", "light-year", "big bang",
+    "singularity", "event horizon", "wormhole", "antimatter", "fusion", "fission",
+    "chemical", "compound", "reaction", "catalyst", "acid", "base", "element", "isotope",
+    "crystal", "lattice", "fluid dynamics", "turbulence", "viscosity", "pressure", "vacuum",
+    "entropy", "thermal", "heat", "cold", "absolute zero", "plasma", "superconductor",
+}
+
+
+def classify_suitability(narration: str, image_prompt: str = "", topic: str = "") -> str:
+    """Classify a scene as ``filmable`` or ``concept``.
+
+    ``filmable`` means a real place/subject that stock footage can plausibly show.
+    ``concept`` means a scientific or abstract idea that cannot be filmed directly.
+    Returns ``"filmable"`` or ``"concept"``.
+    """
+    text = f"{narration} {image_prompt} {topic}".lower()
+    filmable_score = sum(1 for kw in FILMABLE_KEYWORDS if kw in text)
+    concept_score = sum(1 for kw in CONCEPT_KEYWORDS if kw in text)
+    if concept_score > filmable_score:
+        return "concept"
+    return "filmable"
+
+
+def _build_attribution_line(source: str, credit: str, license_str: str, source_url: str) -> str:
+    """Build a human-readable attribution line from actual provider metadata.
+
+    Never invents attribution; every component comes from the selected asset.
+    """
+    parts = []
+    if credit:
+        parts.append(credit)
+    if source:
+        parts.append(source.title())
+    if license_str:
+        parts.append(license_str)
+    if source_url:
+        parts.append(source_url)
+    return " | ".join(parts) if parts else ""
+
+
 
 @dataclass
 class MediaItem:
@@ -41,7 +224,10 @@ class MediaItem:
     width: int = 0
     height: int = 0
     duration: float = 0.0
-    credit: str = ""
+    credit: str = ""              # photographer / user name from the provider
+    license: str = ""             # license string from the provider metadata
+    source_url: str = ""          # provider page URL for the asset
+    attribution_line: str = ""    # human-readable attribution built from provider metadata
     path: Path | None = None
     query: str = ""
     extra: dict = field(default_factory=dict)
@@ -83,7 +269,12 @@ def pexels_videos(query: str, key: str, prefer_4k: bool = False, orientation: st
         if not f:
             continue
         items.append(MediaItem("pexels", str(v["id"]), "video", f["link"], f["width"], f["height"],
-                               float(v.get("duration") or 0), (v.get("user") or {}).get("name", ""), query=query,
+                               float(v.get("duration") or 0), (v.get("user") or {}).get("name", ""),
+                               license="", source_url=v.get("url", ""),
+                               attribution_line=_build_attribution_line(
+                                   "pexels", (v.get("user") or {}).get("name", ""),
+                                   "", v.get("url", "")),
+                               query=query,
                                extra={"page_url": v.get("url", "")}))
     return items
 
@@ -103,6 +294,9 @@ def pexels_photos(query: str, key: str, orientation: str = "portrait") -> list[M
         url += ("&" if "?" in url else "?") + "auto=compress&cs=tinysrgb&h=2400"
         items.append(MediaItem("pexels-photo", str(p["id"]), "image", url, p.get("width", 0), p.get("height", 0),
                                credit=p.get("photographer", ""), query=query,
+                               license="", source_url=p.get("url", ""),
+                               attribution_line=_build_attribution_line(
+                                   "pexels", p.get("photographer", ""), "", p.get("url", "")),
                                extra={"description": p.get("alt", ""), "page_url": p.get("url", "")}))
     return items
 
@@ -129,6 +323,9 @@ def pixabay_videos(query: str, key: str, prefer_4k: bool = False) -> list[MediaI
             continue
         items.append(MediaItem("pixabay", str(h["id"]), "video", f["url"], f.get("width", 0), f.get("height", 0),
                                float(h.get("duration") or 0), h.get("user", ""), query=query,
+                               license="", source_url=h.get("pageURL", ""),
+                               attribution_line=_build_attribution_line(
+                                   "pixabay", h.get("user", ""), "", h.get("pageURL", "")),
                                extra={"tags": _tags(h.get("tags")), "page_url": h.get("pageURL", "")}))
     return items
 
@@ -141,6 +338,9 @@ def pixabay_photos(query: str, key: str, orientation: str = "portrait") -> list[
     raise_for_status(r, "Pixabay photo search")
     return [MediaItem("pixabay-photo", str(h["id"]), "image", h["largeImageURL"], h.get("imageWidth", 0),
                       h.get("imageHeight", 0), credit=h.get("user", ""), query=query,
+                      license="", source_url=h.get("pageURL", ""),
+                      attribution_line=_build_attribution_line(
+                          "pixabay", h.get("user", ""), "", h.get("pageURL", "")),
                       extra={"tags": _tags(h.get("tags")), "page_url": h.get("pageURL", "")})
             for h in r.json().get("hits", []) if h.get("largeImageURL")]
 
@@ -170,12 +370,32 @@ def openai_image(prompt: str, dest: Path, key: str, model: str, orientation: str
 
 
 def agnes_image(prompt: str, dest: Path, key: str, model: str = "agnes-image-2.5-flash",
-                orientation: str = "portrait") -> Path:
-    """Generate an image through Agnes AI's OpenAI-compatible image endpoint."""
-    size = {"portrait": "1024x1536", "landscape": "1536x1024"}.get(orientation, "1024x1024")
-    body = {"model": model, "prompt": prompt, "size": size, "n": 1}
+                orientation: str = "portrait", *, scene_index: int = 0,
+                narration: str = "", visual_description: str = "") -> Path:
+    """Generate an image through Agnes AI's OpenAI-compatible image endpoint.
 
-    def _do():
+    When ``narration`` or ``visual_description`` is provided, the prompt is
+    expanded into a detailed scene-aware cinematic prompt via
+    ``build_agnes_prompt``. Otherwise the raw ``prompt`` is used (backward
+    compatible).
+    """
+    # Build a detailed scene-aware prompt when scene context is available.
+    if narration or visual_description:
+        effective_prompt = build_agnes_prompt(
+            narration=narration,
+            visual_description=visual_description,
+            scene_index=scene_index,
+            style_hint="documentary",
+        )
+    else:
+        effective_prompt = prompt
+
+    size = {"portrait": AGNES_PORTRAIT_SIZE, "landscape": "1536x1024"}.get(
+        orientation, "1024x1024"
+    )
+    body = {"model": model, "prompt": effective_prompt, "size": size, "n": 1}
+
+    def _do() -> Path:
         r = http().post(
             "https://apihub.agnes-ai.com/v1/images/generations",
             json=body,
@@ -194,11 +414,90 @@ def agnes_image(prompt: str, dest: Path, key: str, model: str = "agnes-image-2.5
         elif item.get("url"):
             download(item["url"], dest, timeout=180, max_bytes=30 * 1024 * 1024)
         else:
-            raise RuntimeError("Agnes AI image response contained neither image URL nor base64 data")
+            raise RuntimeError(
+                "Agnes AI image response contained neither image URL nor base64 data"
+            )
         validate_generated_image(dest)
         return dest
 
     return with_retries(_do, attempts=2, label="Agnes AI image")
+
+
+def agnes_image_with_qa(
+    prompt: str,
+    dest: Path,
+    key: str,
+    model: str = AGNES_DEFAULT_MODEL,
+    orientation: str = "portrait",
+    *,
+    scene_index: int = 0,
+    narration: str = "",
+    visual_description: str = "",
+    max_retries: int = AGNES_MAX_RETRIES,
+) -> tuple[Path, ImageQualityResult] | None:
+    """Generate an Agnes image with full quality control and controlled regeneration.
+
+    Returns ``(path, quality_result)`` on success, or ``None`` if Agnes is
+    unavailable or cannot produce a usable image after retries.
+
+    Retry policy:
+      - Max ``max_retries`` additional attempts after the first failure.
+      - Each retry improves the prompt based on the rejection reason.
+      - Identical prompts are never resubmitted.
+    """
+    # Build the scene-aware prompt.
+    effective_prompt = build_agnes_prompt(
+        narration=narration,
+        visual_description=visual_description,
+        scene_index=scene_index,
+        style_hint="documentary",
+    ) if (narration or visual_description) else prompt
+
+    last_result: ImageQualityResult | None = None
+    current_prompt = effective_prompt
+
+    for attempt in range(max_retries + 1):
+        try:
+            agnes_image(
+                current_prompt, dest, key, model=model, orientation=orientation,
+                scene_index=scene_index, narration=narration,
+                visual_description=visual_description,
+            )
+        except Exception as e:
+            log.warning("Agnes generation attempt %d failed: %s", attempt + 1, redact(e))
+            if attempt < max_retries:
+                current_prompt = _improve_prompt_for_retry(
+                    current_prompt, "api_error", attempt
+                )
+                continue
+            return None
+
+        # Run quality control on the generated image.
+        qr = validate_image_quality(dest, prompt=current_prompt, min_dimension=512)
+        last_result = qr
+
+        if qr.passed:
+            log.info(
+                "Agnes image passed QC (score %.1f/100, %s)",
+                qr.score, ", ".join(f"{k}: {v[1]}" for k, v in qr.checks.items()),
+            )
+            return dest, qr
+
+        # Image failed QC: improve prompt and retry if attempts remain.
+        reason = qr.reasons[0] if qr.reasons else "unsuitable"
+        log.warning(
+            "Agnes image failed QC attempt %d/%d: %s (score %.1f)",
+            attempt + 1, max_retries + 1, "; ".join(qr.reasons), qr.score,
+        )
+        if attempt < max_retries:
+            current_prompt = _improve_prompt_for_retry(current_prompt, reason, attempt)
+
+    # Exhausted retries without a passing image.
+    log.error(
+        "Agnes could not produce a usable image for scene %d after %d attempts",
+        scene_index + 1, max_retries + 1,
+    )
+    return None
 
 
 _POLLINATIONS_LOCK = threading.Lock()
@@ -316,6 +615,157 @@ def validate_generated_image(path: Path, min_dimension: int = 256,
         raise RuntimeError(f"generated image dimensions {width}x{height} are below "
                            f"the {min_dimension}px minimum: {path.name}")
     return width, height
+
+
+# ------------------------------------------------------------------------------------------ Agnes image QC
+def _detect_blank_image(image: Image.Image, threshold: float = BLANK_VARIANCE_THRESHOLD) -> tuple[bool, str]:
+    """Detect if an image is blank or near-blank (single dominant color).
+
+    Pure-PIL heuristic: converts to grayscale and checks the value range.
+    Does not require a vision model.
+    """
+    gray = image.convert("L")
+    lo, hi = gray.getextrema()  # type: ignore[assignment] - PIL returns (min, max) tuple
+    value_range = int(hi) - int(lo)
+    if value_range < threshold:
+        return True, f"image appears blank or near-blank (grayscale range {value_range:.1f})"
+    return False, f"image has adequate tonal range (range {value_range:.1f})"
+
+
+def _detect_blurry_image(image: Image.Image, threshold: float = BLUR_EDGE_STRENGTH_THRESHOLD) -> tuple[bool, str]:
+    """Detect excessive blur using edge-strength analysis.
+
+    Pure-PIL heuristic: applies FIND_EDGES filter and measures the spread
+    of edge pixel values. Does not require OpenCV or a vision model.
+    """
+    gray = image.convert("L")
+    edges = gray.filter(ImageFilter.FIND_EDGES)
+    stat = ImageStat.Stat(edges)
+    # Mean edge strength: higher = more detail/sharpness
+    edge_mean = stat.mean[0]
+    if edge_mean < threshold:
+        return True, f"image appears blurry (edge strength {edge_mean:.1f})"
+    return False, f"image appears sharp (edge strength {edge_mean:.1f})"
+
+
+def _check_vertical_composition(image: Image.Image) -> tuple[bool, str]:
+    """Check if image composition is suitable for vertical 9:16 cropping.
+
+    Returns (passed, message). Portrait orientation passes; landscape fails
+    because a center 9:16 crop would discard most of the content.
+    """
+    width, height = image.size
+    if width == 0:
+        return False, "image has zero width"
+    aspect = height / width
+    if aspect >= MIN_PORTRAIT_ASPECT:
+        return True, f"portrait orientation ({width}x{height}, aspect {aspect:.2f}), suitable for 9:16"
+    return False, f"landscape orientation ({width}x{height}, aspect {aspect:.2f}), poor fit for 9:16 vertical"
+
+
+def validate_image_quality(
+    path: Path,
+    prompt: str = "",
+    min_dimension: int = 512,
+) -> ImageQualityResult:
+    """Run full quality control on a generated image.
+
+    Checks: file validity, dimensions, blank content, blur, vertical composition.
+    Returns an ImageQualityResult with per-check details and an overall score.
+    Scene matching is inherently heuristic (no vision model); it is reported
+    as advisory, not proof.
+    """
+    checks: dict[str, tuple[bool, str]] = {}
+    reasons: list[str] = []
+    score = 100.0
+    dimensions: tuple[int, int] | None = None
+    file_size: int | None = None
+
+    # 1. File exists and is readable (reuse validate_generated_image logic)
+    try:
+        if not path.exists():
+            checks["file_exists"] = (False, "image file was not written")
+            reasons.append("image file missing")
+            return ImageQualityResult(False, 0.0, checks, reasons, None, 0)
+        file_size = path.stat().st_size
+        if file_size < 1024:
+            checks["file_size"] = (False, f"file too small ({file_size} bytes)")
+            reasons.append("file too small")
+            score -= 40
+        with Image.open(path) as im:
+            dimensions = (im.width, im.height)
+            fmt = (im.format or "").upper()
+            im.verify()
+        if fmt not in {"PNG", "JPEG", "WEBP"}:
+            checks["format"] = (False, f"unsupported format {fmt}")
+            reasons.append(f"unsupported format {fmt}")
+            score -= 30
+        if dimensions and min(dimensions) < min_dimension:
+            checks["dimensions"] = (False, f"dimensions {dimensions[0]}x{dimensions[1]} below {min_dimension}px")
+            reasons.append("dimensions too small")
+            score -= 30
+    except (UnidentifiedImageError, OSError, ValueError) as e:
+        checks["readable"] = (False, f"unreadable image: {e}")
+        reasons.append("corrupt or unreadable image")
+        return ImageQualityResult(False, 0.0, checks, reasons, dimensions, file_size)
+
+    # Re-open for content checks (verify() above closed/re-positioned the file)
+    try:
+        with Image.open(path) as im:
+            im.load()
+            # 2. Blank detection
+            blank, blank_msg = _detect_blank_image(im)
+            checks["blank"] = (not blank, blank_msg)
+            if blank:
+                reasons.append("blank or near-blank image")
+                score -= 35
+
+            # 3. Blur detection
+            blurry, blur_msg = _detect_blurry_image(im)
+            checks["blur"] = (not blurry, blur_msg)
+            if blurry:
+                reasons.append("excessively blurry image")
+                score -= 30
+
+            # 4. Vertical composition
+            comp, comp_msg = _check_vertical_composition(im)
+            checks["composition"] = (comp, comp_msg)
+            if not comp:
+                reasons.append("unsuitable composition for vertical 9:16")
+                score -= 20
+    except (UnidentifiedImageError, OSError, ValueError) as e:
+        checks["content_readable"] = (False, f"could not read image content: {e}")
+        reasons.append("image content unreadable")
+        score = 0.0
+
+    score = max(0.0, min(100.0, score))
+    passed = len(reasons) == 0
+    return ImageQualityResult(passed, round(score, 1), checks, reasons, dimensions, file_size)
+
+
+# Scene-match heuristic: without a vision model we cannot truly verify that an
+# image matches its narration. This checks keyword overlap only and is advisory.
+def _scene_match_heuristic(image_path: Path, narration: str, prompt: str) -> tuple[bool, str]:
+    """Heuristic scene-match check (advisory only, not proof).
+
+    Without vision capabilities, this checks whether the image file name or
+    prompt contains any narration keywords. A pass does NOT confirm visual
+    relevance; a fail flags the scene for human review.
+    """
+    wanted = set(re.findall(r"[a-z]{4,}", f"{narration} {prompt}".lower())) - STOP_WORDS
+    if not wanted:
+        return True, "no keywords to match (advisory pass)"
+    # We cannot see the image, so we always pass at the heuristic level but
+    # flag that this needs human review.
+    return True, f"scene match cannot be verified without vision; {len(wanted)} keywords in narration (heuristic only)"
+
+
+class AgnesUnavailableError(RuntimeError):
+    """Raised when Agnes is required (agnes-only mode) but cannot be used."""
+
+
+class VisualSelectionError(RuntimeError):
+    """Raised when no suitable visual can be selected for a scene."""
 
 
 class Visuals:
@@ -517,10 +967,12 @@ class Visuals:
         item.extra["validated"] = True
         return item
 
-    def _ai(self, source: str, prompt: str, dest_dir: Path, idx: int) -> MediaItem | None:
+    def _ai(self, source: str, prompt: str, dest_dir: Path, idx: int,
+            narration: str = "", visual_description: str = "") -> MediaItem | None:
         s = self.s
         full = f"{prompt}. {s.visual_style}. No text, no letters, no watermark."
         dest = dest_dir / f"scene{idx:02d}_ai.png"
+        qa_extra: dict = {}
         try:
             if source in ("openai-images", "ai", "dalle", "gpt-image"):
                 if not s.openai_api_key:
@@ -534,14 +986,35 @@ class Visuals:
                 if not s.agnes_api_key:
                     self._warn_missing_key(source, "AGNES_API_KEY")
                     return None
-                agnes_image(full, dest, s.agnes_api_key, s.agnes_image_model, s.orientation)
+                result = agnes_image_with_qa(
+                    prompt, dest, s.agnes_api_key,
+                    model=s.agnes_image_model, orientation=s.orientation,
+                    scene_index=idx, narration=narration,
+                    visual_description=visual_description,
+                )
+                if result is None:
+                    # Agnes could not produce a usable image after retries.
+                    log.warning(
+                        "Agnes QC failed for scene %d; no image returned", idx + 1
+                    )
+                    return None
+                dest, qr = result
+                # Store QC metadata in the item's extra dict for downstream use.
+                qa_extra = {
+                    "quality_score": qr.score,
+                    "quality_checks": {k: {"passed": v[0], "message": v[1]}
+                                       for k, v in qr.checks.items()},
+                    "quality_reasons": qr.reasons,
+                    "quality_dimensions": qr.dimensions,
+                    "quality_file_size": qr.file_size,
+                }
             else:
                 return None
         except PermanentError as e:
             # A refused key or an exhausted free tier won't recover within this video: stop asking.
             if source in self.sources:
                 self._drop_source(source)
-                hint = (" Anonymous Pollinations use is now heavily rate-limited; set POLLINATIONS_API_KEY "
+                hint = (" Anonymous Pollinations use is heavily rate-limited; set POLLINATIONS_API_KEY "
                         "or use Pexels/Pixabay (free keys)." if source == "pollinations" and " 402" in str(e)
                         else "")
                 log.warning("AI images from %s refused (%s); skipping it for this video.%s",
@@ -551,7 +1024,11 @@ class Visuals:
             log.warning("AI image (%s) for scene %d failed: %s", source, idx + 1, redact(e))
             return None
         log.info("Scene %d: %s image", idx + 1, source)
-        return MediaItem(source, dest.name, "image", path=dest, width=s.width, height=s.height, query=prompt)
+        extra = qa_extra if source == "agnes" else {}
+        return MediaItem(source, dest.name, "image", path=dest, width=s.width, height=s.height,
+                         credit=source.title(), license="AI-generated",
+                         source_url="", attribution_line=f"{source.title()} AI-generated image",
+                         query=prompt, extra=extra)
 
     def for_scene(self, idx: int, query: str, image_prompt: str, topic: str, need: float, dest_dir: Path,
                   *, prefer_image: bool = False, narration: str = "") -> MediaItem:
@@ -576,35 +1053,103 @@ class Visuals:
         if prefer_image and narration.strip():
             hybrid_prompt = f"{hybrid_prompt}. Scene context: {narration.strip()}"
 
-        # Hybrid image scene: generate a topic-specific still before looking for stock. The normal
-        # stock-first rule still applies to every other scene, so AI cannot pre-empt footage there.
-        if prefer_image:
+        visual_choice = (self.s.visual_choice or VISUAL_CHOICE_STOCK_FIRST).strip().lower()
+        if visual_choice not in VALID_VISUAL_CHOICES:
+            visual_choice = VISUAL_CHOICE_STOCK_FIRST
+
+        # --- agnes-only mode: Agnes for every scene; clear error if unavailable, no fallback ---
+        if visual_choice == VISUAL_CHOICE_AGNES_ONLY:
+            tried.append("agnes")
+            if "agnes" not in self.sources:
+                msg = (
+                    "VISUAL_CHOICE=agnes-only requires AGNES_API_KEY and 'agnes' in VISUAL_SOURCES. "
+                    "Set AGNES_API_KEY in .env, add 'agnes' to VISUAL_SOURCES/--visuals, "
+                    "or choose a different VISUAL_CHOICE."
+                )
+                report["reason"] = msg
+                with self.lock:
+                    self.reports[idx] = report
+                raise AgnesUnavailableError(msg)
+            item = self._ai("agnes", hybrid_prompt, dest_dir, idx,
+                            narration=narration, visual_description=image_prompt)
+            if item:
+                report["chosen"] = {"source": item.source, "id": item.id, "kind": item.kind,
+                                    "query": hybrid_prompt}
+                report["reason"] = "agnes-only: generated AI image"
+                note(source="agnes", query=hybrid_prompt, result="agnes-image",
+                     reason=report["reason"])
+                with self.lock:
+                    self.reports[idx] = report
+                log.info("Scene %d: agnes-only generated image (%r)", idx + 1, hybrid_prompt)
+                return item
+            msg = (
+                f"Agnes image generation failed for scene {idx + 1} ({hybrid_prompt}). "
+                "agnes-only mode does not fall back to stock footage or gradients."
+            )
+            report["reason"] = msg
+            note(source="agnes", query=hybrid_prompt, result="failed", reason=msg)
+            with self.lock:
+                self.reports[idx] = report
+            raise AgnesUnavailableError(msg)
+
+        # --- Decide whether this scene tries AI before stock ---
+        if visual_choice == VISUAL_CHOICE_SUITABILITY:
+            suitability = classify_suitability(narration, image_prompt, topic)
+            prefer_ai_first = (suitability == "concept")
+            report["suitability"] = suitability
+        elif visual_choice == VISUAL_CHOICE_AI_FIRST:
+            prefer_ai_first = True
+            report["suitability"] = "ai-first"
+        else:
+            # stock-first: only AI-first for explicit hybrid image slots
+            prefer_ai_first = prefer_image
+            report["suitability"] = "stock-first"
+        is_hybrid_slot = (visual_choice == VISUAL_CHOICE_STOCK_FIRST and prefer_image)
+
+        def _record_and_return(item: MediaItem, reason: str, source_name: str, q: str,
+                               hybrid: bool = False) -> MediaItem:
+            if hybrid:
+                reason = f"hybrid AI image unavailable; {reason}"
+            report["chosen"] = {"source": item.source, "id": item.id, "kind": item.kind,
+                                "query": q, "width": item.width, "height": item.height,
+                                "duration": item.duration, "attribution": item.attribution_line,
+                                "license": item.license, "source_url": item.source_url}
+            report["reason"] = reason
+            note(source=source_name, query=q, result="selected", reason=reason,
+                 videos=self._search_kinds.get((source_name, q.lower()), {}).get("video", 0),
+                 images=self._search_kinds.get((source_name, q.lower()), {}).get("image", 0))
+            with self.lock:
+                self.reports[idx] = report
+            if item.source.startswith("pexels"):
+                self.credits.add("Pexels")
+            elif item.source.startswith("pixabay"):
+                self.credits.add("Pixabay")
+            if item.kind == "video":
+                log.info("Scene %d: %s video (%r, %sx%s, %.1fs)", idx + 1, item.source, q,
+                         item.width, item.height, item.duration)
+            else:
+                log.warning("Scene %d: %s photo (%r): no suitable stock video clip was usable",
+                            idx + 1, item.source, q)
+            return item
+
+        # --- AI-first path (concept scenes in suitability, ai-first mode, hybrid image slots) ---
+        if prefer_ai_first:
             for source in ai_sources:
                 tried.append(source)
                 ai_tried.add(source)
-                item = self._ai(source, hybrid_prompt, dest_dir, idx)
+                item = self._ai(source, hybrid_prompt, dest_dir, idx,
+                                narration=narration, visual_description=image_prompt)
                 if item:
-                    report["chosen"] = {"source": item.source, "id": item.id, "kind": item.kind,
-                                        "query": hybrid_prompt}
-                    report["reason"] = "hybrid mode: generated an AI image for this scene"
-                    note(source=source, query=hybrid_prompt, result="hybrid-image",
-                         reason=report["reason"])
-                    log.info("Scene %d: %s generated image (hybrid)", idx + 1, source)
-                    with self.lock:
-                        self.reports[idx] = report
-                    return item
+                    if is_hybrid_slot:
+                        reason = "hybrid mode: generated an AI image for this scene"
+                        return _record_and_return(item, reason, source, hybrid_prompt, hybrid=False)
+                    reason = f"AI image selected ({source}) for {report.get('suitability', 'ai-first')} scene"
+                    return _record_and_return(item, reason, source, hybrid_prompt, hybrid=is_hybrid_slot)
                 note(source=source, query=hybrid_prompt, result="failed",
-                     reason="AI image failed; falling back to stock")
-            if not ai_sources:
-                note(source="", query=hybrid_prompt, result="miss",
-                     reason="hybrid scene but no AI image source is configured")
-            else:
-                log.warning("Scene %d: no hybrid AI image was generated; falling back to stock footage",
-                            idx + 1)
+                     reason="AI image generation failed")
+            log.warning("Scene %d: no AI image generated; falling back to stock footage", idx + 1)
 
-        # Stock first: a real clip (or photo) must be considered before generating an image, regardless of
-        # where the AI source sits in VISUAL_SOURCES. This is what stops an image provider from silently
-        # pre-empting the Pixabay/Pexels clips the user selected.
+        # --- Stock-first path (filmable scenes, stock-first mode) ---
         for source in stock_sources:
             tried.append(source)
             if source not in self.sources:
@@ -625,28 +1170,16 @@ class Visuals:
                     try:
                         self._fetch(item, dest_dir, idx)
                     except Exception as e:
-                        note(source=source, query=q, found=len(raw), usable=len(cand), result="download-failed",
-                             reason=redact(e), videos=kinds.get("video", 0), images=kinds.get("image", 0))
+                        note(source=source, query=q, found=len(raw), usable=len(cand),
+                             result="download-failed", reason=redact(e),
+                             videos=kinds.get("video", 0), images=kinds.get("image", 0))
                         log.warning("Scene %d: download failed for %s: %s", idx + 1, item.key, redact(e))
                         continue
-                    if item.source.startswith("pexels"):
-                        self.credits.add("Pexels")
-                    elif item.source.startswith("pixabay"):
-                        self.credits.add("Pixabay")
-                    report["chosen"] = {"source": item.source, "id": item.id, "kind": item.kind, "query": q,
-                                        "width": item.width, "height": item.height, "duration": item.duration}
-                    if item.kind == "video":
-                        reason = "relevant stock video selected"
-                        log.info("Scene %d: %s video (%r, %sx%s, %.1fs)", idx + 1, item.source, q,
-                                 item.width, item.height, item.duration)
-                    else:
-                        reason = "no suitable stock video; using a stock photo"
-                        log.warning("Scene %d: %s photo (%r): no suitable stock video clip was usable", idx + 1,
-                                    item.source, q)
-                    report["reason"] = (f"hybrid AI image unavailable; {reason}" if prefer_image else reason)
-                    with self.lock:
-                        self.reports[idx] = report
-                    return item
+                    return _record_and_return(
+                        item,
+                        "relevant stock video selected" if item.kind == "video"
+                        else "no suitable stock video; using a stock photo",
+                        source, q, hybrid=is_hybrid_slot)
                 reason = ("no search results" if not raw else
                           "all results rejected by relevance metadata" if not cand else
                           "all matching media already used" if not attempts else
@@ -658,31 +1191,30 @@ class Visuals:
                  videos=sum(self._search_kinds.get((source, q.lower()), {}).get("video", 0) for q in queries),
                  images=sum(self._search_kinds.get((source, q.lower()), {}).get("image", 0) for q in queries))
 
-        stock_reason = ("no usable stock video or photo" if stock_sources else "no stock source selected")
-        for source in ai_sources:
-            if source in ai_tried:
-                continue
-            tried.append(source)
-            item = self._ai(source, image_prompt or query, dest_dir, idx)
-            if item:
-                report["chosen"] = {"source": item.source, "id": item.id, "kind": item.kind,
-                                    "query": image_prompt or query}
-                report["reason"] = f"{stock_reason}; generated an AI image instead"
-                note(source=source, query=image_prompt or query, result="fallback-image", reason=stock_reason)
-                log.warning("Scene %d: %s — using %s image (%r) instead", idx + 1, stock_reason, source,
-                            image_prompt or query)
-                with self.lock:
-                    self.reports[idx] = report
-                return item
-            note(source=source, query=image_prompt or query, result="failed", reason="AI image failed")
-        for source in unknown_sources:
-            tried.append(source)
-            note(source=source, query="", result="skipped", reason="unknown visual source")
+        # --- AI fallback path (stock-first / suitability filmable when stock failed) ---
+        if not prefer_ai_first:
+            stock_reason = ("no usable stock video or photo" if stock_sources
+                            else "no stock source selected")
+            for source in ai_sources:
+                if source in ai_tried:
+                    continue
+                tried.append(source)
+                item = self._ai(source, image_prompt or query, dest_dir, idx,
+                                narration=narration, visual_description=image_prompt)
+                if item:
+                    return _record_and_return(
+                        item,
+                        f"{stock_reason}; generated an AI image instead",
+                        source, image_prompt or query, hybrid=is_hybrid_slot)
+                note(source=source, query=image_prompt or query, result="failed",
+                     reason="AI image failed")
 
-        report["reason"] = f"{stock_reason}; no AI image was available"
-        log.warning("Scene %d: no real visual for %r after trying %s — using an animated gradient. "
-                    "Add a free Pexels/Pixabay key, an image provider, or clips in MEDIA_DIR.",
-                    idx + 1, query, ", ".join(tried) or "no source")
+        # --- Nothing usable: animated gradient placeholder (never an unrelated image) ---
+        report["reason"] = f"{'no AI image was available' if prefer_ai_first else 'no usable stock or AI visual'}; animated gradient placeholder"
+        log.warning(
+            "Scene %d: no real visual for %r after trying %s — using an animated gradient. "
+            "Add a free Pexels/Pixabay key, an image provider, or clips in MEDIA_DIR.",
+            idx + 1, query, ", ".join(tried) or "no source")
         with self.lock:
             self.reports[idx] = report
         return MediaItem("generated", f"gradient-{idx}", "generated", query=query)

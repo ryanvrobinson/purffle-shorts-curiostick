@@ -4,21 +4,28 @@ and upload safeguards. Designed for Windows Task Scheduler."""
 from __future__ import annotations
 
 import contextlib
+import json
 import logging
 import os
 import sys
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, time as dtime, timezone
 from pathlib import Path
 from typing import Optional
+from zoneinfo import ZoneInfo
 
-from .config import Settings
+from .config import ConfigError, Settings
 from .history import History, now_iso
+from . import youtube
 from .pipeline import Result, Studio
 from .quality import QualityGate, QualityReport
 
 log = logging.getLogger("purffle")
+
+# The three CurioStick publishing slots, Asia/Kolkata (UTC+5:30).
+SLOT_TIMES: dict[int, str] = {1: "09:00", 2: "14:00", 3: "19:00"}
+SLOT_LABELS: dict[int, str] = {1: "9:00 AM IST", 2: "2:00 PM IST", 3: "7:00 PM IST"}
 
 
 @dataclass
@@ -352,3 +359,251 @@ class DailyAutomation:
         """Check if Instagram publishing is configured."""
         from .instagram import is_instagram_configured
         return is_instagram_configured()
+
+
+# ------------------------------------------------------------------ slot scheduling helpers
+
+def slot_key(run_date: str, slot: int) -> str:
+    """Stable idempotency key for one date + slot, e.g. 2026-10-31-slot-1."""
+    return History.slot_key(run_date, slot)
+
+
+def slot_publish_moments(run_date: str | None = None,
+                         timezone_name: str = "Asia/Kolkata") -> dict[int, datetime]:
+    """Return {slot: aware IST datetime} for the three daily slots on ``run_date``.
+
+    Slot 1 = 09:00 IST, slot 2 = 14:00 IST, slot 3 = 19:00 IST.
+    Defaults to today in the project timezone.
+    """
+    from zoneinfo import ZoneInfo
+    tz = ZoneInfo(timezone_name)
+    if run_date is None:
+        day = datetime.now(tz).date()
+    else:
+        day = datetime.strptime(run_date, "%Y-%m-%d").date()
+    moments = {}
+    for slot, hhmm in SLOT_TIMES.items():
+        hh, mm = (int(x) for x in hhmm.split(":"))
+        moments[slot] = datetime.combine(day, dtime(hh, mm), tzinfo=tz)
+    return moments
+
+
+@dataclass
+class SlotRunResult:
+    """Result of running one publishing slot."""
+
+    ok: bool
+    slot: int
+    run_date: str
+    key: str
+    publish_at_utc: str | None = None
+    publish_at_ist: str | None = None
+    video_result: Optional[Result] = None
+    quality_report: Optional[QualityReport] = None
+    uploaded: bool = False
+    youtube_id: str | None = None
+    skipped: bool = False
+    skip_reason: str = ""
+    dry_run: bool = False
+    error: str = ""
+
+
+class SlotAutomation:
+    """One Short for one publishing slot: generate -> quality gate -> schedule on YouTube.
+
+    Designed for unattended GitHub Actions runs. There is no interactive PUBLISH prompt:
+    a scheduled run uploads the video as ``private`` with a future ``publishAt`` for the
+    assigned IST slot, and a dry run never touches YouTube.
+    """
+
+    def __init__(self, settings: Settings, slot: int, run_date: str | None = None,
+                 dry_run: bool = False, skip_quality: bool = False,
+                 studio: Studio | None = None, history: History | None = None):
+        if slot not in SLOT_TIMES:
+            raise ConfigError(f"Invalid slot {slot}: choose 1 (09:00 IST), 2 (14:00 IST) or 3 (19:00 IST)")
+        self.s = settings.with_overrides(upload=False)
+        self.slot = int(slot)
+        self.run_date = run_date or self._today_iso()
+        self.key = slot_key(self.run_date, self.slot)
+        self.dry_run = dry_run
+        self.skip_quality = skip_quality
+        self.history = history or History(self.s.data_path / "history.db")
+        self.studio = studio or Studio(self.s)
+        self._failures_dir = self.s.data_path / "failures"
+
+    def _today_iso(self) -> str:
+        tz_name = self.s.timezone or "Asia/Kolkata"
+        try:
+            return datetime.now(ZoneInfo(tz_name)).date().isoformat()
+        except Exception:
+            return datetime.now(timezone.utc).date().isoformat()
+
+    def run_slot(self) -> SlotRunResult:
+        """Generate one Short and schedule it for this slot's IST publication time."""
+        moments = slot_publish_moments(self.run_date, self.s.timezone)
+        publish_at = moments[self.slot]                       # aware IST datetime
+        publish_at_utc = youtube.to_rfc3339(publish_at)
+        now = datetime.now(publish_at.tzinfo)
+
+        log.info("Slot %s (%s) for %s: publish target %s = %s UTC",
+                 self.slot, SLOT_TIMES[self.slot], self.run_date,
+                 publish_at.isoformat(), publish_at_utc)
+
+        out = self._run_slot(publish_at, publish_at_utc, now)
+        self._write_summary(out)
+        return out
+
+    def _run_slot(self, publish_at: datetime, publish_at_utc: str, now: datetime) -> SlotRunResult:
+        # 1. Idempotency: this slot was already completed on YouTube.
+        if self.history.is_slot_done(self.key):
+            existing = self.history.get_slot(self.key)
+            msg = f"Slot {self.slot} for {self.run_date} already scheduled (video {existing.get('youtube_id')})"
+            log.info(msg)
+            return SlotRunResult(
+                ok=True, slot=self.slot, run_date=self.run_date, key=self.key,
+                publish_at_utc=publish_at_utc, publish_at_ist=publish_at.isoformat(),
+                skipped=True, skip_reason=msg, youtube_id=existing.get("youtube_id"))
+
+        # 2. Never publish into the past: if the slot time passed, skip and record it.
+        if publish_at <= now:
+            msg = f"Slot {self.slot} publish time {publish_at.isoformat()} is in the past; skipping slot"
+            log.warning(msg)
+            self.history.record_slot(self.key, self.run_date, self.slot, publish_at_utc,
+                                     "skipped", error="publish time passed")
+            return SlotRunResult(
+                ok=True, slot=self.slot, run_date=self.run_date, key=self.key,
+                publish_at_utc=publish_at_utc, publish_at_ist=publish_at.isoformat(),
+                skipped=True, skip_reason=msg, error=msg)
+
+        # 3. Generate the video (topic, script, voice, footage, render).
+        try:
+            result = self.studio.make()
+        except Exception as e:  # setup problems (no LLM, no auth) stop this slot cleanly
+            error = f"Video generation failed: {e}"
+            log.error(error)
+            self.history.record_slot(self.key, self.run_date, self.slot, publish_at_utc,
+                                     "failed", error=error)
+            return SlotRunResult(ok=False, slot=self.slot, run_date=self.run_date, key=self.key,
+                                 publish_at_utc=publish_at_utc, publish_at_ist=publish_at.isoformat(),
+                                 error=error)
+        if not result.ok:
+            error = f"Video generation failed: {result.error}"
+            log.error(error)
+            self.history.record_slot(self.key, self.run_date, self.slot, publish_at_utc,
+                                     "failed", error=error)
+            return SlotRunResult(
+                ok=False, slot=self.slot, run_date=self.run_date, key=self.key,
+                publish_at_utc=publish_at_utc, publish_at_ist=publish_at.isoformat(),
+                video_result=result, error=error)
+
+        # 4. Quality gate: a failed gate blocks publishing and is recorded.
+        quality_report = None
+        if not self.skip_quality:
+            quality_report = QualityGate(self.s).check(result)
+            if not quality_report.passed:
+                error = f"Quality gate failed: {quality_report.summary}"
+                log.error(error)
+                self._save_failure_details(result, quality_report)
+                self.history.record_slot(self.key, self.run_date, self.slot, publish_at_utc,
+                                         "failed", error=error)
+                return SlotRunResult(
+                    ok=False, slot=self.slot, run_date=self.run_date, key=self.key,
+                    publish_at_utc=publish_at_utc, publish_at_ist=publish_at.isoformat(),
+                    video_result=result, quality_report=quality_report, error=error)
+            log.info("Quality gate passed for slot %s", self.slot)
+
+        # 5. Dry run: everything above ran, but nothing is uploaded or scheduled.
+        if self.dry_run:
+            return SlotRunResult(
+                ok=True, slot=self.slot, run_date=self.run_date, key=self.key,
+                publish_at_utc=publish_at_utc, publish_at_ist=publish_at.isoformat(),
+                video_result=result, quality_report=quality_report, dry_run=True)
+
+        # 6. Non-interactive scheduled upload: private + future publishAt.
+        try:
+            status = self.studio.upload_scheduled(
+                result.record_id, publish_at, result, slot=self.slot, run_date=self.run_date)
+        except Exception as e:  # NotAuthorized, network, quota: record, never blindly retry
+            error = f"YouTube upload failed: {e}"
+            log.error(error)
+            self.history.record_slot(self.key, self.run_date, self.slot, publish_at_utc,
+                                     "failed", error=error)
+            return SlotRunResult(
+                ok=False, slot=self.slot, run_date=self.run_date, key=self.key,
+                publish_at_utc=publish_at_utc, publish_at_ist=publish_at.isoformat(),
+                video_result=result, quality_report=quality_report, error=error)
+
+        rec = self.history.get(result.record_id)
+        if status == "scheduled":
+            self.history.record_slot(self.key, self.run_date, self.slot, publish_at_utc,
+                                     "scheduled", youtube_id=rec.get("youtube_id"),
+                                     title=rec.get("title"))
+            log.info("Slot %s scheduled on YouTube: %s", self.slot, rec.get("youtube_id"))
+            return SlotRunResult(
+                ok=True, slot=self.slot, run_date=self.run_date, key=self.key,
+                publish_at_utc=publish_at_utc, publish_at_ist=publish_at.isoformat(),
+                video_result=result, quality_report=quality_report,
+                uploaded=True, youtube_id=rec.get("youtube_id"))
+        if status == "queued":
+            error = "YouTube upload quota reached; slot not scheduled (not blindly retried)"
+            log.warning(error)
+            self.history.record_slot(self.key, self.run_date, self.slot, publish_at_utc,
+                                     "queued", error=error)
+            return SlotRunResult(
+                ok=False, slot=self.slot, run_date=self.run_date, key=self.key,
+                publish_at_utc=publish_at_utc, publish_at_ist=publish_at.isoformat(),
+                video_result=result, quality_report=quality_report, error=error)
+        error = f"YouTube upload did not schedule the video (status: {status})"
+        log.error(error)
+        self.history.record_slot(self.key, self.run_date, self.slot, publish_at_utc,
+                                 "failed", error=error)
+        return SlotRunResult(
+            ok=False, slot=self.slot, run_date=self.run_date, key=self.key,
+            publish_at_utc=publish_at_utc, publish_at_ist=publish_at.isoformat(),
+            video_result=result, quality_report=quality_report, error=error)
+
+    def _save_failure_details(self, result: Result, report: QualityReport) -> None:
+        """Persist which check(s) failed so the failure can be reviewed later."""
+        self._failures_dir.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "slot": self.slot, "run_date": self.run_date, "key": self.key,
+            "video": str(result.video) if result.video else None,
+            "folder": str(result.folder) if result.folder else None,
+            "title": result.title,
+            "report": report.to_dict(),
+        }
+        (self._failures_dir / f"{self.key}.json").write_text(
+            json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+        log.info("Failure details saved to %s/%s.json", self._failures_dir, self.key)
+
+    def _write_summary(self, out: SlotRunResult) -> None:
+        """Markdown summary for the workflow run and $GITHUB_STEP_SUMMARY."""
+        lines = [
+            "# CurioStick Shorts — scheduled slot run",
+            "",
+            f"- Slot: {out.slot} ({SLOT_TIMES[out.slot]} IST)",
+            f"- Date: {out.run_date}",
+            f"- Publish target: {out.publish_at_ist} ({out.publish_at_utc} UTC)",
+            f"- Idempotency key: {out.key}",
+            f"- Dry run: {out.dry_run}",
+            f"- Skipped: {out.skipped}" + (f" — {out.skip_reason}" if out.skip_reason else ""),
+        ]
+        uploaded = f"- Uploaded: {out.uploaded}"
+        if out.youtube_id:
+            uploaded += f" — https://youtube.com/shorts/{out.youtube_id}"
+        lines.append(uploaded)
+        if out.quality_report is None:
+            lines.append("- Quality gate: not run (--skip-quality)")
+        else:
+            lines.append(f"- Quality gate: {'passed' if out.quality_report.passed else 'failed'}")
+            if not out.quality_report.passed:
+                lines.append("")
+                lines.append("Failed checks: " + "; ".join(
+                    f"{c.name}: {c.message}" for c in out.quality_report.failed_checks))
+        if out.error:
+            lines.append("")
+            lines.append(f"Error: {out.error}")
+        try:
+            (self.s.data_path / "run-summary.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+        except Exception as e:  # a summary file must never fail the run
+            log.warning("Could not write run summary: %s", e)

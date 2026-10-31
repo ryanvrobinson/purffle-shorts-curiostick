@@ -183,8 +183,10 @@ def test_stock_photo_used_when_no_videos_and_reason_is_reported(tmp_path, monkey
 
 
 def test_missing_stock_key_is_reported_and_ai_fallback_is_explicit(tmp_path, monkeypatch, caplog):
-    def fake_agnes(prompt, dest, key, model, orientation):
-        dest.write_bytes(b"image")
+    def fake_agnes(prompt, dest, key, model, orientation, **kwargs):
+        # Noise texture image passes blank/blur QC.
+        import os
+        Image.frombytes("RGB", (512, 768), os.urandom(512 * 768 * 3)).save(dest, "PNG")
         return dest
 
     monkeypatch.setattr(M, "agnes_image", fake_agnes)
@@ -274,9 +276,10 @@ def test_generated_image_validation_accepts_a_real_image(tmp_path):
 def test_agnes_is_selected_as_a_generated_visual(monkeypatch, tmp_path):
     calls = []
 
-    def fake_agnes(prompt, dest, key, model, orientation):
+    def fake_agnes(prompt, dest, key, model, orientation, **kwargs):
         calls.append((prompt, key, model, orientation))
-        dest.write_bytes(b"image")
+        import os
+        Image.frombytes("RGB", (512, 768), os.urandom(512 * 768 * 3)).save(dest, "PNG")
         return dest
 
     monkeypatch.setattr(M, "agnes_image", fake_agnes)
@@ -312,7 +315,8 @@ def test_hybrid_mode_alternates_pixabay_clips_and_agnes_images(monkeypatch, tmp_
 
     def agnes(prompt, dest, *args, **kwargs):
         prompts.append(prompt)
-        dest.write_bytes(b"fake-image")
+        import os
+        Image.frombytes("RGB", (512, 768), os.urandom(512 * 768 * 3)).save(dest, "PNG")
         return dest
 
     monkeypatch.setattr(M, "pixabay_videos", videos)
@@ -329,8 +333,9 @@ def test_hybrid_mode_alternates_pixabay_clips_and_agnes_images(monkeypatch, tmp_
         ("pixabay", "video"), ("agnes", "image"), ("pixabay", "video"),
         ("agnes", "image"), ("pixabay", "video")]
     assert len(prompts) == 2
-    assert "prompt 1" in prompts[0] and "narration 1" in prompts[0]
-    assert "prompt 3" in prompts[1] and "narration 3" in prompts[1]
+    prompt_texts = set(prompts)
+    assert any("prompt 1" in p and "narration 1" in p for p in prompt_texts)
+    assert any("prompt 3" in p and "narration 3" in p for p in prompt_texts)
     assert visual.reports[1]["reason"].startswith("hybrid mode")
     assert visual.reports[1]["chosen"]["source"] == "agnes"
 
@@ -402,3 +407,178 @@ def test_stock_download_failure_tries_another_candidate_before_ai(monkeypatch, t
     assert len(downloads) == 2
     assert selected.id == downloads[1] and selected.kind == "video"
     assert any(a["result"] == "download-failed" for a in visual.reports[0]["attempts"])
+
+
+# ------------------------------------------------------------------ Agnes prompt builder tests
+def test_build_agnes_prompt_includes_narration_and_visuals():
+    prompt = M.build_agnes_prompt(
+        narration="The octopus has three hearts and blue blood.",
+        visual_description="octopus swimming in deep ocean",
+        scene_index=0,
+        topic="octopus",
+    )
+    assert "octopus swimming in deep ocean" in prompt
+    assert "Scene narrative: The octopus has three hearts" in prompt
+    assert "documentary cinematography" in prompt
+    assert "eye-level medium shot" in prompt
+    assert "golden hour lighting" in prompt
+    assert "vertical 9:16" in prompt
+    assert "No text" in prompt
+
+
+def test_build_agnes_prompt_rotates_camera_and_lighting():
+    p0 = M.build_agnes_prompt("narration", "subject", scene_index=0)
+    p1 = M.build_agnes_prompt("narration", "subject", scene_index=1)
+    p2 = M.build_agnes_prompt("narration", "subject", scene_index=2)
+    assert p0 != p1 != p2  # different scenes get different camera/lighting
+    assert "eye-level medium shot" in p0
+    assert "low-angle wide shot" in p1
+    assert "close-up detail shot" in p2
+
+
+# ------------------------------------------------------------------ Image QC tests
+def _write_test_png(dest, size=(512, 768), noise=True):
+    """Write a PNG that passes QC (portrait, textured, not blank)."""
+    import os
+    if noise:
+        img = Image.frombytes("RGB", size, os.urandom(size[0] * size[1] * 3))
+    else:
+        img = Image.new("RGB", size, "#FF7A18")
+    img.save(dest, "PNG")
+
+
+def test_detect_blank_image_rejects_solid_color(tmp_path):
+    img = Image.new("RGB", (100, 100), "#FF7A18")
+    blank, msg = M._detect_blank_image(img)
+    assert blank is True
+    assert "blank" in msg.lower()
+
+
+def test_detect_blank_image_passes_textured(tmp_path):
+    img = Image.frombytes("RGB", (100, 100), os.urandom(100 * 100 * 3))
+    blank, msg = M._detect_blank_image(img)
+    assert blank is False
+
+
+def test_detect_blurry_image_passes_textured():
+    img = Image.frombytes("RGB", (200, 200), os.urandom(200 * 200 * 3))
+    blurry, msg = M._detect_blurry_image(img)
+    assert blurry is False
+
+
+def test_check_vertical_composition_passes_portrait():
+    img = Image.new("RGB", (512, 768), "#FF7A18")
+    ok, msg = M._check_vertical_composition(img)
+    assert ok is True
+    assert "portrait" in msg.lower()
+
+
+def test_check_vertical_composition_fails_landscape():
+    img = Image.new("RGB", (768, 512), "#FF7A18")
+    ok, msg = M._check_vertical_composition(img)
+    assert ok is False
+    assert "landscape" in msg.lower()
+
+
+def test_validate_image_quality_passes_good_image(tmp_path):
+    path = tmp_path / "good.png"
+    _write_test_png(path)
+    result = M.validate_image_quality(path, min_dimension=256)
+    assert result.passed is True
+    assert result.score > 50
+    assert result.dimensions == (512, 768)
+
+
+def test_validate_image_quality_rejects_blank(tmp_path):
+    path = tmp_path / "blank.png"
+    Image.new("RGB", (512, 768), "#FF7A18").save(path, "PNG")
+    result = M.validate_image_quality(path, min_dimension=256)
+    assert result.passed is False
+    assert "blank" in " ".join(result.reasons).lower()
+
+
+def test_validate_image_quality_rejects_landscape(tmp_path):
+    path = tmp_path / "landscape.png"
+    Image.new("RGB", (768, 512), "#FF7A18").save(path, "PNG")
+    result = M.validate_image_quality(path, min_dimension=256)
+    assert result.passed is False
+    assert any("composition" in r.lower() or "landscape" in r.lower() for r in result.reasons)
+
+
+def test_validate_image_quality_rejects_missing_file(tmp_path):
+    path = tmp_path / "nonexistent.png"
+    result = M.validate_image_quality(path, min_dimension=256)
+    assert result.passed is False
+    assert result.score == 0.0
+
+
+# ------------------------------------------------------------------ Agnes QA with retries
+def test_agnes_image_with_qa_passes_on_first_try(tmp_path, monkeypatch):
+    calls = []
+
+    def fake_agnes(prompt, dest, key, model, orientation, **kwargs):
+        calls.append(prompt)
+        import os
+        Image.frombytes("RGB", (512, 768), os.urandom(512 * 768 * 3)).save(dest, "PNG")
+        return dest
+
+    monkeypatch.setattr(M, "agnes_image", fake_agnes)
+    dest = tmp_path / "scene.png"
+    result = M.agnes_image_with_qa(
+        "octopus", dest, "test-key",
+        scene_index=0, narration="The octopus has three hearts.",
+        visual_description="octopus swimming",
+    )
+    assert result is not None
+    path, qr = result
+    assert path == dest
+    assert qr.passed is True
+    assert qr.score > 50
+    assert len(calls) == 1  # no retries needed
+
+
+def test_agnes_image_with_qa_retries_on_qc_failure(tmp_path, monkeypatch):
+    """First attempt returns blank image, second returns valid image."""
+    attempts = []
+
+    def fake_agnes(prompt, dest, key, model, orientation, **kwargs):
+        attempts.append(len(attempts))
+        import os
+        if len(attempts) == 1:
+            # First attempt: blank solid color (fails QC)
+            Image.new("RGB", (512, 768), "#FF7A18").save(dest, "PNG")
+        else:
+            # Second attempt: textured (passes QC)
+            Image.frombytes("RGB", (512, 768), os.urandom(512 * 768 * 3)).save(dest, "PNG")
+        return dest
+
+    monkeypatch.setattr(M, "agnes_image", fake_agnes)
+    dest = tmp_path / "scene.png"
+    result = M.agnes_image_with_qa(
+        "octopus", dest, "test-key",
+        scene_index=0, narration="The octopus has three hearts.",
+        visual_description="octopus swimming",
+        max_retries=2,
+    )
+    assert result is not None
+    path, qr = result
+    assert qr.passed is True
+    assert len(attempts) == 2  # first failed QC, second passed
+
+
+def test_agnes_image_with_qa_fails_after_all_retries(tmp_path, monkeypatch):
+    """All attempts return blank images, so QA returns None."""
+    def fake_agnes(prompt, dest, key, model, orientation, **kwargs):
+        import os
+        Image.new("RGB", (512, 768), "#FF7A18").save(dest, "PNG")
+        return dest
+
+    monkeypatch.setattr(M, "agnes_image", fake_agnes)
+    dest = tmp_path / "scene.png"
+    result = M.agnes_image_with_qa(
+        "octopus", dest, "test-key",
+        scene_index=0, narration="The octopus has three hearts.",
+        visual_description="octopus swimming",
+        max_retries=1,
+    )
+    assert result is None  # all retries exhausted

@@ -5,7 +5,7 @@ import pytest
 
 from purffle_shorts.config import Settings
 from purffle_shorts.llm import extract_json
-from purffle_shorts.script import SCRIPT_SCHEMA, build_prompt, load_script, normalize, offline_script
+from purffle_shorts.script import SCENE_SCHEMA, SCRIPT_SCHEMA, Scene, build_prompt, load_script, normalize, offline_script
 
 
 @pytest.mark.parametrize("text", [
@@ -88,3 +88,64 @@ def test_load_script_rejects_non_objects(tmp_path):
 def test_shipped_examples_load(path):
     sc = load_script(path, Settings())
     assert len(sc.scenes) >= 4 and sc.hook_text and all(s.image_prompt for s in sc.scenes)
+
+
+def test_scene_backward_compatible_fields_only():
+    # Old-style construction with only the original fields still works.
+    scene = Scene(narration="Hello world.", search_query="hello", image_prompt="a hello")
+    assert scene.narration == "Hello world."
+    assert scene.search_query == "hello"
+    assert scene.image_prompt == "a hello"
+    assert scene.speaker == "A"
+
+
+def test_scene_new_optional_fields_default_to_empty():
+    scene = Scene(narration="Hello world.", search_query="hello", image_prompt="a hello")
+    assert scene.duration is None
+    assert scene.visual_description == ""
+    assert scene.visual_source == ""
+    assert scene.attribution == ""
+
+
+def test_normalize_passes_through_optional_scene_fields():
+    data = {
+        "title": "T",
+        "scenes": [
+            {
+                "narration": "First line.",
+                "search_query": "first",
+                "image_prompt": "a first",
+                "duration": 6.5,
+                "visual_description": "A wide shot of the ocean.",
+                "visual_source": "stock",
+                "attribution": "Photographer via Pexels",
+            }
+        ],
+    }
+    s = normalize(data, "x", "facts", "en")
+    assert len(s.scenes) == 1
+    sc = s.scenes[0]
+    assert sc.duration == 6.5
+    assert sc.visual_description == "A wide shot of the ocean."
+    assert sc.visual_source == "stock"
+    assert sc.attribution == "Photographer via Pexels"
+
+
+def test_settings_defaults_preserve_existing_behaviour():
+    s = Settings()
+    assert s.visual_choice == "stock-first"
+    assert s.research_verify is False
+    assert s.verify_provider == ""
+
+
+def test_scene_schema_accepts_optional_new_fields():
+    schema = SCENE_SCHEMA
+    assert "duration" in schema["properties"]
+    assert "visual_description" in schema["properties"]
+    assert "visual_source" in schema["properties"]
+    assert "attribution" in schema["properties"]
+    # None of the new fields are required, so old LLM output still validates.
+    assert "duration" not in schema["required"]
+    assert "visual_description" not in schema["required"]
+    assert "visual_source" not in schema["required"]
+    assert "attribution" not in schema["required"]

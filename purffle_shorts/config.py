@@ -144,6 +144,8 @@ class Settings:
     script_review: str = "rewrite"    # off|score|rewrite — the Script Doctor's second pass
     script_quality_threshold: int = 70
     learn_from_stats: bool = False    # show the LLM which of your videos got the most / fewest views
+    research_verify: bool = False     # claim-based fact verification; off by default (Phase 2)
+    verify_provider: str = ""         # provider used to verify claims; empty = no verification
 
     # --- voice ----------------------------------------------------------------------------
     tts_engine: str = "edge"          # edge|openai|elevenlabs|kokoro|coqui|system|silent
@@ -164,6 +166,7 @@ class Settings:
     agnes_image_model: str = "agnes-image-2.5-flash"
     visual_style: str = "cinematic, dramatic lighting, highly detailed, vertical composition"
     prefer_4k: bool = False
+    visual_choice: str = "stock-first"  # stock-first|ai-first|suitability; stock-first preserves current behavior
 
     # --- render ---------------------------------------------------------------------------
     resolution: tuple[int, int] = (1080, 1920)
@@ -328,6 +331,8 @@ class Settings:
             script_review=_env("SCRIPT_REVIEW", d.script_review).lower(),
             script_quality_threshold=_int("SCRIPT_QUALITY_THRESHOLD", d.script_quality_threshold),
             learn_from_stats=_bool(_env("LEARN_FROM_STATS", "false")),
+            research_verify=_bool(_env("RESEARCH_VERIFY", "false")),
+            verify_provider=_env("VERIFY_PROVIDER"),
             tts_engine=_env("TTS_ENGINE", d.tts_engine).lower(),
             tts_voice=_env("TTS_VOICE"),
             tts_voice_b=_env("TTS_VOICE_B"),
@@ -343,6 +348,7 @@ class Settings:
             image_model=_env("IMAGE_MODEL", d.image_model),
             visual_style=_env("VISUAL_STYLE", d.visual_style),
             prefer_4k=_bool(_env("PREFER_4K", "false")),
+            visual_choice=_env("VISUAL_CHOICE", d.visual_choice),
             resolution=resolution,
             fps=max(1, _int("FPS", d.fps, "SHORTS_FPS")),
             video_encoder=_env("VIDEO_ENCODER", d.video_encoder),

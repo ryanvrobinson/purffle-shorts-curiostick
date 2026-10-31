@@ -33,6 +33,18 @@ CREATE TABLE IF NOT EXISTS ideas (
     status TEXT NOT NULL DEFAULT 'pending',   -- pending | used
     used_at TEXT, video_id INTEGER
 );
+CREATE TABLE IF NOT EXISTS slot_uploads (
+    key TEXT PRIMARY KEY,            -- YYYY-MM-DD-slot-N (Asia/Kolkata date + slot 1-3)
+    run_date TEXT NOT NULL,          -- YYYY-MM-DD in the project timezone
+    slot INTEGER NOT NULL,           -- 1 = 09:00, 2 = 14:00, 3 = 19:00 IST
+    publish_at_utc TEXT NOT NULL,    -- RFC3339 UTC timestamp the video goes public
+    youtube_id TEXT,                 -- YouTube video ID once scheduled/uploaded
+    title TEXT,
+    status TEXT NOT NULL,            -- scheduled | queued | failed | skipped
+    created_at TEXT NOT NULL,
+    updated_at TEXT,
+    error TEXT
+);
 """
 
 # Columns added after 2.0; existing databases get them on open.
@@ -205,3 +217,43 @@ class History:
 
     def mark_topic(self, key: str) -> None:
         self._exec("INSERT OR IGNORE INTO topics_used (key, used_at) VALUES (?, ?)", (key.lower(), now_iso()))
+
+    # ------------------------------------------------------------------ slot publishing ledger
+    @staticmethod
+    def slot_key(run_date: str, slot: int) -> str:
+        """Stable idempotency key for one date + slot, e.g. 2026-10-31-slot-1."""
+        return f"{run_date}-slot-{int(slot)}"
+
+    def is_slot_done(self, key: str) -> bool:
+        """True if this slot was already successfully scheduled on YouTube."""
+        rows = self._all(
+            "SELECT 1 FROM slot_uploads WHERE key = ? AND status = 'scheduled'", (key,))
+        return len(rows) > 0
+
+    def get_slot(self, key: str) -> dict | None:
+        rows = self._all("SELECT * FROM slot_uploads WHERE key = ?", (key,))
+        return rows[0] if rows else None
+
+    def record_slot(self, key: str, run_date: str, slot: int, publish_at_utc: str,
+                    status: str, youtube_id: str | None = None, title: str | None = None,
+                    error: str | None = None) -> None:
+        """Insert or refresh a slot record. `status` is one of scheduled/queued/failed/skipped."""
+        now = now_iso()
+        existing = self.get_slot(key)
+        if existing:
+            self._exec(
+                "UPDATE slot_uploads SET status = ?, updated_at = ?, youtube_id = ?, "
+                "title = ?, error = ? WHERE key = ?",
+                (status, now, youtube_id, title, error, key),
+            )
+            return
+        self._exec(
+            "INSERT INTO slot_uploads "
+            "(key, run_date, slot, publish_at_utc, status, created_at, youtube_id, title, error) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (key, run_date, slot, publish_at_utc, status, now, youtube_id, title, error),
+        )
+
+    def list_slots_for_date(self, run_date: str) -> list[dict]:
+        return self._all(
+            "SELECT * FROM slot_uploads WHERE run_date = ? ORDER BY slot", (run_date,))

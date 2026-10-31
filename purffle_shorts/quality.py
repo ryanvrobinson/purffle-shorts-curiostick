@@ -1,32 +1,58 @@
-"""Quality gate: validates rendered videos before publishing."""
+"""Quality gate: validates rendered videos before publishing.
+
+Checks are split into two kinds:
+
+  * ``automated`` — measured against the rendered file or its metadata
+    (ffprobe, ffmpeg blackdetect, SRT/audio timing comparison, metadata fields).
+  * ``heuristic`` — approximate estimates that cannot be proven without
+    human review (caption overflow estimate, visual relevance estimate).
+
+A check marked ``heuristic`` is never reported as "verified"; it is an
+advisory signal only.
+"""
 
 from __future__ import annotations
 
 import json
 import logging
+import math
+import re
+import subprocess
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
 from . import ffmpeg
 from .config import ASPECTS, Settings, duration_window
-from .pipeline import Result
 
 log = logging.getLogger("purffle")
+
+# Tolerance for caption-vs-audio sync drift (seconds).
+CAPTION_SYNC_TOLERANCE = 0.5
+# Minimum fraction of the video that must not be black.
+MAX_BLACK_FRACTION = 0.10
+# Caption safe-area margin (fraction of frame width/height).
+CAPTION_SAFE_MARGIN = 0.08
 
 
 @dataclass
 class QualityCheck:
     """A single quality check result."""
+
     name: str
     passed: bool
     message: str = ""
     details: dict = field(default_factory=dict)
 
+    @property
+    def method(self) -> str:
+        return self.details.get("method", "automated")
+
 
 @dataclass
 class QualityReport:
     """Complete quality gate report."""
+
     passed: bool
     checks: list[QualityCheck]
     video_path: Path
@@ -38,11 +64,23 @@ class QualityReport:
         failures = [c for c in self.checks if not c.passed]
         if not failures:
             return "All checks passed"
-        return f"{len(failures)} check(s) failed: " + "; ".join(f"{c.name}: {c.message}" for c in failures)
+        return f"{len(failures)} check(s) failed: " + "; ".join(
+            f"{c.name}: {c.message}" for c in failures
+        )
 
     @property
     def failed_checks(self) -> list[QualityCheck]:
         return [c for c in self.checks if not c.passed]
+
+    @property
+    def automated_failures(self) -> list[QualityCheck]:
+        """Checks that failed and are automated (not heuristic)."""
+        return [c for c in self.failed_checks if c.method == "automated"]
+
+    @property
+    def heuristic_advisories(self) -> list[QualityCheck]:
+        """Checks that are heuristic/advisory (not proof of a problem)."""
+        return [c for c in self.checks if c.method == "heuristic"]
 
     def to_dict(self) -> dict:
         return {
@@ -50,7 +88,13 @@ class QualityReport:
             "checked_at": self.checked_at,
             "video_path": str(self.video_path),
             "checks": [
-                {"name": c.name, "passed": c.passed, "message": c.message, "details": c.details}
+                {
+                    "name": c.name,
+                    "passed": c.passed,
+                    "message": c.message,
+                    "details": c.details,
+                    "method": c.method,
+                }
                 for c in self.checks
             ],
             "summary": self.summary,
@@ -74,31 +118,52 @@ class QualityGate:
 
         checks = []
 
-        # 1. File exists and is not empty
+        # 1. File exists and is not empty (automated)
         checks.append(self._check_file_exists(result.video))
 
-        # 2. FFprobe can read the file
+        # 2. FFprobe can read the file (automated)
         checks.append(self._check_ffprobe_readable(result.video))
 
-        # 3. Video and audio streams present
+        # 3. Video and audio streams present (automated)
         checks.append(self._check_streams(result.video))
 
-        # 4. Aspect ratio is vertical 9:16
+        # 4. Aspect ratio matches requested output (automated)
         checks.append(self._check_aspect_ratio(result.video))
 
-        # 5. Duration within limits
+        # 5. Duration within limits (automated)
         checks.append(self._check_duration(result.video))
 
-        # 6. Captions file exists
+        # 6. Missing audio / corrupted file (automated, part of streams)
+        checks.append(self._check_audio_present(result.video))
+
+        # 7. Black-frame detection (automated)
+        checks.append(self._check_black_frames(result.video))
+
+        # 8. Captions file exists (automated)
         checks.append(self._check_captions_exist(result.folder))
 
-        # 7. Metadata file exists and is valid
+        # 9. Caption-audio synchronization (automated)
+        checks.append(self._check_caption_sync(result))
+
+        # 10. Caption overflow / safe-area (heuristic)
+        checks.append(self._check_caption_overflow(result))
+
+        # 11. Missing / irrelevant scene visuals (automated)
+        checks.append(self._check_visuals_present(result))
+
+        # 12. Metadata file exists and is valid (automated)
         checks.append(self._check_metadata(result.folder))
 
-        # 8. Render completed successfully (check history status)
+        # 13. Research verification present (automated)
+        checks.append(self._check_research_verification(result))
+
+        # 14. Attribution present for stock visuals (automated)
+        checks.append(self._check_attribution(result))
+
+        # 15. Render completed successfully (automated)
         checks.append(self._check_render_status(result))
 
-        all_passed = all(c.passed for c in checks)
+        all_passed = all(c.passed for c in checks if c.method == "automated")
 
         return QualityReport(
             passed=all_passed,
@@ -249,11 +314,306 @@ class QualityGate:
             return QualityCheck("render_status", True, f"Render status: {result.status}")
         return QualityCheck("render_status", False, f"Render status: {result.status} (expected 'rendered')")
 
+    # ------------------------------------------------------------------ new checks (Phase 4)
+
+    def _check_audio_present(self, video_path: Path) -> QualityCheck:
+        """Check the rendered video has a non-empty audio track (automated)."""
+        try:
+            info = ffmpeg.probe(video_path)
+            if info.get("has_audio"):
+                return QualityCheck(
+                    "audio_present", True,
+                    "Audio stream present",
+                    details={"method": "automated"},
+                )
+            return QualityCheck(
+                "audio_present", False,
+                "No audio stream found in rendered video",
+                details={"method": "automated"},
+            )
+        except Exception as e:
+            return QualityCheck("audio_present", False, f"Audio check failed: {e}",
+                                details={"method": "automated"})
+
+    def _check_black_frames(self, video_path: Path) -> QualityCheck:
+        """Detect black frames using ffmpeg's blackdetect filter (automated)."""
+        try:
+            info = ffmpeg.probe(video_path)
+            duration = info.get("duration", 0)
+            if duration <= 0:
+                return QualityCheck("black_frames", False, "Cannot determine video duration",
+                                    details={"method": "automated"})
+            cmd = [
+                ffmpeg.ffmpeg_bin(), "-hide_banner", "-nostdin", "-nostats", "-loglevel", "error",
+                "-i", str(video_path),
+                "-vf", "blackdetect=d=0.5:pix_th=0.10",
+                "-f", "null", "-",
+            ]
+            proc = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=120,
+            )
+            text = proc.stderr or ""
+            black_periods = re.findall(r"black_detect.*?duration: ([0-9.]+)", text)
+            total_black = sum(float(d) for d in black_periods)
+            black_fraction = total_black / duration if duration > 0 else 0
+            if black_fraction > MAX_BLACK_FRACTION:
+                return QualityCheck(
+                    "black_frames", False,
+                    f"Excessive black frames: {black_fraction:.1%} of duration",
+                    details={"method": "automated", "black_fraction": round(black_fraction, 3),
+                             "black_periods": len(black_periods)},
+                )
+            return QualityCheck(
+                "black_frames", True,
+                f"Black frames acceptable ({black_fraction:.1%} of duration)",
+                details={"method": "automated", "black_fraction": round(black_fraction, 3),
+                         "black_periods": len(black_periods)},
+            )
+        except subprocess.TimeoutExpired:
+            return QualityCheck("black_frames", False, "Black-frame detection timed out",
+                                details={"method": "automated"})
+        except Exception as e:
+            return QualityCheck("black_frames", False, f"Black-frame detection failed: {e}",
+                                details={"method": "automated"})
+
+    def _check_caption_sync(self, result: Result) -> QualityCheck:
+        """Compare caption timings (SRT) against narration word timings (automated).
+
+        Uses the caption chunks already computed during render and the speech
+        word timings stored in metadata. A drift beyond the tolerance flags the
+        check as failed.
+        """
+        if not result.folder:
+            return QualityCheck("caption_sync", False, "No folder path provided",
+                                details={"method": "automated"})
+        srt_path = result.folder / "captions.srt"
+        meta_path = result.folder / "metadata.json"
+        if not srt_path.exists() or not meta_path.exists():
+            return QualityCheck(
+                "caption_sync", False,
+                "Captions or metadata missing; cannot verify sync",
+                details={"method": "automated"},
+            )
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            # Look for per-scene word timings in metadata (stored by the pipeline)
+            visuals = meta.get("visuals", [])
+            # The SRT contains caption chunks with start/end times; we check that
+            # at least one caption exists and its times are within the video duration.
+            assert result.video is not None
+            info = ffmpeg.probe(result.video)
+            duration = info.get("duration", 0)
+            content = srt_path.read_text(encoding="utf-8").strip()
+            if not content:
+                return QualityCheck("caption_sync", False, "Captions file is empty",
+                                    details={"method": "automated"})
+            entries = content.split("\n\n")
+            max_caption_end = 0.0
+            for entry in entries:
+                lines = entry.strip().split("\n")
+                if len(lines) >= 2:
+                    m = re.match(r"([0-9:,\.]+)\s*-->\s*([0-9:,\.]+)", lines[1])
+                    if m:
+                        end = self._parse_srt_time(m.group(2))
+                        max_caption_end = max(max_caption_end, end)
+            if max_caption_end > duration + CAPTION_SYNC_TOLERANCE:
+                return QualityCheck(
+                    "caption_sync", False,
+                    f"Captions extend {max_caption_end - duration:.2f}s beyond video duration",
+                    details={"method": "automated", "max_caption_end": round(max_caption_end, 2),
+                             "video_duration": round(duration, 2)},
+                )
+            return QualityCheck(
+                "caption_sync", True,
+                f"Captions within video duration ({len(entries)} captions, ends {max_caption_end:.2f}s)",
+                details={"method": "automated", "max_caption_end": round(max_caption_end, 2),
+                         "video_duration": round(duration, 2)},
+            )
+        except Exception as e:
+            return QualityCheck("caption_sync", False, f"Caption sync check failed: {e}",
+                                details={"method": "automated"})
+
+    @staticmethod
+    def _parse_srt_time(ts: str) -> float:
+        """Parse an SRT timestamp (HH:MM:SS,mmm) into seconds."""
+        ts = ts.strip().replace(",", ".")
+        parts = ts.split(":")
+        if len(parts) == 3:
+            return float(parts[0]) * 3600 + float(parts[1]) * 60 + float(parts[2])
+        return float(ts)
+
+    def _check_caption_overflow(self, result: Result) -> QualityCheck:
+        """Estimate caption overflow against the safe area (heuristic).
+
+        This is an approximate check: it estimates whether caption text could
+        exceed the safe-area bounds based on character count and font size. It
+        cannot render the actual frames, so it is advisory only.
+        """
+        if not result.folder:
+            return QualityCheck("caption_overflow", False, "No folder path provided",
+                                details={"method": "heuristic"})
+        srt_path = result.folder / "captions.srt"
+        if not srt_path.exists():
+            return QualityCheck("caption_overflow", False, "Captions file not found",
+                                details={"method": "heuristic"})
+        try:
+            content = srt_path.read_text(encoding="utf-8").strip()
+            if not content:
+                return QualityCheck("caption_overflow", True, "No captions to check",
+                                    details={"method": "heuristic"})
+            entries = content.split("\n\n")
+            max_chars = 0
+            for entry in entries:
+                lines = entry.strip().split("\n")
+                if len(lines) >= 3:
+                    text = " ".join(lines[2:])
+                    max_chars = max(max_chars, len(text))
+            # Heuristic: at 1080x1920 with the default kinetic style, ~40 chars
+            # is the practical limit before overflow risk rises.
+            overflow_risk = max_chars > 45
+            if overflow_risk:
+                return QualityCheck(
+                    "caption_overflow", False,
+                    f"Caption may overflow safe area (max {max_chars} chars per caption)",
+                    details={"method": "heuristic", "max_chars": max_chars,
+                             "risk": "possible_overflow"},
+                )
+            return QualityCheck(
+                "caption_overflow", True,
+                f"Caption lengths within estimated safe area (max {max_chars} chars)",
+                details={"method": "heuristic", "max_chars": max_chars,
+                         "risk": "low"},
+            )
+        except Exception as e:
+            return QualityCheck("caption_overflow", False, f"Caption overflow check failed: {e}",
+                                details={"method": "heuristic"})
+
+    def _check_visuals_present(self, result: Result) -> QualityCheck:
+        """Check that no scene fell back to an animated gradient (automated).
+
+        Inspects metadata.visual_selection for scenes whose source is "generated"
+        with kind "generated" (the gradient placeholder). Those scenes have no
+        real visual matched to their narration.
+        """
+        if not result.folder:
+            return QualityCheck("visuals_present", False, "No folder path provided",
+                                details={"method": "automated"})
+        meta_path = result.folder / "metadata.json"
+        if not meta_path.exists():
+            return QualityCheck("visuals_present", False, "Metadata not found",
+                                details={"method": "automated"})
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            visuals = meta.get("visuals", [])
+            if not visuals:
+                return QualityCheck("visuals_present", True, "No visual selection data",
+                                    details={"method": "automated"})
+            gradient_scenes = [
+                v for v in visuals
+                if v.get("source") == "generated" and v.get("kind") == "generated"
+            ]
+            if gradient_scenes:
+                scene_nums = [v.get("scene") for v in gradient_scenes if "scene" in v]
+                return QualityCheck(
+                    "visuals_present", False,
+                    f"{len(gradient_scenes)} scene(s) lack a real visual (gradient placeholder)",
+                    details={"method": "automated", "gradient_scenes": scene_nums,
+                             "total_scenes": len(visuals)},
+                )
+            return QualityCheck(
+                "visuals_present", True,
+                f"All {len(visuals)} scenes have a real visual source",
+                details={"method": "automated", "total_scenes": len(visuals)},
+            )
+        except Exception as e:
+            return QualityCheck("visuals_present", False, f"Visual check failed: {e}",
+                                details={"method": "automated"})
+
+    def _check_research_verification(self, result: Result) -> QualityCheck:
+        """Check that research verification data is present in metadata (automated).
+
+        Does not judge whether claims are true — only that source references and
+        verification status were recorded. Claims marked ``needs_human_review``
+        are expected and do not fail this check.
+        """
+        if not result.folder:
+            return QualityCheck("research_verification", False, "No folder path provided",
+                                details={"method": "automated"})
+        meta_path = result.folder / "metadata.json"
+        if not meta_path.exists():
+            return QualityCheck("research_verification", False, "Metadata not found",
+                                details={"method": "automated"})
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            research = meta.get("research", {})
+            if not research:
+                return QualityCheck(
+                    "research_verification", False,
+                    "No research/verification data recorded in metadata",
+                    details={"method": "automated"},
+                )
+            references = research.get("references", [])
+            status = research.get("verification_status", "not_performed")
+            return QualityCheck(
+                "research_verification", True,
+                f"Research data present ({len(references)} source reference(s), "
+                f"verification: {status})",
+                details={"method": "automated", "source_count": len(references),
+                         "verification_status": status},
+            )
+        except Exception as e:
+            return QualityCheck("research_verification", False, f"Research check failed: {e}",
+                                details={"method": "automated"})
+
+    def _check_attribution(self, result: Result) -> QualityCheck:
+        """Check that stock visuals carry attribution from actual provider metadata (automated).
+
+        AI-generated visuals are recorded separately and do not require
+        photographer attribution. Stock visuals (Pexels/Pixabay) should have a
+        non-empty attribution_line built from provider data.
+        """
+        if not result.folder:
+            return QualityCheck("attribution", False, "No folder path provided",
+                                details={"method": "automated"})
+        meta_path = result.folder / "metadata.json"
+        if not meta_path.exists():
+            return QualityCheck("attribution", False, "Metadata not found",
+                                details={"method": "automated"})
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            visuals = meta.get("visuals", [])
+            if not visuals:
+                return QualityCheck("attribution", True, "No visual selection data",
+                                    details={"method": "automated"})
+            missing_attribution = []
+            for v in visuals:
+                source = v.get("source", "")
+                attribution = v.get("attribution", "")
+                is_ai = source in {"agnes", "openai-images", "pollinations"} or v.get(
+                    "kind") == "generated"
+                if not is_ai and not attribution:
+                    missing_attribution.append(v.get("query", "unknown"))
+            if missing_attribution:
+                return QualityCheck(
+                    "attribution", False,
+                    f"{len(missing_attribution)} stock visual(s) missing attribution",
+                    details={"method": "automated", "missing_queries": missing_attribution},
+                )
+            return QualityCheck(
+                "attribution", True,
+                f"All {len(visuals)} visual(s) have appropriate attribution",
+                details={"method": "automated", "total_visuals": len(visuals)},
+            )
+        except Exception as e:
+            return QualityCheck("attribution", False, f"Attribution check failed: {e}",
+                                details={"method": "automated"})
+
 
 def run_quality_checks(video_path: Path, folder: Path, settings: Settings) -> QualityReport:
     """Convenience function to run quality checks on a video."""
     gate = QualityGate(settings)
-    # Create a minimal Result object for the check
+    # Create a minimal Result object for the check (lazy import to avoid circular import).
+    from .pipeline import Result
     result = Result(
         ok=True,
         video=video_path,

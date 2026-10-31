@@ -63,6 +63,10 @@ SCENE_SCHEMA = {
         "narration": {"type": "string"},
         "search_query": {"type": "string"},
         "image_prompt": {"type": "string"},
+        "duration": {"type": ["number", "null"]},
+        "visual_description": {"type": "string"},
+        "visual_source": {"type": "string"},
+        "attribution": {"type": "string"},
     },
     "required": ["speaker", "narration", "search_query", "image_prompt"],
     "additionalProperties": False,
@@ -118,6 +122,10 @@ class Scene:
     search_query: str
     image_prompt: str = ""
     speaker: str = "A"
+    duration: float | None = None        # storyboard scene duration (seconds); filled at render
+    visual_description: str = ""         # what should be shown in this scene
+    visual_source: str = ""              # preferred source hint: stock|ai|agency
+    attribution: str = ""                # filled by the media layer from actual asset metadata
 
 
 @dataclass
@@ -136,6 +144,7 @@ class Script:
     score: int | None = None           # Script Doctor retention score (0-100)
     review: list[str] = field(default_factory=list)  # everything the Script Doctor found
     blocking: list[str] = field(default_factory=list)  # factual/safety problems that must stop a render
+    verification_report: dict | None = None  # claim-based fact verification report (Phase 2)
 
     @property
     def narration(self) -> str:
@@ -279,9 +288,15 @@ def normalize(data: dict, subject: str, style: str, language: str) -> Script:
         if not narration:
             continue
         query = _clean_tag(s.get("search_query") or "") or subject
+        raw_duration = s.get("duration")
+        duration = float(raw_duration) if raw_duration is not None else None
         scenes.append(Scene(narration=narration, search_query=truncate_words(query, 60),
                             image_prompt=str(s.get("image_prompt") or query).strip(),
-                            speaker=_speaker(s.get("speaker")) if multi else "A"))
+                            speaker=_speaker(s.get("speaker")) if multi else "A",
+                            duration=duration,
+                            visual_description=str(s.get("visual_description") or "").strip(),
+                            visual_source=str(s.get("visual_source") or "").strip(),
+                            attribution=str(s.get("attribution") or "").strip()))
     if not scenes:
         raise ValueError("script has no narration")
     limit = 20 if style == "chat" else 12
@@ -348,6 +363,7 @@ def normalize(data: dict, subject: str, style: str, language: str) -> Script:
         score=int(score) if isinstance(score, (int, float)) else None,
         review=[str(x) for x in data.get("review") or []][:8],
         blocking=[str(x) for x in data.get("blocking") or data.get("blocking_issues") or []][:5],
+        verification_report=data.get("verification_report"),
     )
 
 

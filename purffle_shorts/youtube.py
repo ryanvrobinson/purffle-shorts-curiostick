@@ -25,6 +25,27 @@ RETRY_STATUS = {500, 502, 503, 504}
 _lock = threading.Lock()
 
 
+def find_existing_video(yt, marker: str) -> str | None:
+    """Best-effort check whether the authorized channel already has a video matching ``marker``.
+
+    Used as a cross-runner idempotency net: if a slot's video is already on YouTube
+    (and the history database did not carry over to this runner), we do not re-upload.
+    Never blocks an upload: any failure returns None.
+    """
+    from googleapiclient.errors import HttpError
+    try:
+        resp = yt.search().list(part="id", forMine=True, type="video",
+                                q=marker, maxResults=5).execute()
+        items = resp.get("items") or []
+        if items:
+            return items[0]["id"]["videoId"]
+    except HttpError as e:
+        log.warning("YouTube duplicate search failed: %s", e)
+    except Exception as e:  # pragma: no cover - network/auth hiccups
+        log.warning("YouTube duplicate search failed: %s", e)
+    return None
+
+
 class QuotaExceeded(RuntimeError):
     pass
 
