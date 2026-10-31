@@ -13,7 +13,7 @@ on:
         default: false
 
 concurrency:
-  group: curiostick-slot-2
+  group: curiostick-history-db-write
   cancel-in-progress: false
 
 permissions:
