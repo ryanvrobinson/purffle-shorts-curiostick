@@ -473,6 +473,11 @@ def review_script(llm, script: Script, settings: Settings) -> Script:
         except (TypeError, ValueError):
             score = None
         issues = [str(i).strip() for i in data.get("issues") or [] if str(i).strip()][:5]
+        blocking_issues = [
+            str(i).strip()
+            for i in (data.get("blocking_issues") or data.get("blocking") or [])
+            if str(i).strip()
+        ][:5]
         result = current
         if rewrite and isinstance(data.get("script"), dict):
             try:
@@ -487,6 +492,21 @@ def review_script(llm, script: Script, settings: Settings) -> Script:
                 log.warning("Script Doctor rewrite ignored: %s", e)
         score = score if score is not None else current.score
         result.score, result.review = score, issues
+        result.blocking = blocking_issues
+
+        if blocking_issues:
+            if rewrite and attempt == 0:
+                log.warning(
+                    "Script Doctor found blocking issues; requesting one bounded rewrite/review attempt: %s",
+                    "; ".join(blocking_issues),
+                )
+                current = result
+                continue
+            raise ScriptQualityError(
+                "Script Doctor found unresolved blocking factual/safety/usability issues: "
+                + "; ".join(blocking_issues)
+            )
+
         if score is not None and score < threshold:
             if rewrite and attempt == 0:
                 log.warning("Script Doctor score %d is below the %d-point threshold; requesting one more "
