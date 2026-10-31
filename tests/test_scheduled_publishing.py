@@ -82,6 +82,26 @@ def test_ledger_record_slot_updates_in_place(tmp_path):
     assert row["error"] is None
 
 
+def test_slot_done_requires_scheduled_status(tmp_path):
+    """Only a successfully scheduled slot blocks re-publication; failed/queued stays retriable
+    and never wipes previously recorded history for other slots."""
+    h = History(tmp_path / "history.db")
+    key = "2026-10-31-slot-2"
+    assert h.is_slot_done(key) is False
+    h.record_slot(key, "2026-10-31", 2, "2026-10-31T08:30:00Z", "failed",
+                  error="LLM provider failed")
+    assert h.is_slot_done(key) is False  # failed -> not done, slot can be retried
+    h.record_slot(key, "2026-10-31", 2, "2026-10-31T08:30:00Z", "queued",
+                  error="quota reached")
+    assert h.is_slot_done(key) is False  # queued -> not done, not blindly retried
+    h.record_slot(key, "2026-10-31", 2, "2026-10-31T08:30:00Z", "scheduled",
+                  youtube_id="vid2", title="T #shorts")
+    assert h.is_slot_done(key) is True
+    # A different slot on the same date is unaffected.
+    other = "2026-10-31-slot-1"
+    assert h.is_slot_done(other) is False
+
+
 # ------------------------------------------------------------------ fake pipeline pieces used below
 
 class FakeStudio:

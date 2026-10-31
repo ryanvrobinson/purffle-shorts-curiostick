@@ -319,3 +319,100 @@ def test_nvidia_gpt_oss_retry_is_capped_at_4096_tokens():
     chain.settings, chain.providers = Settings(), [provider]
     assert chain.complete_json("system", "user") == {"ok": True}
     assert provider.limits == [4000, 4096]
+
+
+def test_nemotron_reasoning_model_payload_disables_thinking_text_only(monkeypatch):
+    """NVIDIA nemotron on NVIDIA NIM: thinking off, text-only, no image inputs, adequate budget."""
+    session = FakeSession(_ok())
+    monkeypatch.setattr(L, "http", lambda: session)
+    provider = L.OpenAICompatible(
+        L.PRESETS["custom"],
+        "nvidia/nemotron-3.5-super-vl-120b-a12b",
+        "fake-key",
+        "https://integrate.api.nvidia.com/v1",
+    )
+    provider.complete("system", "user", schema={})
+    body = session.calls[0]["json"]
+    assert body["model"] == "nvidia/nemotron-3.5-super-vl-120b-a12b"
+    assert body["chat_template_kwargs"] == {"enable_thinking": False}
+    assert body["max_tokens"] >= 4096
+    assert "reasoning_effort" not in body   # that's the gpt-oss knob, not nemotron's
+    # Nemotron is handled like a reasoning model: temperature is not sent (thinking is off instead).
+    assert "temperature" not in body
+    # text-only: every message content is a plain string, no image_url parts
+    assert all(isinstance(m["content"], str) for m in body["messages"])
+
+
+def test_nemotron_empty_reply_with_reasoning_content_errors_without_printing_it(monkeypatch):
+    """Nemotron burns its budget on reasoning -> empty content. Error must not echo reasoning."""
+    session = FakeSession(FakeResp(200, {
+        "choices": [{"message": {
+            "content": None,
+            "reasoning_content": "hidden chain of thought that must not leak",
+        }, "finish_reason": "length"}],
+    }))
+    monkeypatch.setattr(L, "http", lambda: session)
+    provider = L.OpenAICompatible(
+        L.PRESETS["custom"],
+        "nvidia/nemotron-3.5-super-vl-120b-a12b",
+        "fake-key",
+        "https://integrate.api.nvidia.com/v1",
+    )
+    with pytest.raises(L.LLMError, match="empty reply.*reasoning_content is not final output") as exc:
+        provider.complete("system", "user")
+    assert "hidden chain of thought" not in str(exc.value)
+
+
+def test_complete_json_retries_without_forced_json_mode(monkeypatch):
+    """On an empty/invalid first reply the retry drops response_format and raises the token budget."""
+    calls = []
+
+    class S:
+        def post(self, url, json=None, headers=None, timeout=None):
+            calls.append(dict(json))
+            if len(calls) == 1:
+                return FakeResp(200, {"choices": [{"message": {"content": None},
+                                                    "finish_reason": "length"}]})
+            return FakeResp(200, {"choices": [{"message": {"content": '{"ok": true}'},
+                                                "finish_reason": "stop"}]})
+
+    monkeypatch.setattr(L, "http", lambda: S())
+    p = L.OpenAICompatible(L.PRESETS["custom"], "some-model", "k", "https://example.com/v1")
+    chain = object.__new__(L.LLM)
+    chain.settings, chain.providers = Settings(), [p]
+    assert chain.complete_json("s", "u") == {"ok": True}
+    assert len(calls) == 2, calls
+    assert "response_format" in calls[0], calls[0]          # first attempt used JSON mode
+    assert "response_format" not in calls[1], calls[1]      # retry dropped forced JSON mode
+    assert calls[1]["max_tokens"] == 8000, calls[1]         # larger budget on retry
+
+
+def test_nemotron_empty_reply_retries_without_json_mode_and_more_tokens(monkeypatch):
+    """Nemotron retry is a genuinely different request, not the same failed call with more tokens."""
+    calls = []
+
+    class S:
+        def post(self, url, json=None, headers=None, timeout=None):
+            calls.append(dict(json))
+            if len(calls) == 1:
+                return FakeResp(200, {"choices": [{"message": {"content": None},
+                                                    "finish_reason": "length"}]})
+            return FakeResp(200, {"choices": [{"message": {"content": '{"ok": true}'},
+                                                "finish_reason": "stop"}]})
+
+    monkeypatch.setattr(L, "http", lambda: S())
+    p = L.OpenAICompatible(
+        L.PRESETS["custom"],
+        "nvidia/nemotron-3.5-super-vl-120b-a12b",
+        "fake-key",
+        "https://integrate.api.nvidia.com/v1",
+    )
+    chain = object.__new__(L.LLM)
+    chain.settings, chain.providers = Settings(), [p]
+    assert chain.complete_json("s", "u") == {"ok": True}
+    assert len(calls) == 2, calls
+    assert calls[0]["chat_template_kwargs"] == {"enable_thinking": False}
+    assert calls[1]["chat_template_kwargs"] == {"enable_thinking": False}
+    assert "response_format" in calls[0]
+    assert "response_format" not in calls[1]
+    assert calls[1]["max_tokens"] > calls[0]["max_tokens"]

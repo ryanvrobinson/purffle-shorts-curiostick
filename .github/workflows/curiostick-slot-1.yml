@@ -112,7 +112,39 @@ jobs:
           git add -f data/history.db
           git diff --cached --quiet && exit 0
           git commit -m "chore: record CurioStick slot ${{ env.SLOT }} run (${{ github.run_id }})"
-          git push origin main
+          git fetch origin main || { echo "error: git fetch failed; not pushing history" >&2; exit 1; }
+          # Remote main may have advanced while this slot ran (another slot, a re-run, or a manual push).
+          # Never force-push and never overwrite another slot's SQLite history. If our commit is already
+          # contained in remote main, push is a no-op. If remote diverged, check whether this slot's
+          # record is already persisted on remote (idempotent by date + slot); if so there is nothing to
+          # push. Otherwise refuse to merge/overwrite the SQLite file and fail explicitly instead of
+          # silently claiming success.
+          if git merge-base --is-ancestor origin/main HEAD; then
+            git push origin main
+          else
+            RUN_DATE=$(TZ=Asia/Kolkata date +%F)
+            REMOTE_DB="$(mktemp)"
+            git show origin/main:data/history.db > "$REMOTE_DB" 2>/dev/null || true
+            if python3 - "$REMOTE_DB" "$RUN_DATE" "${SLOT}" <<'PY'
+            import sqlite3, sys
+            path, run_date, slot = sys.argv[1], sys.argv[2], sys.argv[3]
+            key = f"{run_date}-slot-{slot}"
+            try:
+                conn = sqlite3.connect(path)
+                row = conn.execute(
+                    "SELECT 1 FROM slot_uploads WHERE key = ? AND status = 'scheduled'", (key,)).fetchone()
+                conn.close()
+                sys.exit(0 if row else 1)
+            except Exception:
+                sys.exit(1)
+            PY
+            then
+              echo "Slot ${SLOT} for ${RUN_DATE} already recorded on remote; nothing to push."
+              exit 0
+            fi
+            echo "error: remote main advanced with history this run does not have; refusing to force-push or merge SQLite history" >&2
+            exit 1
+          fi
 
       - name: Upload logs and failure reports
         if: always()

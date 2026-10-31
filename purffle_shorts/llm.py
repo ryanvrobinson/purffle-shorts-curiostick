@@ -240,6 +240,16 @@ class OpenAICompatible(Provider):
     def _is_reasoning_model(self) -> bool:
         return bool(re.match(r"^(o\d|gpt-5)", self.model.split("/")[-1]))
 
+    def _is_nvidia_reasoning_model(self) -> bool:
+        """NVIDIA Nemotron reasoning models (e.g. nemotron-3.5-super-vl-120b-a12b).
+
+        Reasoning is on by default and its tokens count against ``max_tokens``, so a small budget
+        ends inside the chain of thought and leaves ``content`` empty. CurioStick script generation is
+        text-only and does not need reasoning, so we switch thinking off and never print it.
+        """
+        return ("integrate.api.nvidia.com" in self.base_url.lower()
+                and "nemotron" in self.model.lower())
+
     def complete(self, system, user, *, schema=None, temperature=0.9, max_tokens=4000) -> str:
         payload: dict[str, Any] = {
             "model": self.model,
@@ -247,6 +257,9 @@ class OpenAICompatible(Provider):
         }
         if self._is_reasoning_model():
             payload["max_completion_tokens"] = max(max_tokens, 8000)  # room for hidden reasoning tokens
+        elif self._is_nvidia_reasoning_model():
+            payload["chat_template_kwargs"] = {"enable_thinking": False}
+            payload["max_tokens"] = max(max_tokens, 4096)
         else:
             payload["temperature"] = temperature
             payload["max_tokens"] = max_tokens
@@ -418,9 +431,13 @@ class LLM:
                 if max_tokens < 16000:
                     limits.append(min(max_tokens * 2, 16000))
             for attempt, token_limit in enumerate(limits):
-                def _call(p=p, token_limit=token_limit):
+                # The retry is a genuinely different request: drop forced JSON mode (some endpoints
+                # return an empty body when JSON mode is required) and rely on the extract_json
+                # parser instead, on top of the larger token budget. Never the same call twice.
+                attempt_schema = None if attempt > 0 else (schema if schema is not None else {})
+                def _call(p=p, token_limit=token_limit, attempt_schema=attempt_schema):
                     try:
-                        return p.complete(system, user, schema=schema if schema is not None else {},
+                        return p.complete(system, user, schema=attempt_schema,
                                           max_tokens=token_limit, temperature=self.settings.llm_temperature)
                     except LLMError as e:
                         if "empty reply" in str(e).lower():
@@ -436,8 +453,8 @@ class LLM:
                     message = str(e).lower()
                     is_incomplete = ("empty reply" in message or "model did not return valid json" in message)
                     if attempt == 0 and is_incomplete and len(limits) > 1:
-                        log.warning("LLM %s returned an empty or invalid JSON response; retrying once with "
-                                    "%d output tokens", p, limits[1])
+                        log.warning("LLM %s returned an empty or invalid JSON response; retrying once without "
+                                    "forced JSON mode and with %d output tokens", p, limits[1])
                         continue
                     errors.append(f"{p}: {e}")
                     log.warning("LLM %s failed: %s", p, e)
