@@ -65,7 +65,7 @@ def test_openai_payload_for_chat_model(monkeypatch):
     body = sess.calls[0]["json"]
     assert body["temperature"] == 0.9 and body["max_tokens"] == 4000
     assert body["response_format"] == {"type": "json_object"}
-    assert sess.calls[0]["timeout"] == (5, 45)
+    assert sess.calls[0]["timeout"] == (10, 120)
     assert sess.calls[0]["headers"]["Authorization"] == "Bearer k"
 
 
@@ -104,7 +104,7 @@ def test_openai_timeout_is_reported_and_not_retried(monkeypatch):
 
         def post(self, *args, **kwargs):
             self.calls += 1
-            assert kwargs["timeout"] == (5, 45)
+            assert kwargs["timeout"] == (10, 120)
             raise requests.exceptions.ReadTimeout("socket stalled")
 
     session = TimeoutSession()
@@ -113,7 +113,7 @@ def test_openai_timeout_is_reported_and_not_retried(monkeypatch):
     chain = object.__new__(L.LLM)
     chain.settings, chain.providers = Settings(), [provider]
 
-    with pytest.raises(L.LLMError, match="request timed out.*connect/read limits 5s/45s"):
+    with pytest.raises(L.LLMError, match="request timed out.*connect/read limits 10s/120s"):
         chain.complete_json("s", "u")
     assert session.calls == 1
 
@@ -287,3 +287,35 @@ def test_ollama_uses_an_installed_model_when_default_missing(monkeypatch):
     monkeypatch.setattr(L, "ollama_models", lambda url: ["llama3.1:latest"])
     assert L.build_provider("ollama", Settings()).model == "llama3.1"
     assert L.ollama_has(["llama3.1:latest"], "llama3.1") and not L.ollama_has(["llama3.1:8b"], "llama3.1")
+
+
+def test_nvidia_gpt_oss_uses_low_reasoning_effort(monkeypatch):
+    session = FakeSession(_ok())
+    monkeypatch.setattr(L, "http", lambda: session)
+    provider = L.OpenAICompatible(
+        L.PRESETS["custom"], "openai/gpt-oss-20b", "fake-key",
+        "https://integrate.api.nvidia.com/v1",
+    )
+    provider.complete("system", "user", schema={})
+    body = session.calls[0]["json"]
+    assert body["reasoning_effort"] == "low"
+
+
+def test_nvidia_gpt_oss_retry_is_capped_at_4096_tokens():
+    class Truncated(L.Provider):
+        name = "custom"
+        model = "openai/gpt-oss-20b"
+        base_url = "https://integrate.api.nvidia.com/v1"
+
+        def __init__(self):
+            self.limits = []
+
+        def complete(self, system, user, *, schema=None, temperature=0.9, max_tokens=4000):
+            self.limits.append(max_tokens)
+            return "{" if len(self.limits) == 1 else '{"ok": true}'
+
+    provider = Truncated()
+    chain = object.__new__(L.LLM)
+    chain.settings, chain.providers = Settings(), [provider]
+    assert chain.complete_json("system", "user") == {"ok": True}
+    assert provider.limits == [4000, 4096]

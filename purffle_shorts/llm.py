@@ -21,7 +21,7 @@ from .config import Settings
 from .utils import PermanentError, http, raise_for_status, with_retries
 
 log = logging.getLogger("purffle")
-_LLM_REQUEST_TIMEOUT = (5, 45)
+_LLM_REQUEST_TIMEOUT = (10, 120)
 
 
 class LLMError(RuntimeError):
@@ -252,6 +252,10 @@ class OpenAICompatible(Provider):
             payload["max_tokens"] = max_tokens
         if schema is not None and self._json_mode:
             payload["response_format"] = {"type": "json_object"}
+        if (self.name == "custom"
+                and "integrate.api.nvidia.com" in self.base_url.lower()
+                and self.model.lower().startswith("openai/gpt-oss-")):
+            payload["reasoning_effort"] = "low"
         headers = {"Content-Type": "application/json"}
         if self.api_key:
             headers["Authorization"] = "Bearer " + self.api_key
@@ -399,9 +403,20 @@ class LLM:
                       max_tokens: int = 4000) -> dict[str, Any]:
         errors = []
         for p in self.providers:
-            limits = [max_tokens]
-            if max_tokens < 16000:
-                limits.append(min(max_tokens * 2, 16000))
+            nvidia_gpt_oss = (
+                getattr(p, "name", "") == "custom"
+                and "integrate.api.nvidia.com" in getattr(p, "base_url", "").lower()
+                and getattr(p, "model", "").lower().startswith("openai/gpt-oss-")
+            )
+            if nvidia_gpt_oss:
+                first_limit = min(max_tokens, 4096)
+                limits = [first_limit]
+                if first_limit < 4096:
+                    limits.append(4096)
+            else:
+                limits = [max_tokens]
+                if max_tokens < 16000:
+                    limits.append(min(max_tokens * 2, 16000))
             for attempt, token_limit in enumerate(limits):
                 def _call(p=p, token_limit=token_limit):
                     try:
