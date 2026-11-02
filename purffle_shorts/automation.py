@@ -590,7 +590,15 @@ class SlotAutomation:
         ]
         uploaded = f"- Uploaded: {out.uploaded}"
         if out.youtube_id:
-            uploaded += f" — https://youtube.com/shorts/{out.youtube_id}"
+            # A scheduled upload is private until its publishAt time: it is not yet
+            # public on the channel. Never describe it as "published."
+            when = f", goes public {out.publish_at_ist}" if out.publish_at_ist else ""
+            uploaded = (
+                f"- Uploaded: {out.uploaded} — scheduled as private{when} — "
+                f"https://youtube.com/shorts/{out.youtube_id}"
+            )
+        elif out.dry_run:
+            uploaded += " — YouTube upload not attempted (dry run)"
         lines.append(uploaded)
         if out.quality_report is None:
             lines.append("- Quality gate: not run (--skip-quality)")

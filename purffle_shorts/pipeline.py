@@ -463,14 +463,44 @@ class Studio:
             return 0
         return self.s.daily_upload_limit - self.history.uploads_since(day)
 
+    def _pre_upload_video_check(self, rid: int, rec: dict) -> bool:
+        """Validate the rendered video before any upload is attempted.
+
+        Returns True when the video is usable (exists, ffprobe-readable, has
+        video and audio streams). When it is not, the record is marked failed
+        with a clear, actionable error and False is returned so no upload is
+        attempted and the run is never mistaken for a successful publication.
+        """
+        video_path = Path(rec["video_path"]) if rec.get("video_path") else None
+        if not rec or not video_path or not video_path.exists():
+            log.error("Video #%s has no file to upload", rid)
+            return False
+        try:
+            info = ffmpeg.probe(video_path)
+        except Exception as e:
+            log.error("Video #%s is not a usable video file: %s", rid, e)
+            self.history.update_video(rid, status="failed", error=f"invalid video file: {e}")
+            return False
+        if not info.get("has_video"):
+            log.error("Video #%s has no video stream", rid)
+            self.history.update_video(rid, status="failed", error="rendered video has no video stream")
+            return False
+        if not info.get("has_audio"):
+            log.error("Video #%s has no audio stream", rid)
+            self.history.update_video(rid, status="failed", error="rendered video has no audio stream")
+            return False
+        return True
+
     def upload_record(self, rid: int, result: Result | None = None) -> str:
         rec = self.history.get(rid)
-        if not rec or not rec.get("video_path") or not Path(rec["video_path"]).exists():
+        if not rec:
             log.error("Video #%s has no file to upload", rid)
             return "missing"
         if rec.get("youtube_id") or rec.get("status") in ("uploaded", "scheduled"):
             log.warning("Video #%s already has a YouTube upload; refusing to create a duplicate", rid)
             return "already-uploaded"
+        if not self._pre_upload_video_check(rid, rec):
+            return "missing"
         if rec.get("approval_status") != "approved" or not rec.get("approved_at"):
             log.warning("Video #%s has not been explicitly approved; refusing to upload", rid)
             return "approval-required"
@@ -538,12 +568,14 @@ class Studio:
         from . import youtube as YT
 
         rec = self.history.get(rid)
-        if not rec or not rec.get("video_path") or not Path(rec["video_path"]).exists():
+        if not rec:
             log.error("Video #%s has no file to upload", rid)
             return "missing"
         if rec.get("youtube_id") or rec.get("status") in ("uploaded", "scheduled"):
             log.warning("Video #%s already has a YouTube upload; refusing to create a duplicate", rid)
             return "already-uploaded"
+        if not self._pre_upload_video_check(rid, rec):
+            return "missing"
         if self.quota_left() <= 0:
             log.warning("Daily upload limit (%d) reached — video #%d not scheduled",
                         self.s.daily_upload_limit, rid)
