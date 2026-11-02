@@ -1,4 +1,5 @@
 ﻿import os
+from pathlib import Path
 from io import BytesIO
 
 import pytest
@@ -582,3 +583,122 @@ def test_agnes_image_with_qa_fails_after_all_retries(tmp_path, monkeypatch):
         max_retries=1,
     )
     assert result is None  # all retries exhausted
+
+
+# ------------------------------------------------------------------ visual mixing regression tests
+def _fake_pixabay_video(query, *args, **kwargs):
+    return [M.MediaItem("pixabay", f"v-{query}", "video",
+                        url=f"https://example.invalid/{query}.mp4",
+                        width=1080, height=1920, duration=5,
+                        extra={"tags": query.split()})]
+
+
+def _fake_agnes_image(prompt, dest, *args, **kwargs):
+    import os
+    Image.frombytes("RGB", (512, 768), os.urandom(512 * 768 * 3)).save(dest, "PNG")
+    return dest
+
+
+def test_hybrid_suitability_image_slots_prefer_ai_for_filmable_scenes(monkeypatch, tmp_path):
+    """Hybrid + suitability: an image slot requests AI first even for filmable content,
+    so the same video mixes Pixabay clips and Agnes images."""
+    monkeypatch.setattr(M, "pixabay_videos", _fake_pixabay_video)
+    monkeypatch.setattr(M, "pixabay_photos", lambda *args, **kwargs: [])
+    monkeypatch.setattr(M, "agnes_image", _fake_agnes_image)
+    visual = M.Visuals(Settings(visual_sources=["pixabay", "agnes"],
+                                pixabay_api_key="fake-pixabay-key",
+                                agnes_api_key="fake-agnes-key",
+                                visual_mode="hybrid", hybrid_image_every=2,
+                                visual_choice="suitability"))
+    monkeypatch.setattr(visual, "_fetch", lambda item, *args: item)
+    # Even-numbered scenes (index 1, 3) are hybrid image slots.
+    jobs = [(f"ocean {i}", f"prompt {i}", 3.0, f"narration {i}") for i in range(4)]
+    selected = visual.for_scenes(jobs, "ocean", tmp_path)
+
+    sources = [(m.source, m.kind) for m in selected]
+    # Scene 0 and 2 are stock slots (filmable -> pixabay); scene 1 and 3 are image slots
+    # that request AI first even though the content is filmable.
+    assert sources[0] == ("pixabay", "video")
+    assert sources[1] == ("agnes", "image")
+    assert sources[2] == ("pixabay", "video")
+    assert sources[3] == ("agnes", "image")
+    assert len(visual.reports) == 4
+    for rep in visual.reports.values():
+        assert rep["chosen"] is not None, rep  # every scene records its selected source
+
+
+def test_missing_agnes_key_clear_diagnostic_and_stock_fallback(monkeypatch, tmp_path, caplog):
+    """No Agnes key: a clear diagnostic is logged, the source is dropped, and the
+    image slot falls back to Pixabay stock rather than silently using AI."""
+    monkeypatch.setattr(M, "pixabay_videos", _fake_pixabay_video)
+    monkeypatch.setattr(M, "pixabay_photos", lambda *args, **kwargs: [])
+    called = []
+    monkeypatch.setattr(M, "agnes_image", lambda *a, **k: called.append(True) or (_ for _ in ()).throw(
+        AssertionError("Agnes must not be called without a key")))
+    visual = M.Visuals(Settings(visual_sources=["pixabay", "agnes"],
+                                pixabay_api_key="fake-pixabay-key",
+                                agnes_api_key="", visual_mode="hybrid"))
+    monkeypatch.setattr(visual, "_fetch", lambda item, *args: item)
+
+    selected = visual.for_scene(0, "ocean", "ocean", "ocean", 3.0, tmp_path,
+                                prefer_image=True, narration="An octopus has three hearts.")
+
+    assert selected.source == "pixabay"
+    assert "AGNES_API_KEY is not set" in caplog.text
+    assert "hybrid AI image unavailable" in visual.reports[0]["reason"]
+    assert not called  # Agnes was never invoked
+
+
+def test_ai_failure_for_one_scene_does_not_abort_others(monkeypatch, tmp_path):
+    """One scene's AI generation fails: that scene falls back to stock gracefully
+    (recorded in the report) instead of aborting the whole video, and later image
+    slots still receive AI images — so the same video mixes sources."""
+    def videos(query, *args, **kwargs):
+        return [M.MediaItem("pixabay", f"v-{query}", "video",
+                            url=f"https://example.invalid/{query}.mp4",
+                            width=1080, height=1920, duration=5,
+                            extra={"tags": query.split()})]
+
+    def agnes(prompt, dest, *args, **kwargs):
+        # Scene 1's image slot (prompt 1) fails; scene 3's succeeds. Deterministic per scene
+        # so the result is stable regardless of parallel scheduling order.
+        if "prompt 1" in prompt:
+            raise RuntimeError("Agnes transient failure")
+        Image.frombytes("RGB", (512, 768), os.urandom(512 * 768 * 3)).save(dest, "PNG")
+        return dest
+
+    monkeypatch.setattr(M, "pixabay_videos", videos)
+    monkeypatch.setattr(M, "pixabay_photos", lambda *args, **kwargs: [])
+    monkeypatch.setattr(M, "agnes_image", agnes)
+    visual = M.Visuals(Settings(visual_sources=["pixabay", "agnes"],
+                                pixabay_api_key="fake-pixabay-key",
+                                agnes_api_key="fake-agnes-key",
+                                visual_mode="hybrid", hybrid_image_every=2))
+    monkeypatch.setattr(visual, "_fetch", lambda item, *args: item)
+
+    # Scenes 0 (stock), 1 (image slot -> AI fails -> stock fallback), 2 (stock),
+    # 3 (image slot -> AI succeeds). No scene aborts the whole video.
+    jobs = [(f"ocean {i}", f"prompt {i}", 3.0, f"narration {i}") for i in range(4)]
+    selected = visual.for_scenes(jobs, "ocean", tmp_path)
+
+    assert [m.source for m in selected] == ["pixabay", "pixabay", "pixabay", "agnes"]
+    assert len(visual.reports) == 4
+    for rep in visual.reports.values():
+        assert rep["chosen"] is not None, rep
+    # Scene 1's transient AI failure was handled safely (stock fallback, logged+reported).
+    assert visual.reports[1]["chosen"]["source"] == "pixabay"
+    assert visual.reports[3]["chosen"]["source"] == "agnes"
+
+
+def test_all_slot_workflows_request_mixed_visual_sources():
+    """All three scheduled workflows enable hybrid mixing of Pixabay stock and Agnes AI images."""
+    import yaml
+    from pathlib import Path as P
+    root = P(__file__).resolve().parent.parent
+    for name in ("curiostick-slot-1.yml", "curiostick-slot-2.yml", "curiostick-slot-3.yml"):
+        data = yaml.safe_load((root / ".github/workflows" / name).read_text(encoding="utf-8"))
+        env = data["jobs"]["publish-short"]["env"]
+        assert env["VISUAL_SOURCES"] == "pixabay,agnes", name
+        assert env["VISUAL_CHOICE"] == "suitability", name
+        assert env["VISUAL_MODE"] == "hybrid", name
+        assert "AGNES_API_KEY" in env and "PIXABAY_API_KEY" in env, name

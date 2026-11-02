@@ -1,6 +1,8 @@
 from purffle_shorts.config import Settings, parse_resolution
 from purffle_shorts.history import History
 from purffle_shorts.utils import redact
+from purffle_shorts.timing import Chunk, Word
+from purffle_shorts import overlays as O
 
 
 def test_legacy_env_names_still_work(monkeypatch):
@@ -36,9 +38,35 @@ def test_target_seconds_is_clamped_to_the_supported_range(monkeypatch):
     assert Settings.from_env().target_seconds == 15
 
 
-def test_watermark_defaults_to_channel():
-    assert Settings(channel_name="Chan").watermark_text == "Chan"
+def test_watermark_blank_means_no_watermark():
+    # Blank WATERMARK means nothing is burned into the rendered video; the
+    # channel name is no longer used as a default watermark.
+    assert Settings(channel_name="Chan").watermark_text == ""
     assert Settings(watermark="none").watermark_text == ""
+    assert Settings(watermark="off").watermark_text == ""
+    assert Settings(watermark="My Brand").watermark_text == "My Brand"
+
+
+def test_build_overlays_omits_watermark_when_blank(settings, tmp_path):
+    # The Pillow overlay template does not create a watermark PNG when WATERMARK is blank,
+    # so nothing is burned into the rendered video. Captions/hook (intended graphics) are unaffected.
+    s = settings.with_overrides(watermark="")
+    word = Word("Hello", 0.0, 1.0, "A")
+    chunk = Chunk(words=[word], start=0.0, end=1.0)
+    work = tmp_path / "work"
+    plan = O.build_overlays(s, [chunk], 5.0, "HELLO", work)
+    assert plan.watermark is None
+    assert not (work / "watermark.png").exists()
+
+
+def test_build_overlays_creates_watermark_when_explicitly_set(settings, tmp_path):
+    # Defense in depth: an explicitly set WATERMARK still produces a watermark (opt-in).
+    s = settings.with_overrides(watermark="My Brand")
+    word = Word("Hello", 0.0, 1.0, "A")
+    chunk = Chunk(words=[word], start=0.0, end=1.0)
+    work = tmp_path / "work"
+    plan = O.build_overlays(s, [chunk], 5.0, "HELLO", work)
+    assert plan.watermark is not None
 
 
 def test_history_roundtrip(tmp_path):

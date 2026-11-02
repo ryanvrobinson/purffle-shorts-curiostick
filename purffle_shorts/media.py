@@ -1095,7 +1095,9 @@ class Visuals:
         # --- Decide whether this scene tries AI before stock ---
         if visual_choice == VISUAL_CHOICE_SUITABILITY:
             suitability = classify_suitability(narration, image_prompt, topic)
-            prefer_ai_first = (suitability == "concept")
+            # A hybrid image slot always asks for an AI image first, whatever the
+            # content classification; suitability still drives the non-hybrid scenes.
+            prefer_ai_first = (suitability == "concept") or prefer_image
             report["suitability"] = suitability
         elif visual_choice == VISUAL_CHOICE_AI_FIRST:
             prefer_ai_first = True

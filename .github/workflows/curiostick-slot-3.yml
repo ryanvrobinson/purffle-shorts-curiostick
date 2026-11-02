@@ -38,6 +38,8 @@ jobs:
       # ── Visual sources — Pixabay stock + Agnes AI images, suitability choice ──
       VISUAL_SOURCES: "pixabay,agnes"
       VISUAL_CHOICE: "suitability"
+      # Hybrid mode alternates stock clips with AI images so every Short mixes both.
+      VISUAL_MODE: "hybrid"
       PIXABAY_API_KEY: ${{ secrets.PIXABAY_API_KEY }}
       AGNES_API_KEY: ${{ secrets.AGNES_API_KEY }}
       AGNES_IMAGE_MODEL: "agnes-image-2.5-flash"

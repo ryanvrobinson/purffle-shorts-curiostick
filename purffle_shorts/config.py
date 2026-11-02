@@ -277,9 +277,11 @@ class Settings:
 
     @property
     def watermark_text(self) -> str:
-        if self.watermark.lower() in {"none", "off", "false", "0"}:
+        # Blank (or none/off) means no watermark: nothing is burned into the
+        # rendered video. Only an explicitly set WATERMARK produces one.
+        if not self.watermark or self.watermark.lower() in {"none", "off", "false", "0"}:
             return ""
-        return self.watermark or self.channel_name
+        return self.watermark
 
     @property
     def out_path(self) -> Path:
