@@ -501,12 +501,27 @@ def review_script(llm, script: Script, settings: Settings) -> Script:
         if rewrite and isinstance(data.get("script"), dict):
             try:
                 better = normalize(data["script"], current.topic, current.style, current.language)
+            except ValueError as e:
+                # The rewrite dropped required narration (or is otherwise un-normalizable):
+                # record targeted feedback so the bounded retry restores it, and keep
+                # the current draft untouched.
+                feedback.append(
+                    "The last rewrite had no usable narration; every scene needs narration "
+                    "so the video can be voiced. Keep all scenes and their narration intact, "
+                    "and do not delete any scene's text."
+                )
+                log.warning("Script Doctor rewrite ignored: %s", e)
+            else:
                 target = scene_plan(current.style, settings.target_seconds)[0]
                 n = word_count(better.narration, current.language)
                 previous_score = current.score
                 in_range = 0.75 * target <= n <= 1.3 * target
                 score_gain = score is None or previous_score is None or score >= previous_score
-                if in_range and score_gain:
+                # A rewrite is adopted only when it has valid narration (guaranteed by
+                # normalize succeeding), lands in the configured word window, does not lose
+                # quality, and resolves the blocking factual/safety/usability issues.
+                blocking_resolved = not blocking_issues
+                if in_range and score_gain and blocking_resolved:
                     result = better
                 else:
                     if not in_range:
@@ -521,13 +536,17 @@ def review_script(llm, script: Script, settings: Settings) -> Script:
                             f"The last rewrite scored {score}, below the current draft's "
                             f"{previous_score}. Keep what works and only fix the listed issues."
                         )
+                    elif blocking_issues:
+                        feedback.append(
+                            "The last rewrite still has unresolved blocking issues: "
+                            + "; ".join(blocking_issues)
+                            + ". Fix those issues before resubmitting."
+                        )
                     log.warning(
-                        "Script Doctor rewrite ignored: %d words for a %d-word target or no score gain",
+                        "Script Doctor rewrite ignored: %d words for a %d-word target or unresolved issues",
                         n,
                         target,
                     )
-            except ValueError as e:
-                log.warning("Script Doctor rewrite ignored: %s", e)
         score = score if score is not None else current.score
         result.score, result.review = score, issues
         result.blocking = blocking_issues

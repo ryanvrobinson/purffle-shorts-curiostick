@@ -369,3 +369,104 @@ def test_both_rewrites_undersized_produces_clear_error_and_bounds_calls():
     ):
         review_script(llm, _curio_stick_draft(), settings)
     assert len(llm.calls) == 2  # bounded, no endless retrying
+
+
+def test_rewrite_without_narration_is_ignored_then_retry_restores_narration():
+    """A rewrite that drops all narration is ignored; targeted feedback on the
+    bounded retry restores valid narration and a higher-scoring script wins.
+    The original draft is never replaced by the empty rewrite."""
+    settings = Settings(target_seconds=16, script_quality_threshold=70)
+    target = scene_plan("facts", 16)[0]  # 41-word target
+    lo, hi = int(0.75 * target), int(1.3 * target)  # 30 .. 53
+
+    def replies(user):
+        if len(llm.calls) == 1:
+            # Rewrite drops every scene's narration -> must be ignored,
+            # feedback recorded, original draft kept.
+            return {
+                "score": 50,
+                "issues": ["missing narration"],
+                "script": {
+                    "title": "Empty", "hook_text": "H", "cast": [], "description": "d",
+                    "hashtags": ["#cats"], "tags": ["cats"], "category": "pets",
+                    "scenes": [
+                        {"speaker": "A", "narration": "", "search_query": "q", "image_prompt": "p"}
+                        for _ in range(4)
+                    ],
+                },
+            }
+        # Retry receives the narration feedback and returns valid narration.
+        return {
+            "score": 80, "issues": [],
+            "script": _full_script(_scenes(5, 9)),  # 45 words, in range
+        }
+
+    llm = FakeLLM(replies)
+    out = review_script(llm, _draft(), settings)
+
+    assert out.score == 80 and out.review == []
+    assert lo <= word_count(out.narration) <= hi  # accepted rewrite meets length rule
+    assert len(llm.calls) == 2  # one bounded retry
+    # The retry received targeted feedback about the missing narration.
+    assert "no usable narration" in llm.calls[1]["user"]
+
+
+def test_rewrite_with_unresolved_blocking_issues_is_rejected_then_resolved():
+    """A rewrite that is in range and higher-scored but still carries blocking
+    factual/safety issues is rejected; the retry that resolves them is accepted."""
+    settings = Settings(target_seconds=16, script_quality_threshold=70)
+    target = scene_plan("facts", 16)[0]  # 41-word target
+    lo, hi = int(0.75 * target), int(1.3 * target)  # 30 .. 53
+
+    def replies(user):
+        if len(llm.calls) == 1:
+            return {
+                "score": 75,
+                "issues": ["unverified claim"],
+                "blocking_issues": [
+                    "The claim that the brine has been trapped for two million years "
+                    "cannot be verified.",
+                ],
+                "script": _full_script(_scenes(5, 9)),  # in range, higher score
+            }
+        # Retry receives blocking feedback and returns a clean rewrite.
+        return {
+            "score": 85, "issues": [], "blocking_issues": [],
+            "script": _full_script(_scenes(5, 9)),
+        }
+
+    llm = FakeLLM(replies)
+    out = review_script(llm, _draft(), settings)
+
+    assert out.score == 85 and out.review == [] and out.blocking == []
+    assert lo <= word_count(out.narration) <= hi
+    assert len(llm.calls) == 2  # one bounded retry
+    # The retry received targeted feedback about the unresolved blocking issues.
+    assert "unresolved blocking issues" in llm.calls[1]["user"]
+    assert "cannot be verified" in llm.calls[1]["user"]
+
+
+def test_rewrite_keeps_blocking_issues_produces_clear_blocking_error():
+    """Every rewrite stays in range and high-scored but keeps blocking issues:
+    bounded retries then raise a clear blocking-issues error, preserving the draft."""
+    settings = Settings(target_seconds=16, script_quality_threshold=70)
+
+    def replies(user):
+        return {
+            "score": 80, "issues": ["unverified claim"],
+            "blocking_issues": [
+                "The claim that the brine has been trapped for two million years "
+                "cannot be verified.",
+                "Describing the flow as 'bleeding' contradicts the scientific "
+                "explanation of iron-rich brine.",
+            ],
+            "script": _full_script(_scenes(5, 9)),
+        }
+
+    llm = FakeLLM(replies)
+    with pytest.raises(
+        ScriptQualityError,
+        match="unresolved blocking factual/safety/usability issues",
+    ):
+        review_script(llm, _draft(), settings)
+    assert len(llm.calls) == 2  # bounded, no endless retrying
