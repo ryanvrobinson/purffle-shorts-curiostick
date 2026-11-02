@@ -390,7 +390,8 @@ def write_script(llm, subject: str, settings: Settings, *, source: str = "niche"
 # --------------------------------------------------------------------------------------------------
 # Script Doctor — a second pass that scores the draft for retention and fixes what is weak.
 # --------------------------------------------------------------------------------------------------
-def review_prompt(script: Script, settings: Settings, rewrite: bool) -> tuple[str, str]:
+def review_prompt(script: Script, settings: Settings, rewrite: bool,
+                  feedback: list[str] | None = None) -> tuple[str, str]:
     words, n_scenes = scene_plan(script.style, settings.target_seconds)
     lang = LANGUAGES.get(script.language, script.language)
     lo, hi = int(0.75 * words), int(1.3 * words)
@@ -408,9 +409,22 @@ def review_prompt(script: Script, settings: Settings, rewrite: bool) -> tuple[st
 Format rules to keep:
 {_format_rules(script.style)}""" if rewrite else
             'Return only "score" and "issues".')
-    user = f"""Review this YouTube Short script ({STYLES[script.style]}).
+    parts = [
+        f"""Review this YouTube Short script ({STYLES[script.style]}).
 
-{json.dumps(draft, ensure_ascii=False, indent=1)}
+{json.dumps(draft, ensure_ascii=False, indent=1)}""",
+    ]
+    findings = []
+    if script.score is not None:
+        findings.append(f"previous Script Doctor score: {script.score}/100")
+    if script.review:
+        findings.append(f"previous issues: {'; '.join(script.review)}")
+    if findings:
+        parts.append("Previous Script Doctor findings on this draft:\n- " + "\n- ".join(findings))
+    if feedback:
+        parts.append("Previous attempt feedback:\n- " + "\n- ".join(feedback))
+    parts.append(
+        f"""
 
 Score it 0-100 for how well it will hold viewers to the end: hook strength in the first 2 seconds (most
 important), curiosity gaps, pacing, specificity, payoff, and accuracy risk. Be strict: 85+ is rare.
@@ -420,6 +434,8 @@ Put any problem that could make the video false, unsafe, self-contradictory or u
 a claim that contradicts another scene, or a missing payoff). Put pacing/style notes in "advisory_issues".
 Every issue must also appear in "issues"; if there are no blocking issues, return an empty list.
 {task}"""
+    )
+    user = "\n\n".join(parts)
     return system, user
 
 
@@ -440,8 +456,9 @@ def review_script(llm, script: Script, settings: Settings) -> Script:
     threshold = settings.script_quality_threshold
     current = script
     attempts = 2 if rewrite else 1
+    feedback: list[str] = []
     for attempt in range(attempts):
-        system, user = review_prompt(current, settings, rewrite)
+        system, user = review_prompt(current, settings, rewrite, feedback=feedback)
         try:
             data = llm.complete_json(system, user, REVIEW_SCHEMA if rewrite else SCORE_SCHEMA, max_tokens=5000)
         except Exception as e:
@@ -487,11 +504,23 @@ def review_script(llm, script: Script, settings: Settings) -> Script:
                 target = scene_plan(current.style, settings.target_seconds)[0]
                 n = word_count(better.narration, current.language)
                 previous_score = current.score
-                if 0.75 * target <= n <= 1.3 * target and (
-                    score is None or previous_score is None or score >= previous_score
-                ):
+                in_range = 0.75 * target <= n <= 1.3 * target
+                score_gain = score is None or previous_score is None or score >= previous_score
+                if in_range and score_gain:
                     result = better
                 else:
+                    if not in_range:
+                        feedback.append(
+                            f"The last rewrite had {n} words; the target is between "
+                            f"{int(0.75 * target)} and {int(1.3 * target)} words (target {target}). "
+                            "Expand it while preserving every fact, the scene order, and the "
+                            "hook-to-payoff progression — do not cut content to hit a shorter count."
+                        )
+                    elif previous_score is not None and score is not None and score < previous_score:
+                        feedback.append(
+                            f"The last rewrite scored {score}, below the current draft's "
+                            f"{previous_score}. Keep what works and only fix the listed issues."
+                        )
                     log.warning(
                         "Script Doctor rewrite ignored: %d words for a %d-word target or no score gain",
                         n,

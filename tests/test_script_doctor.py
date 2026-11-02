@@ -14,6 +14,8 @@ from purffle_shorts.script import (
     scene_plan,
     script_from_data,
     translate_script,
+    word_count,
+    write_script,
 )
 
 
@@ -289,3 +291,81 @@ def test_offline_reddit_story():
     s = offline_script("", Settings(), "reddit")
     assert s.style == "reddit" and s.cast == ["r/confessions", "u/quiet_otter22"]
     assert s.scenes[0].narration.startswith("Am I wrong") and len(s.scenes) == 8
+
+
+# ------------------------------------------------------------------ regression: the Slot 3 failure
+# Reported: original 109 words, rewrites 66 and 78 words against a 117-word target,
+# final score 58 below the 70-point threshold after 2 bounded reviews.
+# With TARGET_SECONDS=45 the target is 117 words and the permitted window is 87..152.
+
+
+def _curio_stick_draft() -> Script:
+    """~110-word facts draft for a 45-second target (117-word target, 87..152 window)."""
+    return normalize(_full_script(_scenes(5, 22)), "cats", "facts", "en")
+
+
+def test_length_rule_is_a_permitted_range_not_an_exact_count():
+    """The length target is a centre with a +/-30% permitted window:
+    ~109 words is acceptable for a 117-word target; 66 and 78 are below the 87-word floor."""
+    settings = Settings(target_seconds=45)  # 45s * 2.6 words/s = 117-word target
+    target = scene_plan("facts", 45)[0]
+    assert target == 117
+    lo, hi = int(0.75 * target), int(1.3 * target)  # 87 .. 152
+    assert lo == 87 and hi == 152
+    original = _curio_stick_draft()
+    assert lo <= word_count(original.narration) <= hi  # ~110 words: accepted for review
+    assert word_count(normalize(_full_script(_scenes(3, 22)), "x", "facts", "en").narration) == 66 < lo
+    assert word_count(normalize(_full_script(_scenes(3, 26)), "x", "facts", "en").narration) == 78 < lo
+
+
+def test_undersized_rewrites_rejected_then_targeted_expansion_recovers():
+    """66- and 78-word rewrites are rejected; a targeted expansion after feedback
+    lands in range with a higher score and is accepted. The original draft is not destroyed."""
+    settings = Settings(target_seconds=45, script_quality_threshold=70)
+    target = scene_plan("facts", 45)[0]  # 117
+    lo, hi = int(0.75 * target), int(1.3 * target)  # 87 .. 152
+
+    def replies(user):
+        if len(llm.calls) == 1:
+            # First rewrite: undersized (66 words) -> must be ignored, feedback recorded.
+            assert f"between {lo} and {hi} words" in user
+            return {
+                "score": 58, "issues": ["thin hook"],
+                "script": _full_script(_scenes(3, 22)),  # 66 words, below the 87-word floor
+            }
+        # Second attempt receives the targeted-expansion feedback.
+        assert "The last rewrite had 66 words" in user
+        assert "Expand it while preserving every fact" in user
+        return {
+            "score": 72, "issues": [],
+            "script": _full_script(_scenes(5, 24)),  # 120 words, in range, higher score
+        }
+
+    llm = FakeLLM(replies)
+    out = review_script(llm, _curio_stick_draft(), settings)
+
+    assert out.score == 72 and out.review == []
+    # The accepted rewrite meets the configured length requirement (120 in 87..152).
+    assert lo <= word_count(out.narration) <= hi
+    # Only the accepted rewrite replaced the draft; undersized rewrites never did.
+    assert len(llm.calls) == 2  # API calls bounded to one retry
+
+
+def test_both_rewrites_undersized_produces_clear_error_and_bounds_calls():
+    """Retry exhaustion: every rewrite undersized -> ScriptQualityError with the
+    correct reason, exactly two bounded API calls."""
+    settings = Settings(target_seconds=45, script_quality_threshold=70)
+
+    def replies(user):
+        return {
+            "score": 50, "issues": ["thin"],
+            "script": _full_script(_scenes(3, 22)),  # 66 words, always below the floor
+        }
+
+    llm = FakeLLM(replies)
+    with pytest.raises(
+        ScriptQualityError,
+        match="below the 70-point threshold after 2 bounded review",
+    ):
+        review_script(llm, _curio_stick_draft(), settings)
+    assert len(llm.calls) == 2  # bounded, no endless retrying
