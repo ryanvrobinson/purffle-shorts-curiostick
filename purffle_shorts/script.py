@@ -13,6 +13,7 @@ import random
 import re
 from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
+from typing import Any
 
 from .config import Settings
 from .utils import clean_narration, strip_emoji, truncate_words
@@ -78,12 +79,16 @@ SCRIPT_SCHEMA = {
         "topic": {"type": "string"},
         "title": {"type": "string"},
         "hook_text": {"type": "string"},
+        "angle": {"type": "string"},
+        "hooks": {"type": "array", "items": {"type": "string"}},
+        "selected_hook": {"type": "string"},
         "cast": {"type": "array", "items": {"type": "string"}},
         "scenes": {"type": "array", "items": SCENE_SCHEMA},
         "description": {"type": "string"},
         "hashtags": {"type": "array", "items": {"type": "string"}},
         "tags": {"type": "array", "items": {"type": "string"}},
         "category": {"type": "string", "enum": list(CATEGORIES)},
+        "sources": {"type": "array", "items": {"type": "string"}},
     },
     "required": ["topic", "title", "hook_text", "cast", "scenes", "description", "hashtags", "tags", "category"],
     "additionalProperties": False,
@@ -144,6 +149,10 @@ class Script:
     score: int | None = None           # Script Doctor retention score (0-100)
     review: list[str] = field(default_factory=list)  # everything the Script Doctor found
     blocking: list[str] = field(default_factory=list)  # factual/safety problems that must stop a render
+    angle: str = ""                    # the specific, defensible angle chosen for this topic
+    hooks: list[str] = field(default_factory=list)  # three alternative hooks the writer considered
+    selected_hook: str = ""            # the hook that made it into the final script
+    sources: list[str] = field(default_factory=list)  # source references when research material was supplied
     verification_report: dict | None = None  # claim-based fact verification report (Phase 2)
 
     @property
@@ -229,10 +238,16 @@ def build_prompt(subject: str, style: str, settings: Settings, avoid: list[str],
         avoid_block = "Do NOT repeat any of these recent videos:\n" + "\n".join(f"- {a}" for a in avoid[:40]) + "\n\n"
     ctx = f"Background information (use it, don't invent beyond it):\n{context.strip()}\n\n" if context else ""
     ins = f"{insights.strip()}\n\n" if insights else ""
+    src_rule = (
+        "- Ground claims in the Background information above; list the source references you relied on\n"
+        "  in \"sources\". Do not invent sources or factual claims. If reliable material is unavailable,\n"
+        "  mark the claims that need verification instead of presenting them as verified.\n\n"
+    ) if context else ""
     user = f"""Write one YouTube Short.
 
 Subject: {subject}
-If the subject is broad, choose ONE specific, surprising, lesser-known topic inside it.
+If the subject is broad, choose ONE specific, surprising, lesser-known topic inside it and name it in
+"angle" — the one defensible take this video will argue or show.
 Format: {STYLES[style]}
 Audience: {settings.audience}
 Language: {lang} for narration, title, hook_text, cast and description. search_query and image_prompt are ALWAYS English.
@@ -243,17 +258,19 @@ Language: {lang} for narration, title, hook_text, cast and description. search_q
 - Make the opening specific immediately: name the subject and its concrete consequence, or ask a precise question the video will answer. Avoid vague phrases such as "a cosmic transformation."
 - Keep the hook scientifically accurate. Frame hypothetical scenarios as hypotheticals, and do not imply an outcome is certain when it is not.
 - Every line earns its place: concrete details, numbers, names. Only well-established facts; no made-up statistics.
-- The last scene lands the payoff, then a short call to action (max 8 words), e.g. asking viewers to comment or follow.
-- Narration is spoken by a voice: no emojis, hashtags, labels, brackets or stage directions.
+- Propose THREE substantially different hooks in "hooks" (different angles, under 10 words each), then set "selected_hook" to the strongest one — the one Scene 1's narration delivers on.
+- Build one compelling narrative: introduce information progressively, one idea per scene, so curiosity builds scene by scene. Create curiosity without misleading viewers — every hook claim must be paid off honestly by the end.
+- The last scene lands a satisfying payoff, then a short call to action (max 8 words), e.g. asking viewers to comment or follow.
+- Narration is natural spoken text by a voice: no emojis, hashtags, labels, brackets or stage directions.
 - search_query: 1-4 English words describing concrete, filmable stock footage for that scene (e.g. "octopus underwater", "old library books"). No abstract words.
 - image_prompt: one vivid English sentence for an AI image of that scene, no text or letters in the image.
+- visual_description: what should be shown in this scene, one sentence.
 - title: max 60 characters, curiosity-driven but honest, no hashtags, no quotes.
 - hook_text: max 6 words shown on screen during the first seconds.
 - description: 2-3 sentences plus one question that invites comments. No hashtags.
 - hashtags: 3-5 relevant hashtags. tags: 8-15 search keywords.
 - category: one of {", ".join(CATEGORIES)}.
-
-Return JSON with keys: topic, title, hook_text, cast, scenes (array of {{speaker, narration, search_query, image_prompt}}), description, hashtags, tags, category."""
+{src_rule}Return JSON with keys: topic, title, hook_text, angle, hooks (exactly three strings), selected_hook, cast, scenes (array of {{speaker, narration, search_query, image_prompt, visual_description}}), description, hashtags, tags, category, sources (when background information was supplied)."""
     return system, user
 
 
@@ -363,6 +380,10 @@ def normalize(data: dict, subject: str, style: str, language: str) -> Script:
         score=int(score) if isinstance(score, (int, float)) else None,
         review=[str(x) for x in data.get("review") or []][:8],
         blocking=[str(x) for x in data.get("blocking") or data.get("blocking_issues") or []][:5],
+        angle=str(data.get("angle") or "").strip(),
+        hooks=[str(h).strip() for h in (data.get("hooks") or []) if str(h).strip()][:3],
+        selected_hook=str(data.get("selected_hook") or "").strip(),
+        sources=[str(s).strip() for s in (data.get("sources") or []) if str(s).strip()],
         verification_report=data.get("verification_report"),
     )
 
@@ -443,49 +464,169 @@ class ScriptQualityError(RuntimeError):
     """The bounded Script Doctor rewrite did not meet the configured minimum score."""
 
 
-def review_script(llm, script: Script, settings: Settings) -> Script:
-    """Score the script and (in rewrite mode) replace it with the improved version.
+# --------------------------------------------------------------------------------------
+# Script Doctor 2.0 — deterministic gates + a 100-point rubric + bounded targeted rewrites.
+# --------------------------------------------------------------------------------------
 
-    A failed first review keeps the draft; a rewrite-mode score that stays below the threshold after the
-    bounded retry raises ScriptQualityError so the draft is not silently rendered as acceptable.
+DOCTOR_TARGET_SCORE = 90          # acceptance target: a script must score 90/100 to be rendered
+DOCTOR_MAX_REWRITES = 3           # at most three targeted rewrite attempts per draft
+
+RUBRIC: tuple[tuple[str, int, str], ...] = (
+    ("hook_strength", 20, "hook strength in the first two seconds — specific, scroll-stopping, honest"),
+    ("storytelling_curiosity", 20, "storytelling and curiosity gaps — information revealed progressively"),
+    ("retention_pacing", 20, "retention and pacing — no filler; every line earns its place"),
+    ("factual_accuracy", 15, "factual accuracy and evidence — only well-established claims"),
+    ("originality", 10, "originality — a specific angle, not a generic treatment"),
+    ("narration_quality", 10, "narration quality — natural, voice-friendly spoken text"),
+    ("ending_payoff", 5, "ending and payoff — a satisfying close, not an abrupt stop"),
+)
+
+
+def doctor_structural_issues(script: Script, settings: Settings) -> list[str]:
+    """Deterministic checks that need no LLM. Any one of them blocks the script.
+
+    Covers: missing or empty narration, invalid story structure, missing title/hook,
+    excessive repetition. Factual accuracy, misleading hooks and payoff quality can
+    only be judged semantically, so they belong to the rubric review (blocking_issues)
+    rather than here.
+    """
+    issues: list[str] = []
+    if not script.scenes:
+        return ["Invalid script structure: the script has no scenes."]
+    for i, scene in enumerate(script.scenes):
+        if not scene.narration or not scene.narration.strip():
+            issues.append(f"Scene {i + 1} has no narration.")
+    narration = (script.narration or "").strip()
+    if not narration:
+        issues.append("Missing or empty narration: every scene needs spoken text.")
+    if not script.title.strip():
+        issues.append("Missing title.")
+    if not script.hook_text.strip():
+        issues.append("Missing hook_text: the first seconds need an on-screen hook.")
+    seen: set[str] = set()
+    for scene in script.scenes:
+        line = clean_narration(scene.narration).strip().lower()
+        if line:
+            if line in seen:
+                issues.append("Excessive repetition: identical narration appears in more than one scene.")
+                break
+            seen.add(line)
+    return issues
+
+
+def doctor_schema(include_script: bool) -> dict:
+    props: dict[str, Any] = {
+        "score": {"type": "integer", "minimum": 0, "maximum": 100},
+        "breakdown": {
+            "type": "object",
+            "properties": {name: {"type": "integer", "minimum": 0, "maximum": pts}
+                           for name, pts, _ in RUBRIC},
+            "required": [name for name, _, _ in RUBRIC],
+        },
+        "issues": {"type": "array", "items": {"type": "string"}},
+        "blocking_issues": {"type": "array", "items": {"type": "string"}},
+        "advisory_issues": {"type": "array", "items": {"type": "string"}},
+    }
+    required = ["score", "issues"]
+    if include_script:
+        props["script"] = SCRIPT_SCHEMA
+        required.append("script")
+    return {"type": "object", "properties": props, "required": required, "additionalProperties": False}
+
+
+def doctor_prompt(script: Script, settings: Settings, rewrite: bool,
+                  feedback: list[str] | None = None) -> tuple[str, str]:
+    words, n_scenes = scene_plan(script.style, settings.target_seconds)
+    lang = LANGUAGES.get(script.language, script.language)
+    lo, hi = int(0.75 * words), int(1.3 * words)
+    draft = {k: v for k, v in script.to_dict().items()
+             if k not in ("style", "language", "score", "review", "blocking")}
+    rubric = "\n".join(f"  - {name}: 0-{points} — {what}."
+                       for name, points, what in RUBRIC)
+    system = ("You are a ruthless YouTube Shorts retention editor. Viewers decide in 1-2 seconds and "
+              "swipe away at any slow moment. Score honestly against the rubric: a high score never "
+              "excuses a blocking flaw. Reply with a single JSON object and nothing else.")
+    task = (
+        f"Then rewrite it into the strongest version you can. Keep the same subject, format, "
+        f"language ({lang}), the same JSON structure and between {lo} and {hi} words (target {words}) "
+        f"in {n_scenes} scenes. Do not pad or cut scenes to hit the count; keep the same information "
+        "density. Preserve scene order and a coherent progression from hook to payoff. Make the "
+        "opening a specific, scientifically defensible question or consequence. Fix every issue you "
+        "list: sharpen the hook, cut filler, make vague lines concrete, remove any claim that may not "
+        "be true, keep the payoff for the end, and end with a short call to action (max 8 words). Do "
+        "not invent facts, statistics, studies, or certainty. Put the rewritten script in \"script\".\n"
+        "Format rules to keep:\n" + _format_rules(script.style)
+    ) if rewrite else 'Return only "score", "breakdown", "issues" and "blocking_issues".'
+    parts = [
+        f"""Review this YouTube Short script ({STYLES[script.style]}).
+
+{json.dumps(draft, ensure_ascii=False, indent=1)}""",
+    ]
+    findings = []
+    if script.score is not None:
+        findings.append(f"previous Script Doctor score: {script.score}/100")
+    if script.review:
+        findings.append(f"previous issues: {'; '.join(script.review)}")
+    if findings:
+        parts.append("Previous Script Doctor findings on this draft:\n- " + "\n- ".join(findings))
+    if feedback:
+        parts.append("Previous attempt feedback:\n- " + "\n- ".join(feedback))
+    parts.append(
+        f"""\nScore it 0-100 and break the score down:{rubric}
+Target acceptance is {DOCTOR_TARGET_SCORE}/100; be strict.
+
+List concrete problems in "issues" (max 5, short sentences, most important first).
+Put any problem that could make the video false, unsafe, self-contradictory or unusable in
+"blocking_issues" — for example: missing or empty narration; unsupported factual claims presented
+as established facts; a misleading hook; broken story structure; excessive repetition; a missing
+promised payoff; invalid script structure. Blocking issues always reject the script, whatever its
+score. Put pacing/style notes in "advisory_issues". Every blocking issue must also appear in
+"issues"; if there are no blocking issues, return an empty list.
+
+Remember: an AI-generated score is not proof of factual accuracy. When the supplied material does
+not support a claim, flag it instead of scoring it as verified.
+{task}"""
+    )
+    return system, "\n\n".join(parts)
+
+
+def review_script(llm, script: Script, settings: Settings) -> Script:
+    """Score the script and (in rewrite mode) replace it with an improved version.
+
+    Each round scores the current draft against the 100-point Script Doctor 2.0 rubric and,
+    in rewrite mode, asks for a targeted rewrite. A rewrite is adopted only when it has valid
+    narration and structure, lands in the configured word window, does not lose quality, and
+    resolves the blocking issues. Invalid rewrites are discarded and the current draft is kept.
+    At most DOCTOR_MAX_REWRITES rewrite rounds happen; if the draft still fails, production
+    stops with a clear ScriptQualityError and the last valid draft is never replaced by an
+    invalid one.
     """
     mode = settings.script_review
     if llm is None or mode == "off":
         return script
     rewrite = mode == "rewrite"
     threshold = settings.script_quality_threshold
+    attempts = DOCTOR_MAX_REWRITES if rewrite else 1
     current = script
-    attempts = 2 if rewrite else 1
     feedback: list[str] = []
     for attempt in range(attempts):
         system, user = review_prompt(current, settings, rewrite, feedback=feedback)
         try:
-            data = llm.complete_json(system, user, REVIEW_SCHEMA if rewrite else SCORE_SCHEMA, max_tokens=5000)
+            data = llm.complete_json(system, user, doctor_schema(include_script=rewrite),
+                                     max_tokens=5000)
         except Exception as e:
             log.warning("Script Doctor attempt %d/%d skipped: %s", attempt + 1, attempts, e)
             if current.blocking:
                 raise ScriptQualityError(
                     "Script Doctor found blocking factual/safety problems and could not verify a fix: "
-                    + "; ".join(current.blocking)
-                ) from e
-            if rewrite and current.score is not None and current.score < threshold:
-                raise ScriptQualityError(
-                    f"Script Doctor could not complete its bounded retry; score {current.score} remains below "
-                    f"the {threshold}-point threshold, so rendering was stopped."
-                ) from e
+                    + "; ".join(current.blocking)) from e
             return current
         if not isinstance(data, dict):
             log.warning("Script Doctor returned an unusable response; keeping the current script")
             if current.blocking:
                 raise ScriptQualityError(
-                    "Script Doctor found blocking factual/safety problems and returned no usable verification: "
-                    + "; ".join(current.blocking)
-                )
-            if rewrite and current.score is not None and current.score < threshold:
-                raise ScriptQualityError(
-                    f"Script Doctor returned no usable retry; score {current.score} remains below the "
-                    f"{threshold}-point threshold, so rendering was stopped."
-                )
+                    "Script Doctor found blocking factual/safety problems and returned no usable "
+                    "verification: " + "; ".join(current.blocking))
             return current
         try:
             score = max(0, min(100, int(data.get("score"))))
@@ -497,14 +638,17 @@ def review_script(llm, script: Script, settings: Settings) -> Script:
             for i in (data.get("blocking_issues") or data.get("blocking") or [])
             if str(i).strip()
         ][:5]
+        structural = doctor_structural_issues(current, settings)
+        combined_blocking = list(dict.fromkeys(structural + blocking_issues))
+
         result = current
         if rewrite and isinstance(data.get("script"), dict):
             try:
                 better = normalize(data["script"], current.topic, current.style, current.language)
             except ValueError as e:
                 # The rewrite dropped required narration (or is otherwise un-normalizable):
-                # record targeted feedback so the bounded retry restores it, and keep
-                # the current draft untouched.
+                # record targeted feedback so the next round restores it, and keep the
+                # current draft untouched.
                 feedback.append(
                     "The last rewrite had no usable narration; every scene needs narration "
                     "so the video can be voiced. Keep all scenes and their narration intact, "
@@ -517,11 +661,9 @@ def review_script(llm, script: Script, settings: Settings) -> Script:
                 previous_score = current.score
                 in_range = 0.75 * target <= n <= 1.3 * target
                 score_gain = score is None or previous_score is None or score >= previous_score
-                # A rewrite is adopted only when it has valid narration (guaranteed by
-                # normalize succeeding), lands in the configured word window, does not lose
-                # quality, and resolves the blocking factual/safety/usability issues.
+                candidate_structural = doctor_structural_issues(better, settings)
                 blocking_resolved = not blocking_issues
-                if in_range and score_gain and blocking_resolved:
+                if in_range and score_gain and blocking_resolved and not candidate_structural:
                     result = better
                 else:
                     if not in_range:
@@ -542,39 +684,46 @@ def review_script(llm, script: Script, settings: Settings) -> Script:
                             + "; ".join(blocking_issues)
                             + ". Fix those issues before resubmitting."
                         )
+                    elif candidate_structural:
+                        feedback.append(
+                            "The last rewrite failed the structure check: "
+                            + "; ".join(candidate_structural)
+                        )
                     log.warning(
                         "Script Doctor rewrite ignored: %d words for a %d-word target or unresolved issues",
                         n,
                         target,
                     )
+
         score = score if score is not None else current.score
         result.score, result.review = score, issues
-        result.blocking = blocking_issues
+        result.blocking = combined_blocking
 
-        if blocking_issues:
-            if rewrite and attempt == 0:
+        if combined_blocking:
+            if rewrite and attempt + 1 < attempts:
                 log.warning(
-                    "Script Doctor found blocking issues; requesting one bounded rewrite/review attempt: %s",
-                    "; ".join(blocking_issues),
+                    "Script Doctor found blocking issues; requesting another bounded rewrite: %s",
+                    "; ".join(combined_blocking),
                 )
-                current = result
-                continue
-            raise ScriptQualityError(
-                "Script Doctor found unresolved blocking factual/safety/usability issues: "
-                + "; ".join(blocking_issues)
-            )
-
-        if score is not None and score < threshold:
-            if rewrite and attempt == 0:
-                log.warning("Script Doctor score %d is below the %d-point threshold; requesting one more "
-                            "bounded review/rewrite attempt", score, threshold)
                 current = result
                 continue
             if rewrite:
                 raise ScriptQualityError(
-                    f"Script Doctor score {score} remains below the {threshold}-point threshold after "
-                    f"{attempt + 1} bounded review(s); rendering was stopped."
-                )
+                    "Script Doctor found unresolved blocking factual/safety/usability issues: "
+                    + "; ".join(combined_blocking))
+            # Score-only mode reports but never stops production.
+            log.warning("Script Doctor blocking issues on the draft: %s", "; ".join(combined_blocking))
+
+        if score is not None and score < threshold:
+            if rewrite and attempt + 1 < attempts:
+                log.warning("Script Doctor score %d is below the %d-point threshold; requesting "
+                            "another bounded rewrite", score, threshold)
+                current = result
+                continue
+            if rewrite:
+                raise ScriptQualityError(
+                    f"Script Doctor score {score} remains below the {threshold}-point threshold "
+                    f"after {attempts} bounded rewrite(s); rendering was stopped.")
             log.warning("Script Doctor score %d is below the %d-point threshold", score, threshold)
         changed = "rewritten" if result is not current else "kept"
         log.info("Script Doctor: %s/100, %s%s", score if score is not None else "?", changed,

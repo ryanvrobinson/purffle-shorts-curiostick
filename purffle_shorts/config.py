@@ -141,8 +141,9 @@ class Settings:
     llm_fallbacks: list[str] = field(default_factory=list)
     llm_temperature: float = 0.9
     anthropic_effort: str = ""        # low|medium|high|xhigh|max (blank = API default)
+    gemini_api_key: str = ""          # GEMINI_API_KEY (or GOOGLE_API_KEY) — never logged
     script_review: str = "rewrite"    # off|score|rewrite — the Script Doctor's second pass
-    script_quality_threshold: int = 70
+    script_quality_threshold: int = 90   # Script Doctor 2.0 acceptance target (0-100)
     learn_from_stats: bool = False    # show the LLM which of your videos got the most / fewest views
     research_verify: bool = False     # claim-based fact verification; off by default (Phase 2)
     verify_provider: str = ""         # provider used to verify claims; empty = no verification
@@ -324,12 +325,13 @@ class Settings:
             rss_feeds=_list(_env("RSS_FEEDS")),
             also_languages=[v.lower() for v in _list(_env("ALSO_LANGUAGES"))],
             llm_provider=_env("LLM_PROVIDER", d.llm_provider).lower(),
-            llm_model=_env("LLM_MODEL"),
+            llm_model=_env("LLM_MODEL", "GEMINI_MODEL"),
             llm_base_url=_env("LLM_BASE_URL"),
             llm_api_key=_env("LLM_API_KEY"),
             llm_fallbacks=[p.lower() for p in _list(_env("LLM_FALLBACKS"))],
             llm_temperature=_float("LLM_TEMPERATURE", d.llm_temperature),
             anthropic_effort=_env("ANTHROPIC_EFFORT").lower(),
+            gemini_api_key=_env("GEMINI_API_KEY", "", "GOOGLE_API_KEY"),
             script_review=_env("SCRIPT_REVIEW", d.script_review).lower(),
             script_quality_threshold=_int("SCRIPT_QUALITY_THRESHOLD", d.script_quality_threshold),
             learn_from_stats=_bool(_env("LEARN_FROM_STATS", "false")),

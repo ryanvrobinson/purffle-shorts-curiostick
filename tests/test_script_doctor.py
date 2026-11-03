@@ -33,7 +33,8 @@ class FakeLLM:
 
 
 def _scenes(n, words=8, speakers="A"):
-    return [{"speaker": speakers[i % len(speakers)], "narration": " ".join(["word"] * words) + ".",
+    return [{"speaker": speakers[i % len(speakers)],
+             "narration": f"s{i} " + " ".join(["word"] * (words - 1)) + ".",
              "search_query": f"q{i}", "image_prompt": f"p{i}"} for i in range(n)]
 
 
@@ -118,18 +119,19 @@ def test_doctor_rewrite_with_wrong_length_is_ignored():
     llm = FakeLLM({"score": 40, "issues": ["too long"], "script": {"title": "Bloated", "scenes": _scenes(30, 20)}})
     with pytest.raises(ScriptQualityError, match="rendering was stopped"):
         review_script(llm, _draft(), Settings(target_seconds=16))
-    assert len(llm.calls) == 2
+    assert len(llm.calls) == 3
 
 
 def test_doctor_stops_after_bounded_attempts_if_score_stays_low():
     replies = iter([
         {"score": 45, "issues": ["The hook is vague"], "script": None},
         {"score": 68, "issues": ["The opening still lacks a concrete consequence"], "script": None},
+        {"score": 55, "issues": ["Still vague"], "script": None},
     ])
     llm = FakeLLM(lambda user: next(replies))
-    with pytest.raises(ScriptQualityError, match="68.*70.*2 bounded review"):
+    with pytest.raises(ScriptQualityError, match="55.*70.*3 bounded rewrite"):
         review_script(llm, _draft(), Settings(script_quality_threshold=70))
-    assert len(llm.calls) == 2
+    assert len(llm.calls) == 3
 
 
 def test_final_low_score_stops_make_before_rendering(tmp_path, monkeypatch):
@@ -141,9 +143,9 @@ def test_final_low_score_stops_make_before_rendering(tmp_path, monkeypatch):
         "title": "A neutron star question",
         "hook_text": "WHAT HAPPENS?",
         "scenes": [
-            {"narration": "Neutron stars are compact remnants formed after some massive stars collapse.",
+            {"narration": f"Neutron stars are compact remnants formed after some massive stars collapse. Observation {i}.",
              "search_query": "neutron star", "image_prompt": "neutron star in space"}
-            for _ in range(5)
+            for i in range(5)
         ],
         "description": "A science explanation.",
         "hashtags": [],
@@ -172,8 +174,8 @@ def test_final_low_score_stops_make_before_rendering(tmp_path, monkeypatch):
 
     result = studio.make(topic="neutron stars", upload=False)
 
-    assert not result.ok and "below the 70-point threshold" in result.error
-    assert llm.reviews == 2
+    assert not result.ok and "below the 90-point threshold" in result.error
+    assert llm.reviews == 3
 
 
 def test_low_score_gets_one_bounded_second_review():
@@ -226,7 +228,7 @@ def test_in_bounds_rewrite_without_score_gain_is_not_adopted():
     llm = FakeLLM(replies)
     with pytest.raises(ScriptQualityError, match="rendering was stopped"):
         review_script(llm, _draft(), Settings(target_seconds=16, script_quality_threshold=70))
-    assert len(llm.calls) == 2  # bounded retry happened, lower-score rewrite not adopted
+    assert len(llm.calls) == 3  # bounded retries happened, lower-score rewrite not adopted
 
 
 def test_doctor_failure_never_fails_the_video():
@@ -295,7 +297,7 @@ def test_offline_reddit_story():
 
 # ------------------------------------------------------------------ regression: the Slot 3 failure
 # Reported: original 109 words, rewrites 66 and 78 words against a 117-word target,
-# final score 58 below the 70-point threshold after 2 bounded reviews.
+# final score 58 below the 90-point target after up to 3 bounded rewrite attempts.
 # With TARGET_SECONDS=45 the target is 117 words and the permitted window is 87..152.
 
 
@@ -365,10 +367,10 @@ def test_both_rewrites_undersized_produces_clear_error_and_bounds_calls():
     llm = FakeLLM(replies)
     with pytest.raises(
         ScriptQualityError,
-        match="below the 70-point threshold after 2 bounded review",
+        match="below the 70-point threshold after 3 bounded rewrite",
     ):
         review_script(llm, _curio_stick_draft(), settings)
-    assert len(llm.calls) == 2  # bounded, no endless retrying
+    assert len(llm.calls) == 3  # bounded, no endless retrying
 
 
 def test_rewrite_without_narration_is_ignored_then_retry_restores_narration():
@@ -469,4 +471,4 @@ def test_rewrite_keeps_blocking_issues_produces_clear_blocking_error():
         match="unresolved blocking factual/safety/usability issues",
     ):
         review_script(llm, _draft(), settings)
-    assert len(llm.calls) == 2  # bounded, no endless retrying
+    assert len(llm.calls) == 3  # bounded, no endless retrying

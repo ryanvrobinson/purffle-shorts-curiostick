@@ -1,4 +1,5 @@
-"""Pluggable LLMs: any OpenAI-compatible endpoint plus native Anthropic Claude, with a fallback chain.
+"""Pluggable LLMs: any OpenAI-compatible endpoint, native Anthropic Claude and native Google Gemini,
+with a fallback chain.
 
 Pick one with LLM_PROVIDER (or --provider) and LLM_MODEL (or --model). With LLM_PROVIDER=auto the
 first provider whose API key is present is used. LLM_FALLBACKS=anthropic,gemini adds backups that
@@ -18,7 +19,7 @@ from typing import Any
 import requests
 
 from .config import Settings
-from .utils import PermanentError, http, raise_for_status, with_retries
+from .utils import PermanentError, http, raise_for_status, redact, with_retries
 
 log = logging.getLogger("purffle")
 _LLM_REQUEST_TIMEOUT = (10, 120)
@@ -55,8 +56,8 @@ PRESETS: dict[str, Preset] = {p.name: p for p in [
     Preset("openai", "OpenAI (GPT)", "https://api.openai.com/v1", ("OPENAI_API_KEY",), "gpt-4o-mini"),
     Preset("anthropic", "Anthropic (Claude)", "", ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"),
            "claude-opus-5", kind="anthropic"),
-    Preset("gemini", "Google Gemini", "https://generativelanguage.googleapis.com/v1beta/openai",
-           ("GEMINI_API_KEY", "GOOGLE_API_KEY"), "gemini-2.5-flash"),
+    Preset("gemini", "Google Gemini", "", ("GEMINI_API_KEY", "GOOGLE_API_KEY"),
+           "gemini-2.5-flash", kind="gemini"),
     Preset("groq", "Groq (Llama, fast)", "https://api.groq.com/openai/v1", ("GROQ_API_KEY",),
            "llama-3.3-70b-versatile"),
     Preset("openrouter", "OpenRouter (hundreds of models)", "https://openrouter.ai/api/v1",
@@ -81,6 +82,13 @@ _CLAUDE_FALLBACK_MODELS = re.compile(r"^claude-(opus-5|fable-5)")
 def _key_for(preset: Preset, settings: Settings) -> str:
     if preset.name == "custom":
         return settings.llm_api_key
+    if preset.name == "gemini":
+        # GEMINI_API_KEY (GOOGLE_API_KEY as fallback) from the environment first, then the Settings field.
+        for env in preset.key_envs:
+            value = os.getenv(env)
+            if value:
+                return value
+        return settings.gemini_api_key
     for env in preset.key_envs:
         if os.getenv(env):
             return os.environ[env]
@@ -363,6 +371,89 @@ class AnthropicProvider(Provider):
         return text
 
 
+class GeminiProvider(Provider):
+    """Native Google Gemini via the officially supported google-genai SDK.
+
+    Reads GEMINI_API_KEY (GOOGLE_API_KEY as fallback) from the environment. The model is configured
+    through GEMINI_MODEL / LLM_MODEL and defaults to gemini-2.5-flash, a currently supported model
+    that supports native structured JSON output. Output tokens are capped for cost control, JSON mode
+    uses the SDK's response_mime_type/response_schema (not an OpenAI-compatible shim), and API
+    failures raise LLMError with a clear, key-free message. This provider never falls back to another
+    provider on its own and never logs or echoes credentials.
+    """
+
+    _MAX_OUTPUT_TOKENS = 8000
+    _REQUEST_TIMEOUT = 60
+
+    def __init__(self, model: str, api_key: str):
+        try:
+            from google import genai
+            from google.genai import types
+        except ImportError as e:
+            raise LLMConfigError(
+                "Gemini provider needs the google-genai SDK:  pip install google-genai"
+            ) from e
+        if not api_key:
+            raise LLMConfigError("Gemini: set GEMINI_API_KEY (or GOOGLE_API_KEY) in .env")
+        self.name, self.model = "gemini", model
+        self._genai = genai
+        self._types = types
+        # Construction is local: no API call happens here. The timeout bounds every request.
+        self.client = genai.Client(api_key=api_key,
+                                   http_options=types.HttpOptions(timeout=self._REQUEST_TIMEOUT))
+
+    def _classify_error(self, exc: Exception) -> tuple[bool, str]:
+        """Classify a Gemini SDK error into (permanent, key-free message)."""
+        code = getattr(exc, "code", None)
+        message = redact(str(exc))
+        if code == 429 or "rate limit" in message.lower() or "quota" in message.lower():
+            return False, f"rate limited or quota exhausted ({message})"
+        if code in (401, 403):
+            return True, f"authentication or permission failure ({message})"
+        if code == 400:
+            return True, f"request rejected ({message})"
+        if isinstance(exc, self._genai.errors.ServerError):
+            return False, f"Gemini API error ({message})"
+        return False, f"request failed ({message})"
+
+    def complete(self, system, user, *, schema=None, temperature=0.9, max_tokens=4000) -> str:
+        kwargs: dict[str, Any] = {
+            "system_instruction": system,
+            "temperature": temperature,
+            "max_output_tokens": min(max_tokens, self._MAX_OUTPUT_TOKENS),
+        }
+        if schema is not None:
+            kwargs["response_mime_type"] = "application/json"
+            kwargs["response_schema"] = schema
+        config = self._types.GenerateContentConfig(**kwargs)
+
+        def call() -> str:
+            try:
+                started = time.perf_counter()
+                resp = self.client.models.generate_content(
+                    model=self.model, contents=user, config=config,
+                )
+                elapsed = time.perf_counter() - started
+            except PermanentError:
+                raise
+            except Exception as exc:
+                permanent, message = self._classify_error(exc)
+                raised = PermanentError(message) if permanent else LLMError(message)
+                raise raised from exc
+            text = getattr(resp, "text", None) or ""
+            usage = getattr(resp, "usage_metadata", None)
+            if usage:
+                log.debug("%s finished in %.2fs (total tokens %s)",
+                          self, elapsed, getattr(usage, "total_token_count", None))
+            if not text.strip():
+                raise LLMError(f"{self}: empty reply")
+            return text
+
+        # One bounded retry covers transient failures (5xx, rate limits, timeouts).
+        # Auth failures and bad requests are PermanentError and are not retried.
+        return with_retries(call, attempts=2, label=f"LLM {self}")
+
+
 def build_provider(name: str, settings: Settings, model: str = "") -> Provider:
     preset = PRESETS[name]
     chosen = model
@@ -370,6 +461,8 @@ def build_provider(name: str, settings: Settings, model: str = "") -> Provider:
     key = _key_for(preset, settings)
     if preset.kind == "anthropic":
         return AnthropicProvider(model, key, settings.anthropic_effort)
+    if preset.kind == "gemini":
+        return GeminiProvider(model, key)
     base_url = preset.base_url
     if name == "custom":
         base_url = settings.llm_base_url
