@@ -64,7 +64,7 @@ SCENE_SCHEMA = {
         "narration": {"type": "string"},
         "search_query": {"type": "string"},
         "image_prompt": {"type": "string"},
-        "duration": {"type": ["number", "null"]},
+        "duration": {"type": "number"},
         "visual_description": {"type": "string"},
         "visual_source": {"type": "string"},
         "attribution": {"type": "string"},
