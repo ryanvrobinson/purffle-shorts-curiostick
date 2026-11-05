@@ -94,9 +94,15 @@ def build_agnes_prompt(
     The prompt specifies subject, environment, action, camera, lighting,
     textures, depth, composition and art direction — never just raw narration.
     """
-    # Subject/environment: prefer the explicit visual description, fall back to narration.
+    # Subject/environment: prefer the explicit visual description, then the topic
+    # (actual subject/location/geological feature), then fall back to narration.
     # Include narration context so the image matches the scene's story.
-    subject = (visual_description or narration[:300]).strip()
+    if visual_description:
+        subject = visual_description.strip()
+    elif topic:
+        subject = f"{topic}: {narration[:200]}".strip()
+    else:
+        subject = narration[:300].strip()
     narration_context = f" Scene narrative: {narration[:200]}." if narration and narration != subject else ""
 
     # Cinematic base style for visual identity coherence.

@@ -437,6 +437,29 @@ def test_build_agnes_prompt_rotates_camera_and_lighting():
     assert "close-up detail shot" in p2
 
 
+def test_build_agnes_prompt_includes_topic_subject():
+    """When no visual_description is given, the topic (actual subject/location)
+    must be included in the prompt so Agnes generates scene-specific imagery,
+    not a generic AI landscape."""
+    prompt = M.build_agnes_prompt(
+        narration="A rare mineral glows under ultraviolet light.",
+        topic="Hoodoo formations at Bryce Canyon",
+    )
+    assert "Hoodoo formations at Bryce Canyon" in prompt
+    assert "Scene narrative: A rare mineral glows" in prompt
+
+
+def test_build_agnes_prompt_visual_description_takes_precedence_over_topic():
+    """An explicit per-scene visual_description overrides the topic as subject."""
+    prompt = M.build_agnes_prompt(
+        narration="Some narration text.",
+        visual_description="close-up of glowing mineral crystals",
+        topic="Hoodoo formations at Bryce Canyon",
+    )
+    assert "close-up of glowing mineral crystals" in prompt
+    assert "Hoodoo formations at Bryce Canyon" not in prompt.split("Scene narrative")[0]
+
+
 # ------------------------------------------------------------------ Image QC tests
 def _write_test_png(dest, size=(512, 768), noise=True):
     """Write a PNG that passes QC (portrait, textured, not blank)."""
