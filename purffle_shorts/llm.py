@@ -371,6 +371,28 @@ class AnthropicProvider(Provider):
         return text
 
 
+def _sanitize_gemini_schema(value: Any) -> Any:
+    """Convert JSON Schema constructs unsupported by google-genai's Pydantic types.
+
+    google-genai expects each schema 'type' to be a string/enum. A JSON Schema union
+    such as ["number", "null"] reaches its enum converter as a list and crashes on
+    .upper() before any HTTP request is sent. Optional properties are already optional
+    unless listed in 'required', so retain the non-null type for these fields.
+    """
+    if isinstance(value, dict):
+        cleaned = {}
+        for key, item in value.items():
+            if key == "type" and isinstance(item, list):
+                non_null = [part for part in item if isinstance(part, str) and part.lower() != "null"]
+                cleaned[key] = non_null[0] if non_null else "string"
+            else:
+                cleaned[key] = _sanitize_gemini_schema(item)
+        return cleaned
+    if isinstance(value, list):
+        return [_sanitize_gemini_schema(item) for item in value]
+    return value
+
+
 class GeminiProvider(Provider):
     """Native Google Gemini via the officially supported google-genai SDK.
 
@@ -424,7 +446,7 @@ class GeminiProvider(Provider):
         }
         if schema is not None:
             kwargs["response_mime_type"] = "application/json"
-            kwargs["response_schema"] = schema
+            kwargs["response_schema"] = _sanitize_gemini_schema(schema)
         config = self._types.GenerateContentConfig(**kwargs)
 
         def call() -> str:
