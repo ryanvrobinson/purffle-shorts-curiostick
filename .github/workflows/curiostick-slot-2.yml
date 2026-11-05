@@ -112,14 +112,39 @@ jobs:
           git config user.name "github-actions[bot]"
           git add -f data/history.db
           git diff --cached --quiet && exit 0
-          git commit -m "chore: record CurioStick slot ${{ env.SLOT }} run (${{ github.run_id }})"
+          # Fetch remote first so other slots' history is absorbed before we commit, instead of after.
           git fetch origin main || { echo "error: git fetch failed; not pushing history" >&2; exit 1; }
-          # Remote main may have advanced while this slot ran (another slot, a re-run, or a manual push).
-          # Never force-push and never overwrite another slot's SQLite history. If our commit is already
-          # contained in remote main, push is a no-op. If remote diverged, check whether this slot's
-          # record is already persisted on remote (idempotent by date + slot); if so there is nothing to
-          # push. Otherwise refuse to merge/overwrite the SQLite file and fail explicitly instead of
-          # silently claiming success.
+          # Merge remote's slot_uploads records into the local history.db (idempotent by date+slot key;
+          # each slot owns its key). This preserves every slot's history without overwriting the SQLite
+          # file wholesale, without force-pushing, and without a binary-file rebase conflict.
+          REMOTE_DB="$(mktemp)"
+          if git show origin/main:data/history.db > "$REMOTE_DB" 2>/dev/null; then
+            python3 - "$REMOTE_DB" "data/history.db" <<'PY'
+          import sqlite3, sys
+          remote_path, local_path = sys.argv[1], sys.argv[2]
+          rcon = sqlite3.connect(remote_path)
+          lcon = sqlite3.connect(local_path)
+          rows = rcon.execute(
+              "SELECT key, run_date, slot, publish_at_utc, youtube_id, title, status, "
+              "created_at, updated_at, error FROM slot_uploads").fetchall()
+          for row in rows:
+              lcon.execute(
+                  "INSERT INTO slot_uploads (key, run_date, slot, publish_at_utc, youtube_id, title, "
+                  "status, created_at, updated_at, error) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                  "ON CONFLICT(key) DO UPDATE SET run_date=excluded.run_date, slot=excluded.slot, "
+                  "publish_at_utc=excluded.publish_at_utc, youtube_id=excluded.youtube_id, "
+                  "title=excluded.title, status=excluded.status, created_at=excluded.created_at, "
+                  "updated_at=excluded.updated_at, error=excluded.error", row)
+          lcon.commit()
+          rcon.close()
+          lcon.close()
+          PY
+          fi
+          git add -f data/history.db
+          git diff --cached --quiet && exit 0
+          git commit -m "chore: record CurioStick slot ${{ env.SLOT }} run (${{ github.run_id }})"
+          # If remote advanced between our fetch and this commit, reparent onto origin/main so the
+          # push fast-forwards. Never force-push; never overwrite another slot's history.
           if git merge-base --is-ancestor origin/main HEAD; then
             git push origin main
           else
