@@ -53,10 +53,10 @@ def main() -> int:
                 "model": GROQ_MODEL,
                 "messages": [
                     {"role": "system", "content": "You are a helpful assistant."},
-                    {"role": "user", "content": "Reply with exactly the word: OK"},
+                    {"role": "user", "content": "Reply with exactly the word: OK. Keep your response short."},
                 ],
                 "temperature": 0.6,
-                "max_tokens": 10,
+                "max_tokens": 256,
             },
             timeout=60,
         )
@@ -66,9 +66,14 @@ def main() -> int:
         check("Groq auth returns 200", r.status_code == 200, f"status={r.status_code}")
         if r.status_code == 200:
             data = r.json()
-            content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+            choice = data.get("choices", [{}])[0]
+            message = choice.get("message", {})
+            content = message.get("content", "")
+            finish_reason = choice.get("finish_reason", "")
             print(f"Completion content: {content!r}")
+            print(f"Finish reason: {finish_reason}")
             check("Groq completion returns content", bool(content and content.strip()), "")
+            check("Groq completion not truncated by length", finish_reason != "length", f"finish_reason={finish_reason}")
     except Exception as e:
         print(f"REQUEST ERROR: {type(e).__name__}: {e}")
         check("Groq auth request succeeded", False, f"{type(e).__name__}: {e}")
