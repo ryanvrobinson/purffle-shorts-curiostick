@@ -4,8 +4,18 @@ from pathlib import Path
 import pytest
 
 from purffle_shorts.config import Settings
-from purffle_shorts.llm import extract_json
-from purffle_shorts.script import SCENE_SCHEMA, SCRIPT_SCHEMA, Scene, build_prompt, load_script, normalize, offline_script
+from purffle_shorts.llm import LLMError, extract_json
+from purffle_shorts.script import (
+    SCENE_SCHEMA,
+    SCRIPT_SCHEMA,
+    Scene,
+    build_prompt,
+    load_script,
+    normalize,
+    offline_script,
+    scene_plan,
+    write_script,
+)
 
 
 @pytest.mark.parametrize("text", [
@@ -161,3 +171,97 @@ def test_scene_schema_accepts_optional_new_fields():
     assert "visual_description" not in schema["required"]
     assert "visual_source" not in schema["required"]
     assert "attribution" not in schema["required"]
+
+
+class _WriteFakeLLM:
+    """Fake LLM for testing write_script with scripted replies."""
+
+    label = "fake:model"
+
+    def __init__(self, replies):
+        self.replies = list(replies)
+        self.calls = []
+
+    def complete_json(self, system, user, schema=None, max_tokens=4000):
+        self.calls.append(
+            {"system": system, "user": user, "schema": schema, "max_tokens": max_tokens}
+        )
+        if not self.replies:
+            raise LLMError("no more replies")
+        reply = self.replies.pop(0)
+        if isinstance(reply, Exception):
+            raise reply
+        return reply
+
+
+def _full_script_data(scenes, title="X"):
+    return {
+        "title": title,
+        "hook_text": "HOOK",
+        "cast": [],
+        "scenes": scenes,
+        "description": "d",
+        "hashtags": ["#cats"],
+        "tags": ["cats"],
+        "category": "pets",
+    }
+
+
+def _scenes_data(n, words=8):
+    return [
+        {
+            "speaker": "A",
+            "narration": f"s{i} " + " ".join(["word"] * (words - 1)) + ".",
+            "search_query": f"q{i}",
+            "image_prompt": f"p{i}",
+        }
+        for i in range(n)
+    ]
+
+
+def test_write_script_accepts_complete_script_on_first_try():
+    """A complete script is accepted without retry."""
+    settings = Settings(target_seconds=30)
+    words, n_scenes = scene_plan("facts", 30)
+
+    def replies():
+        yield _full_script_data(_scenes_data(n_scenes, words // n_scenes))
+
+    llm = _WriteFakeLLM(replies())
+    script = write_script(llm, "cats", settings)
+
+    assert script.title == "X"
+    assert len(script.scenes) == n_scenes
+    assert len(llm.calls) == 1  # no retry needed
+
+
+def test_write_script_rejects_truncated_and_retries():
+    """An undersized initial script is rejected; the retry with more tokens produces a complete script."""
+    settings = Settings(target_seconds=30)
+    words, n_scenes = scene_plan("facts", 30)
+
+    def replies():
+        # First attempt: truncated (2 scenes, few words)
+        yield _full_script_data(_scenes_data(2, 9))
+        # Second attempt: complete
+        yield _full_script_data(_scenes_data(n_scenes, words // n_scenes))
+
+    llm = _WriteFakeLLM(replies())
+    script = write_script(llm, "cats", settings)
+
+    assert script.title == "X"
+    assert len(script.scenes) == n_scenes
+    assert len(llm.calls) == 2  # first undersized, then complete
+
+
+def test_write_script_rejects_undersized_without_recovery():
+    """Two undersized attempts in a row raise LLMError."""
+    def replies():
+        yield _full_script_data(_scenes_data(2, 9))  # undersized
+        yield _full_script_data(_scenes_data(3, 9))  # still undersized
+
+    llm = _WriteFakeLLM(replies())
+    settings = Settings(target_seconds=30)
+    with pytest.raises(LLMError, match="incomplete script"):
+        write_script(llm, "cats", settings)
+    assert len(llm.calls) == 2  # both attempts used, then raised

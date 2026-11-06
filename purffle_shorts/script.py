@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from .config import Settings
+from .llm import LLMError
 from .utils import clean_narration, strip_emoji, truncate_words
 
 log = logging.getLogger("purffle")
@@ -403,11 +404,43 @@ def write_script(llm, subject: str, settings: Settings, *, source: str = "niche"
     if llm is None:
         return offline_script(subject, settings, style)
     system, user = build_prompt(subject, style, settings, avoid or [], context, insights)
-    data = llm.complete_json(system, user, SCRIPT_SCHEMA)
-    script = normalize(data, subject, style, settings.language)
-    log.info("Script (%s, %d words, %d scenes): %s", style, word_count(script.narration, settings.language),
-             len(script.scenes), script.title)
-    return script
+    words, n_scenes = scene_plan(style, settings.target_seconds)
+    lo_words = int(words * 0.5)  # absolute floor: at least half the target
+    min_scenes = max(1, n_scenes // 2)
+
+    for attempt in range(2):
+        try:
+            # First attempt with a generous token budget; retry with even more
+            # if the script comes back truncated.
+            max_tokens = 10000 if attempt == 0 else 14000
+            data = llm.complete_json(system, user, SCRIPT_SCHEMA, max_tokens=max_tokens)
+            script = normalize(data, subject, style, settings.language)
+        except Exception as e:
+            if attempt == 0:
+                log.warning("Initial script generation failed, retrying: %s", e)
+                continue
+            raise
+
+        actual_words = word_count(script.narration, settings.language)
+        if actual_words < lo_words or len(script.scenes) < min_scenes:
+            if attempt == 0:
+                log.warning(
+                    "Initial script too short (%d words, %d scenes; target ~%d words, %d scenes), retrying",
+                    actual_words, len(script.scenes), words, n_scenes,
+                )
+                continue
+            raise LLMError(
+                f"Script generation produced an incomplete script: "
+                f"{actual_words} words, {len(script.scenes)} scenes "
+                f"(target ~{words} words, {n_scenes} scenes)"
+            )
+
+        log.info("Script (%s, %d words, %d scenes): %s", style,
+                 word_count(script.narration, settings.language),
+                 len(script.scenes), script.title)
+        return script
+
+    raise LLMError("Script generation failed after retries")
 
 
 # --------------------------------------------------------------------------------------------------
