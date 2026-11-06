@@ -387,6 +387,39 @@ def test_complete_json_retries_without_forced_json_mode(monkeypatch):
     assert calls[1]["max_tokens"] == 8000, calls[1]         # larger budget on retry
 
 
+def test_groq_json_validate_failure_falls_back_to_prompt_json(monkeypatch):
+    """Groq returns HTTP 400 json_validate_failed for response_format + gpt-oss-20b.
+
+    The provider must disable JSON mode and retry without response_format so
+    extract_json can parse the output locally. Regression test for the
+    Slot 1 production failure on 2026-11-07.
+    """
+    calls = []
+
+    class S:
+        def post(self, url, json=None, headers=None, timeout=None):
+            calls.append(dict(json))
+            if len(calls) == 1:
+                # Groq rejects response_format with reasoning models: json_validate_failed
+                return FakeResp(400, {"error": {"message": "json_validate_failed"}})
+            return FakeResp(200, {"choices": [{"message": {"content": '{"ok": true}'},
+                                                "finish_reason": "stop"}]})
+
+    monkeypatch.setattr(L, "http", lambda: S())
+    p = L.OpenAICompatible(L.PRESETS["custom"], "openai/gpt-oss-20b", "k",
+                           "https://api.groq.com/openai/v1")
+    assert p._json_mode is True
+    chain = object.__new__(L.LLM)
+    chain.settings, chain.providers = Settings(), [p]
+    schema = {"type": "object", "properties": {"ok": {"type": "boolean"}},
+              "required": ["ok"], "additionalProperties": False}
+    assert chain.complete_json("s", "u", schema=schema) == {"ok": True}
+    assert len(calls) == 2, calls
+    assert "response_format" in calls[0], calls[0]       # first attempt used JSON mode
+    assert "response_format" not in calls[1], calls[1]   # retry dropped JSON mode
+    assert p._json_mode is False                         # json_mode disabled for future calls
+
+
 def test_nemotron_empty_reply_retries_without_json_mode_and_more_tokens(monkeypatch):
     """Nemotron retry is a genuinely different request, not the same failed call with more tokens."""
     calls = []

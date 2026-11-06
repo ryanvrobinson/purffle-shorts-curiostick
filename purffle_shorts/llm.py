@@ -297,9 +297,14 @@ class OpenAICompatible(Provider):
                 f"(connect/read limits {_LLM_REQUEST_TIMEOUT[0]}s/{_LLM_REQUEST_TIMEOUT[1]}s)"
             ) from e
         except PermanentError as e:
-            if "response_format" in payload and "response_format" in str(e):
-                self._json_mode = False  # endpoint doesn't support JSON mode; rely on prompt + parser
-                return self.complete(system, user, schema=schema, temperature=temperature, max_tokens=max_tokens)
+            error_msg = str(e)
+            # Some endpoints (e.g. Groq) reject requests that combine response_format
+            # with a model that emits non-strict-JSON (reasoning content, code fences).
+            # Fall back to prompt-only JSON and let extract_json parse the output.
+            if "response_format" in error_msg or "json_validate" in error_msg:
+                self._json_mode = False
+                return self.complete(system, user, schema=schema,
+                                     temperature=temperature, max_tokens=max_tokens)
             raise
         data = r.json()
         try:
