@@ -537,3 +537,54 @@ def test_groq_non_retryable_errors_not_retried(monkeypatch):
     with pytest.raises(PermanentError, match="HTTP 401"):
         p.complete("system", "user")
     assert len(calls) == 1, calls  # no retry on auth failure
+
+
+def test_truncated_json_with_finish_reason_length_retries(monkeypatch):
+    """Non-empty but truncated JSON (finish_reason=length) triggers retry
+    without JSON mode and succeeds on the second attempt."""
+    calls = []
+
+    class S:
+        def post(self, url, json=None, headers=None, timeout=None):
+            calls.append(dict(json=json))
+            if len(calls) == 1:
+                # Truncated JSON - cut off mid-structure, finish_reason=length
+                return FakeResp(200, {"choices": [{"message": {"content": '{"ok":'},
+                                                    "finish_reason": "length"}]})
+            return FakeResp(200, {"choices": [{"message": {"content": '{"ok": true}'},
+                                                "finish_reason": "stop"}]})
+
+    monkeypatch.setattr(L, "http", lambda: S())
+    p = L.OpenAICompatible(L.PRESETS["custom"], "openai/gpt-oss-20b", "k",
+                           "https://api.groq.com/openai/v1")
+    chain = object.__new__(L.LLM)
+    chain.settings, chain.providers = Settings(), [p]
+    schema = {"type": "object", "properties": {"ok": {"type": "boolean"}},
+              "required": ["ok"], "additionalProperties": False}
+    result = chain.complete_json("s", "u", schema=schema)
+    assert result == {"ok": True}
+    assert len(calls) == 2, calls  # first truncated, then success
+    assert "response_format" in calls[0]["json"], calls[0]   # first attempt used JSON mode
+    assert "response_format" not in calls[1]["json"], calls[1]  # retry dropped JSON mode
+
+
+def test_truncated_json_exhausts_retry_budget(monkeypatch):
+    """Truncated JSON on every attempt raises after exhausting the retry budget."""
+    calls = []
+
+    class S:
+        def post(self, url, json=None, headers=None, timeout=None):
+            calls.append(dict(json=json))
+            return FakeResp(200, {"choices": [{"message": {"content": '{"ok":'},
+                                                "finish_reason": "length"}]})
+
+    monkeypatch.setattr(L, "http", lambda: S())
+    p = L.OpenAICompatible(L.PRESETS["custom"], "openai/gpt-oss-20b", "k",
+                           "https://api.groq.com/openai/v1")
+    chain = object.__new__(L.LLM)
+    chain.settings, chain.providers = Settings(), [p]
+    schema = {"type": "object", "properties": {"ok": {"type": "boolean"}},
+              "required": ["ok"], "additionalProperties": False}
+    with pytest.raises(L.LLMError, match="did not return valid JSON"):
+        chain.complete_json("s", "u", schema=schema)
+    assert len(calls) == 2, calls  # both attempts returned truncated JSON

@@ -446,6 +446,9 @@ Format rules to keep:
         parts.append("Previous Script Doctor findings on this draft:\n- " + "\n- ".join(findings))
     if feedback:
         parts.append("Previous attempt feedback:\n- " + "\n- ".join(feedback))
+    blocking = list(dict.fromkeys(script.blocking or []))
+    if blocking:
+        parts.append("BLOCKING ISSUES THAT MUST BE FIXED IN THE REWRITE:\n- " + "\n- ".join(blocking[:5]))
     parts.append(
         f"""
 
@@ -549,15 +552,16 @@ def doctor_prompt(script: Script, settings: Settings, rewrite: bool,
               "swipe away at any slow moment. Score honestly against the rubric: a high score never "
               "excuses a blocking flaw. Reply with a single JSON object and nothing else.")
     task = (
-        f"Then rewrite it into the strongest version you can. Keep the same subject, format, "
+        f"Then rewrite the script to fix every blocking issue listed above. Keep the same subject, format, "
         f"language ({lang}), the same JSON structure and between {lo} and {hi} words (target {words}) "
-        f"in {n_scenes} scenes. Do not pad or cut scenes to hit the count; keep the same information "
-        "density. Preserve scene order and a coherent progression from hook to payoff. Make the "
-        "opening a specific, scientifically defensible question or consequence. Fix every issue you "
-        "list: sharpen the hook, cut filler, make vague lines concrete, remove any claim that may not "
-        "be true, keep the payoff for the end, and end with a short call to action (max 8 words). Do "
-        "not invent facts, statistics, studies, or certainty. Put the rewritten script in \"script\".\n"
-        "Format rules to keep:\n" + _format_rules(script.style)
+        f"in exactly {n_scenes} scenes. Do not pad or cut scenes to hit the count; keep the same "
+        f"information density. Preserve scene order and a coherent progression from hook to payoff. "
+        f"Make the opening a specific, scientifically defensible question or consequence. Sharpen the "
+        f"hook, cut filler, make vague lines concrete, remove any claim that may not be true, keep "
+        f"the payoff for the end, and end with a short call to action (max 8 words). Do not invent "
+        f"facts, statistics, studies, or certainty. Put the COMPLETE rewritten script in \"script\" "
+        f"— the response must include every required field and must not be truncated.\n"
+        f"Format rules to keep:\n" + _format_rules(script.style)
     ) if rewrite else 'Return only "score", "breakdown", "issues" and "blocking_issues".'
     parts = [
         f"""Review this YouTube Short script ({STYLES[script.style]}).
@@ -573,6 +577,9 @@ def doctor_prompt(script: Script, settings: Settings, rewrite: bool,
         parts.append("Previous Script Doctor findings on this draft:\n- " + "\n- ".join(findings))
     if feedback:
         parts.append("Previous attempt feedback:\n- " + "\n- ".join(feedback))
+    blocking = list(dict.fromkeys(script.blocking or []))
+    if blocking:
+        parts.append("BLOCKING ISSUES THAT MUST BE FIXED IN THE REWRITE:\n- " + "\n- ".join(blocking[:5]))
     parts.append(
         f"""\nScore it 0-100 and break the score down:{rubric}
 Target acceptance is {DOCTOR_TARGET_SCORE}/100; be strict.
@@ -615,7 +622,7 @@ def review_script(llm, script: Script, settings: Settings) -> Script:
         system, user = review_prompt(current, settings, rewrite, feedback=feedback)
         try:
             data = llm.complete_json(system, user, doctor_schema(include_script=rewrite),
-                                     max_tokens=5000)
+                                     max_tokens=7000)
         except Exception as e:
             log.warning("Script Doctor attempt %d/%d skipped: %s", attempt + 1, attempts, e)
             if current.blocking:

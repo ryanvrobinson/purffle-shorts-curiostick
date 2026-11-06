@@ -390,6 +390,11 @@ class OpenAICompatible(Provider):
                 if isinstance(part, dict) and isinstance(part.get("text"), str)
             )
         if not isinstance(content, str) or not content.strip():
+            if finish_reason == "length":
+                reasoning_note = "; reasoning_content is not final output" if message.get("reasoning_content") else ""
+                raise LLMError(
+                    f"{self}: empty reply (finish_reason=length){reasoning_note} — reply truncated by token limit"
+                )
             reasoning_note = "; reasoning_content is not final output" if message.get("reasoning_content") else ""
             raise LLMError(f"{self}: empty reply (finish_reason={finish_reason}{reasoning_note})")
         log.debug("%s finish_reason=%s usage=%s content_length=%d",
@@ -655,7 +660,7 @@ class LLM:
                     return result
                 except Exception as e:
                     message = str(e).lower()
-                    is_incomplete = ("empty reply" in message or "model did not return valid json" in message)
+                    is_incomplete = ("empty reply" in message or "model did not return valid json" in message or "truncated" in message)
                     if attempt == 0 and is_incomplete and len(limits) > 1:
                         log.warning("LLM %s returned an empty or invalid JSON response; retrying once without "
                                     "forced JSON mode and with %d output tokens", p, limits[1])
