@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING
 
 from . import ffmpeg
 from .config import ASPECTS, Settings, duration_window
+from .script import HOOK_BAD_PATTERNS
 
 if TYPE_CHECKING:
     from .pipeline import Result
@@ -387,7 +388,7 @@ class QualityGate:
             if not scenes or not scenes[0].get("narration", "").strip():
                 return QualityCheck("script_hook", False, "Opening scene has no narration")
             opening = scenes[0]["narration"].strip()
-            if re.match(r"^(?:did you know\b|welcome back\b|hello\b|hi everyone\b|hey everyone\b)", opening, re.I):
+            if HOOK_BAD_PATTERNS.match(opening):
                 return QualityCheck("script_hook", False,
                                     "Opening uses a greeting or generic 'Did you know?' hook")
             return QualityCheck("script_hook", True, "Opening narration starts directly with the story")

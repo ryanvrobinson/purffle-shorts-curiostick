@@ -28,11 +28,13 @@ from .script import (
     CARD_STYLES,
     DEFAULT_CAST,
     MULTI_SPEAKER,
+    SCRIPT_SCHEMA,
     Script,
     ScriptQualityError,
     load_script,
     review_script,
     translate_script,
+    validate_opening_hook,
     write_script,
 )
 from .timing import caption_chunks, scene_timeline, srt, tokenize
@@ -207,23 +209,97 @@ class Studio:
                                   context=pick.context, style=style or pick.style or None, insights=insights)
             script_took = time.perf_counter() - script_started
             log.info("Initial script generation: %.2fs", script_took)
+
+            # Early hook validation: reject generic greetings before TTS/images/render.
+            if llm is not None:
+                hook_issue = validate_opening_hook(script)
+                if hook_issue:
+                    log.warning("Initial script hook failed: %s", hook_issue)
+                    script = self._rewrite_hook_only(llm, script, s, hook_issue)
+                    hook_issue = validate_opening_hook(script)
+                    if hook_issue:
+                        raise RuntimeError(
+                            f"Script hook still invalid after rewrite: {hook_issue}"
+                        )
+
             if llm is not None and s.script_review != "off":
                 self._step("review", "Script Doctor")
                 review_started = time.perf_counter()
                 script = review_script(llm, script, s)
                 review_took = time.perf_counter() - review_started
                 log.info("Script Doctor: %.2fs", review_took)
+                # Revalidate hook after any rewrite — Doctor may have reintroduced a generic opening.
+                hook_issue = validate_opening_hook(script)
+                if hook_issue:
+                    log.warning("Post-Doctor script hook failed: %s", hook_issue)
+                    script = self._rewrite_hook_only(llm, script, s, hook_issue)
+                    hook_issue = validate_opening_hook(script)
+                    if hook_issue:
+                        raise RuntimeError(
+                            f"Script hook still invalid after Doctor rewrite: {hook_issue}"
+                        )
+
             if llm is not None and s.research_verify:
                 self._step("research", "fact verification")
                 claims = research.extract_claims_from_script(script, s.language)
                 report = research.verify_script_claims(claims, pick, llm)
                 script.verification_report = report.to_dict()
                 log.info("Fact verification: %d claims, %s", len(report.claims), report.status)
+                # Block production when claims need human review or LLM extraction failed.
+                if report.status == research.NEEDS_HUMAN_REVIEW:
+                    raise RuntimeError(
+                        "Fact verification unresolved: claims need human review before rendering. "
+                        f"Checked by {report.checked_by}; "
+                        f"{'LLM claim extraction failed; ' if report.llm_extraction_failed else ''}"
+                        f"{len(report.claims)} claim(s) unresolved."
+                    )
+                if report.llm_extraction_failed:
+                    raise RuntimeError(
+                        "LLM claim extraction failed; cannot proceed without verified claims."
+                    )
         except BaseException:
             if pick.idea_id:
                 self.history.release_idea(pick.idea_id)
             raise
         return script, pick, llm.label if llm else "offline"
+
+    # ------------------------------------------------------------------ hook-only targeted rewrite
+    def _rewrite_hook_only(self, llm, script: Script, settings, hook_issue: str) -> Script:
+        """Targeted rewrite that fixes only the opening hook.
+
+        Preserves all verified factual content, target duration, scene count,
+        and scene structure. Only the first scene's narration is changed.
+        """
+        from .script import build_prompt, normalize
+
+        first = script.scenes[0]
+        system, user = build_prompt(
+            script.topic, script.style, settings, [],
+            context="",
+            insights=(
+                f"REWRITE ONLY THE OPENING HOOK. Problem: {hook_issue}. "
+                f"Current opening: '{first.narration}'. "
+                "Replace ONLY the first scene's narration with a specific, "
+                "scroll-stopping opening that names the subject immediately. "
+                "Do not use greetings, 'Did you know?', or throat-clearing. "
+                "Keep all other scenes, facts, search queries, image prompts, "
+                "and structure exactly as-is. Return the complete script JSON."
+            ),
+        )
+        data = llm.complete_json(system, user, SCRIPT_SCHEMA, max_tokens=8000)
+        rewritten = normalize(data, script.topic, script.style, script.language)
+        # Preserve everything except the fixed opening narration
+        for i, scene in enumerate(rewritten.scenes):
+            if i == 0:
+                continue  # new opening from the rewrite
+            if i < len(script.scenes):
+                scene.narration = script.scenes[i].narration
+                scene.search_query = script.scenes[i].search_query
+                scene.image_prompt = script.scenes[i].image_prompt
+                scene.visual_description = script.scenes[i].visual_description
+                scene.visual_source = script.scenes[i].visual_source
+                scene.attribution = script.scenes[i].attribution
+        return rewritten
 
     # ------------------------------------------------------------------ one video
     def make(self, topic: str | None = None, *, source: str | None = None, upload: bool | None = None,
@@ -482,7 +558,10 @@ class Studio:
             result = Result(True, title, folder, video, "rendered", seconds=took, record_id=rid,
                             score=script.score, language=s.language)
             if upload:
+                # Prevent duplicate publishing: check YouTube for an existing upload
+                # of this slot's video before uploading again.
                 self._step("upload")
+                self._check_duplicate_upload(s, title, video)
                 self.upload_record(rid, result)
             else:
                 notify.send(s, "rendered", title=title, detail=str(video))
@@ -496,6 +575,30 @@ class Studio:
         finally:
             if not os.getenv("KEEP_WORK"):
                 shutil.rmtree(work, ignore_errors=True)
+
+    def _check_duplicate_upload(self, settings, title: str, video: Path) -> None:
+        """Before uploading, check YouTube for an existing video matching this slot.
+
+        Never uploads the same slot twice. Preserves existing video IDs and
+        successful upload state.
+        """
+        try:
+            yt = youtube.service(settings, interactive=False)
+            marker = f"{title} #shorts"
+            existing = youtube.find_existing_video(yt, marker)
+            if existing:
+                log.warning(
+                    "Duplicate upload prevented: video %s already on YouTube for %s",
+                    existing, title,
+                )
+                raise RuntimeError(
+                    f"Refusing to re-upload: {title} already exists on YouTube (video {existing})."
+                )
+        except RuntimeError:
+            raise
+        except Exception as e:
+            # Never block an upload due to a duplicate-check failure.
+            log.warning("Duplicate upload check skipped: %s", e)
 
     def _translation(self, script: Script, pick: Topic, writer: str, lang: str, s: Settings,
                      by_scene: dict[int, MediaItem], credits: set[str], parent_id: int, upload: bool) -> Result:

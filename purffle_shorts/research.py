@@ -19,7 +19,7 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 from .config import Settings
-from .llm import LLM
+from .llm import LLM, LLMError
 from .topics import Topic
 from .utils import redact
 
@@ -59,6 +59,7 @@ class VerificationReport:
     status: str = NEEDS_HUMAN_REVIEW  # overall: verified | needs_human_review | unverifiable
     source_count: int = 0
     checked_by: str = "heuristic"  # heuristic | llm
+    llm_extraction_failed: bool = False  # True if LLM claim extraction failed
 
     @property
     def verified_count(self) -> int:
@@ -77,6 +78,7 @@ class VerificationReport:
             "status": self.status,
             "checked_by": self.checked_by,
             "source_count": self.source_count,
+            "llm_extraction_failed": self.llm_extraction_failed,
             "claims": [
                 {
                     "text": c.text,
@@ -127,15 +129,12 @@ Narration:
 Return a JSON array of claim strings, e.g. ["Octopuses have three hearts.", "The Great Wall is visible from space."].
 If there are no checkable claims, return [].
 """
-    try:
-        data = llm.complete_json(system, user, None, max_tokens=2000)
-        if isinstance(data, list):
-            return [str(c).strip() for c in data if str(c).strip()]
-        if isinstance(data, dict) and isinstance(data.get("claims"), list):
-            return [str(c).strip() for c in data["claims"] if str(c).strip()]
-    except Exception as e:  # pragma: no cover - LLM failures fall back to heuristic
-        log.warning("LLM claim extraction failed, using heuristic: %s", redact(e))
-    return _extract_claims_heuristic(narration)
+    data = llm.complete_json(system, user, None, max_tokens=2000)
+    if isinstance(data, list):
+        return [str(c).strip() for c in data if str(c).strip()]
+    if isinstance(data, dict) and isinstance(data.get("claims"), list):
+        return [str(c).strip() for c in data["claims"] if str(c).strip()]
+    raise LLMError("LLM claim extraction returned unparseable result")
 
 
 def _claim_relevance(claim: str, source: dict) -> bool:
@@ -194,16 +193,19 @@ def verify_script_claims(
     sources = list(topic.source_references or [])
     all_claims = [c for _, c in script_claims]
     checked_by = "heuristic"
+    llm_extraction_failed = False
     if llm is not None and all_claims:
         # Optionally let the LLM re-extract/refine claims, but verification still
-        # depends on source evidence, not LLM opinion.
+        # depends on source evidence, not LLM opinion. A failed LLM extraction
+        # is never silently treated as successful LLM-based extraction.
         try:
             llm_claims = _extract_claims_llm(llm, " ".join(all_claims), topic.subject)
             if llm_claims:
                 all_claims = llm_claims
                 checked_by = "llm"
-        except Exception as e:  # pragma: no cover
-            log.warning("LLM claim refinement failed: %s", redact(e))
+        except Exception as e:
+            llm_extraction_failed = True
+            log.warning("LLM claim extraction failed; using heuristic fallback: %s", redact(e))
 
     claims = verify_claims(all_claims, sources, llm)
 
@@ -220,6 +222,7 @@ def verify_script_claims(
         status=overall,
         source_count=len(sources),
         checked_by=checked_by,
+        llm_extraction_failed=llm_extraction_failed,
     )
 
 

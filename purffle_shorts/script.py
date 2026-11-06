@@ -21,6 +21,13 @@ from .utils import clean_narration, strip_emoji, truncate_words
 
 log = logging.getLogger("purffle")
 
+# Regex for generic openings that fail the hook QC check.
+# Must stay in sync with QualityGate._check_hook in quality.py.
+HOOK_BAD_PATTERNS = re.compile(
+    r"^(?:did you know\b|welcome back\b|hello\b|hi everyone\b|hey everyone\b)",
+    re.I,
+)
+
 LANGUAGES = {
     "en": "English", "es": "Spanish", "fr": "French", "de": "German", "it": "Italian", "pt": "Portuguese",
     "hi": "Hindi", "ta": "Tamil", "te": "Telugu", "bn": "Bengali", "mr": "Marathi", "ur": "Urdu",
@@ -409,6 +416,23 @@ def estimate_narration_duration(word_count: int, language: str = "en",
     """
     speak_time = word_count / words_per_second
     return speak_time + end_pad
+
+
+def validate_opening_hook(script: Script) -> str | None:
+    """Return a rejection message if the opening scene uses a generic greeting,
+    or None if the hook is acceptable.
+
+    Uses the same rules as QualityGate._check_hook so early and late validation
+    never disagree.
+    """
+    if not script.scenes:
+        return "Opening scene has no narration"
+    opening = script.scenes[0].narration.strip()
+    if not opening:
+        return "Opening scene has no narration"
+    if HOOK_BAD_PATTERNS.match(opening):
+        return "Opening uses a greeting or generic 'Did you know?' hook"
+    return None
 
 
 def write_script(llm, subject: str, settings: Settings, *, source: str = "niche",

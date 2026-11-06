@@ -14,6 +14,7 @@ from purffle_shorts.script import (
     scene_plan,
     script_from_data,
     translate_script,
+    validate_opening_hook,
     word_count,
     write_script,
 )
@@ -472,3 +473,188 @@ def test_rewrite_keeps_blocking_issues_produces_clear_blocking_error():
     ):
         review_script(llm, _draft(), settings)
     assert len(llm.calls) == 2  # bounded, no endless retrying
+
+# ------------------------------------------------------------------ hook-only rewrite regression tests
+
+def _script_with_bad_hook():
+    """Script whose opening uses a generic 'Did you know?' greeting."""
+    return normalize({
+        "title": "T", "hook_text": "HOOK", "cast": [],
+        "scenes": [
+            {"speaker": "A", "narration": "Did you know octopuses have three hearts?",
+             "search_query": "octopus hearts", "image_prompt": "octopus"},
+            {"speaker": "A", "narration": "Their blood is blue because of copper.",
+             "search_query": "octopus blood", "image_prompt": "blue blood"},
+        ],
+        "description": "d", "hashtags": ["#cats"], "tags": ["cats"], "category": "pets",
+    }, "cats", "facts", "en")
+
+
+def test_hook_rewrite_fixes_opening_preserves_rest():
+    """Hook-only rewrite replaces only the first scene's narration."""
+    from purffle_shorts.pipeline import Studio
+    settings = Settings(target_seconds=16)
+    studio = Studio.__new__(Studio)
+    studio.s = settings
+
+    script = _script_with_bad_hook()
+    assert validate_opening_hook(script) is not None
+
+    class FakeLLM:
+        label = "fake:model"
+        def complete_json(self, system, user, schema=None, max_tokens=4000):
+            return {
+                "title": "T", "hook_text": "FIXED HOOK", "cast": [],
+                "scenes": [
+                    {"speaker": "A", "narration": "Octopuses have three hearts and blue blood.",
+                     "search_query": "octopus hearts", "image_prompt": "octopus"},
+                    {"speaker": "A", "narration": "Their blood is blue because of copper.",
+                     "search_query": "octopus blood", "image_prompt": "blue blood"},
+                ],
+                "description": "d", "hashtags": ["#cats"], "tags": ["cats"], "category": "pets",
+            }
+
+    result = studio._rewrite_hook_only(FakeLLM(), script, settings, "generic greeting")
+    assert validate_opening_hook(result) is None
+    # Second scene preserved unchanged
+    assert result.scenes[1].narration == "Their blood is blue because of copper."
+    assert result.scenes[1].search_query == "octopus blood"
+
+
+def test_hook_rewrite_cannot_bypass_factual_verification(tmp_path):
+    """Hook rewrite does not skip fact verification; needs_human_review still blocks."""
+    from purffle_shorts import pipeline
+    from purffle_shorts.script import SCRIPT_SCHEMA
+
+    data = {
+        "topic": "neutron stars",
+        "title": "A neutron star question",
+        "hook_text": "WHAT HAPPENS?",
+        "scenes": [
+            {"narration": f"Neutron stars are collapsed stars. Fact {i}.",
+             "search_query": "neutron star", "image_prompt": "neutron star in space"}
+            for i in range(5)
+        ],
+        "description": "A science explanation.",
+        "hashtags": [], "tags": [], "category": "science",
+    }
+
+    class FakeLLM:
+        label = "fake:model"
+        def __init__(self):
+            self.reviews = 0
+        def complete_json(self, system, user, schema=None, max_tokens=4000):
+            if schema is SCRIPT_SCHEMA:
+                return data
+            self.reviews += 1
+            return {"score": 95, "issues": [], "script": data}
+
+    settings = Settings(target_seconds=16, script_review="rewrite", research_verify=True,
+                        output_dir=str(tmp_path / "out"), data_dir=str(tmp_path / "data"))
+    studio = pipeline.Studio(settings)
+    llm = FakeLLM()
+    studio._llm = llm
+
+    # verification_report with needs_human_review should block production
+    script = normalize(data, "neutron stars", "facts", "en")
+    script.verification_report = {
+        "status": "needs_human_review",
+        "checked_by": "heuristic",
+        "source_count": 0,
+        "llm_extraction_failed": False,
+        "claims": [{"text": "unverified claim", "status": "needs_human_review"}],
+    }
+
+    # draft() should raise because verification is needs_human_review
+    try:
+        studio.draft(topic="neutron stars")
+        raise AssertionError("draft() should have raised RuntimeError for needs_human_review")
+    except RuntimeError as e:
+        assert "human review" in str(e).lower() or "unresolved" in str(e).lower()
+
+
+def test_invalid_claim_extraction_json_fails_safely():
+    """LLM claim extraction returning incomplete JSON twice raises LLMError."""
+    from purffle_shorts.llm import LLMError
+    from purffle_shorts.research import _extract_claims_llm
+
+    class FailingLLM:
+        name = "custom"
+        model = "openai/gpt-oss-20b"
+        base_url = "https://api.groq.com/openai/v1"
+        api_key = "test-key"
+
+        def complete_json(self, system, user, schema=None, max_tokens=4000):
+            # First call: incomplete JSON (finish_reason=length)
+            raise LLMError("empty reply (finish_reason=length)")
+
+    llm = FailingLLM()
+    try:
+        _extract_claims_llm(llm, "Octopuses have three hearts. Their blood is blue.", "octopuses")
+        raise AssertionError("_extract_claims_llm should have raised LLMError")
+    except LLMError:
+        pass  # expected: failure propagates, no silent heuristic fallback
+
+# ------------------------------------------------------------------ duplicate upload and asset reuse tests
+
+def test_duplicate_upload_prevented(monkeypatch):
+    """_check_duplicate_upload raises when YouTube already has the video."""
+    from pathlib import Path
+
+    from purffle_shorts.config import Settings
+    from purffle_shorts.pipeline import Studio
+
+    settings = Settings()
+    studio = Studio.__new__(Studio)
+    studio.s = settings
+
+    class FakeYT:
+        def search(self):
+            return self
+        def list(self, **kwargs):
+            return self
+        def execute(self):
+            return {"items": [{"id": {"videoId": "existing123"}}]}
+
+    class FakeYouTubeModule:
+        @staticmethod
+        def service(settings, interactive=False):
+            return FakeYT()
+        @staticmethod
+        def find_existing_video(yt, marker):
+            return "existing123"
+
+    import purffle_shorts.pipeline as pip
+    monkeypatch.setattr(pip, "youtube", FakeYouTubeModule)
+
+    try:
+        studio._check_duplicate_upload(settings, "My Video", Path("video.mp4"))
+        raise AssertionError("Should have raised RuntimeError for duplicate")
+    except RuntimeError as e:
+        assert "already exists on YouTube" in str(e)
+
+
+def test_duplicate_upload_check_failure_does_not_block(monkeypatch):
+    """Duplicate check failure (network error) never blocks upload."""
+    from pathlib import Path
+
+    from purffle_shorts.config import Settings
+    from purffle_shorts.pipeline import Studio
+
+    settings = Settings()
+    studio = Studio.__new__(Studio)
+    studio.s = settings
+
+    class FakeYouTubeModule:
+        @staticmethod
+        def service(settings, interactive=False):
+            raise ConnectionError("network down")
+        @staticmethod
+        def find_existing_video(yt, marker):
+            return None
+
+    import purffle_shorts.pipeline as pip
+    monkeypatch.setattr(pip, "youtube", FakeYouTubeModule)
+
+    # Should not raise — duplicate check failure is non-blocking
+    studio._check_duplicate_upload(settings, "My Video", Path("video.mp4"))

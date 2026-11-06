@@ -296,3 +296,66 @@ def test_write_script_rejects_oversized_without_recovery():
     with pytest.raises(LLMError, match="overlong script"):
         write_script(llm, "cats", settings)
     assert len(llm.calls) == 2
+
+def test_validate_opening_hook_rejects_generic_greeting():
+    """Generic greeting hook is rejected before TTS/images/render."""
+    from purffle_shorts.script import Scene, Script, validate_opening_hook
+    script = Script(
+        topic="cats", title="T", hook_text="HOOK", scenes=[
+            Scene(narration="Did you know cats have whiskers?", search_query="cats", image_prompt="cats"),
+        ],
+        description="d", hashtags=["#cats"], tags=["cats"], category="pets",
+    )
+    issue = validate_opening_hook(script)
+    assert issue is not None
+    assert "greeting" in issue or "Did you know" in issue
+
+
+def test_validate_opening_hook_rejects_did_you_know():
+    """'Did you know?' opening is rejected."""
+    from purffle_shorts.script import Scene, Script, validate_opening_hook
+    script = Script(
+        topic="cats", title="T", hook_text="HOOK", scenes=[
+            Scene(narration="Did you know octopuses have three hearts?", search_query="octopus", image_prompt="octopus"),
+        ],
+        description="d", hashtags=["#cats"], tags=["cats"], category="pets",
+    )
+    issue = validate_opening_hook(script)
+    assert issue is not None
+
+
+def test_validate_opening_hook_accepts_specific_opening():
+    """Specific subject-opening hook is accepted."""
+    from purffle_shorts.script import Scene, Script, validate_opening_hook
+    script = Script(
+        topic="cats", title="T", hook_text="HOOK", scenes=[
+            Scene(narration="Octopuses have three hearts and blue blood.", search_query="octopus", image_prompt="octopus"),
+        ],
+        description="d", hashtags=["#cats"], tags=["cats"], category="pets",
+    )
+    issue = validate_opening_hook(script)
+    assert issue is None
+
+
+def test_validate_opening_hook_empty_narration():
+    """Empty opening narration is rejected."""
+    from purffle_shorts.script import Scene, Script, validate_opening_hook
+    script = Script(
+        topic="cats", title="T", hook_text="HOOK", scenes=[
+            Scene(narration="", search_query="cats", image_prompt="cats"),
+        ],
+        description="d", hashtags=["#cats"], tags=["cats"], category="pets",
+    )
+    issue = validate_opening_hook(script)
+    assert issue is not None
+
+
+def test_validate_opening_hook_no_scenes():
+    """Script with no scenes is rejected."""
+    from purffle_shorts.script import Script, validate_opening_hook
+    script = Script(
+        topic="cats", title="T", hook_text="HOOK", scenes=[],
+        description="d", hashtags=["#cats"], tags=["cats"], category="pets",
+    )
+    issue = validate_opening_hook(script)
+    assert issue is not None
