@@ -397,6 +397,18 @@ def word_count(text: str, language: str = "en") -> int:
     return len(text.split())
 
 
+def estimate_narration_duration(word_count: int, language: str = "en",
+                                words_per_second: float = WORDS_PER_SECOND,
+                                end_pad: float = 0.6) -> float:
+    """Estimate spoken duration for a given word count.
+
+    Accounts for speaking rate and the end pad added at render time.
+    Returns seconds.
+    """
+    speak_time = word_count / words_per_second
+    return speak_time + end_pad
+
+
 def write_script(llm, subject: str, settings: Settings, *, source: str = "niche",
                  avoid: list[str] | None = None, context: str = "", style: str | None = None,
                  insights: str = "") -> Script:
@@ -406,6 +418,7 @@ def write_script(llm, subject: str, settings: Settings, *, source: str = "niche"
     system, user = build_prompt(subject, style, settings, avoid or [], context, insights)
     words, n_scenes = scene_plan(style, settings.target_seconds)
     lo_words = int(words * 0.5)  # absolute floor: at least half the target
+    hi_words = int(words * 1.2)  # ceiling: ~20% over target keeps total duration within limits
     min_scenes = max(1, n_scenes // 2)
 
     for attempt in range(2):
@@ -433,6 +446,24 @@ def write_script(llm, subject: str, settings: Settings, *, source: str = "niche"
                 f"Script generation produced an incomplete script: "
                 f"{actual_words} words, {len(script.scenes)} scenes "
                 f"(target ~{words} words, {n_scenes} scenes)"
+            )
+        if actual_words > hi_words:
+            if attempt == 0:
+                log.warning(
+                    "Initial script too long (%d words; target ~%d, max %d), "
+                    "retrying with a more concise prompt",
+                    actual_words, words, hi_words,
+                )
+                user = user + (
+                    f"\n\nIMPORTANT: The narration must be concise — target about {words} words "
+                    f"total (maximum {hi_words}). Trim every scene to the essential facts; "
+                    "do not add padding or extra scenes."
+                )
+                continue
+            raise LLMError(
+                f"Script generation produced an overlong script: "
+                f"{actual_words} words, {len(script.scenes)} scenes "
+                f"(target ~{words} words, max {hi_words} words)"
             )
 
         log.info("Script (%s, %d words, %d scenes): %s", style,

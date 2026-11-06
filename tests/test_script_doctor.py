@@ -143,7 +143,7 @@ def test_final_low_score_stops_make_before_rendering(tmp_path, monkeypatch):
         "title": "A neutron star question",
         "hook_text": "WHAT HAPPENS?",
         "scenes": [
-            {"narration": f"Neutron stars are compact remnants formed after some massive stars collapse. Observation {i}.",
+            {"narration": f"Neutron stars are collapsed stars. Fact {i}.",
              "search_query": "neutron star", "image_prompt": "neutron star in space"}
             for i in range(5)
         ],

@@ -17,7 +17,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from . import analytics, ffmpeg, notify, research, topics, tts, youtube
-from .config import Settings
+from .config import Settings, duration_window
 from .history import History, now_iso
 from .llm import LLM, LLMConfigError, LLMNotConfigured
 from .media import AI_SOURCES, MediaItem, Visuals
@@ -29,6 +29,7 @@ from .script import (
     DEFAULT_CAST,
     MULTI_SPEAKER,
     Script,
+    ScriptQualityError,
     load_script,
     review_script,
     translate_script,
@@ -270,6 +271,49 @@ class Studio:
             self._step("voice", f"{s.tts_engine} voice")
             speech = self._speak(script, work, s)
             total = round(speech.duration + END_PAD, 3)
+
+            # Pre-render duration guard: if the spoken audio already exceeds the
+            # QC maximum, attempt a meaning-preserving script reduction before
+            # rendering anything. This catches overlong scripts early instead of
+            # rendering a 45s video that QC will reject.
+            max_dur = duration_window(s.target_seconds)[1]
+            if total > max_dur:
+                log.warning(
+                    "Narration too long (%.1fs incl. pad; max %.1fs), attempting script reduction",
+                    total, max_dur,
+                )
+                for reduce_attempt in range(2):
+                    if s.llm_provider is None or s.llm_provider == "off":
+                        break
+                    try:
+                        llm = self._llm_or_none()
+                        if llm is None:
+                            break
+                        script = review_script(
+                            llm, script, replace(s, script_review="rewrite",
+                                                 script_quality_threshold=s.script_quality_threshold),
+                        )
+                        speech = self._speak(script, work, s)
+                        total = round(speech.duration + END_PAD, 3)
+                        if total <= max_dur:
+                            log.info(
+                                "Script reduced to %.1fs (incl. pad); within limits",
+                                total,
+                            )
+                            break
+                    except ScriptQualityError as e:
+                        log.warning("Script reduction failed: %s", e)
+                        break
+                else:
+                    # Loop exhausted without breaking → still too long
+                    pass
+
+                if total > max_dur:
+                    raise RuntimeError(
+                        f"Script narration ({speech.duration:.1f}s + {END_PAD}s pad = {total:.1f}s) "
+                        f"exceeds the {max_dur}s maximum for a {s.target_seconds}s target. "
+                        f"Reduce script length or increase TARGET_SECONDS."
+                    )
             chat = script.style == "chat"
             timeline = scene_timeline([sc.narration for sc in script.scenes], speech.words, total, s.language,
                                       starts=speech.line_starts, min_len=4.5 if chat else 1.2)
