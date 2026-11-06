@@ -399,7 +399,7 @@ def test_workflow_files_select_the_correct_slots():
         assert '${{ github.event_name }}" = "schedule"' in text, path  # scheduled runs pass --publish
         assert 'LLM_PROVIDER: "custom"' in text, path
         assert 'LLM_BASE_URL: "https://integrate.api.nvidia.com/v1"' in text, path
-        assert 'NVIDIA_NIM_MODEL: "openai/gpt-oss-20b"' in text, path
+        assert 'NVIDIA_NIM_MODEL: "nvidia/nemotron-3.5-lightning-30b-a3b"' in text, path
         assert '${{ secrets.NVIDIA_NIM_API_KEY }}' in text, path
         assert 'LLM_TEMPERATURE: "0.6"' in text, path
         assert 'GEMINI_API_KEY' not in text, path

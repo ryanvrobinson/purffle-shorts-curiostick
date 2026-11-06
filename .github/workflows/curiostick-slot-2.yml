@@ -25,10 +25,10 @@ jobs:
     timeout-minutes: 60
     env:
       SLOT: "2"
-      # ── LLM — NVIDIA NIM GPT-OSS-20B (OpenAI-compatible) ──
+      # ── LLM — NVIDIA NIM Nemotron-3.5-Lightning-30B (OpenAI-compatible) ──
       LLM_PROVIDER: "custom"
       LLM_BASE_URL: "https://integrate.api.nvidia.com/v1"
-      NVIDIA_NIM_MODEL: "openai/gpt-oss-20b"
+      NVIDIA_NIM_MODEL: "nvidia/nemotron-3.5-lightning-30b-a3b"
       NVIDIA_NIM_API_KEY: ${{ secrets.NVIDIA_NIM_API_KEY }}
       LLM_TEMPERATURE: "0.6"
 
