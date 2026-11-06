@@ -99,6 +99,23 @@ def test_gemini_default_model_from_settings(monkeypatch):
     assert p.model == "gemini-2.5-flash"  # preset default
 
 
+def test_gemini_http_options_timeout_is_120_seconds_not_60_ms(monkeypatch):
+    """google-genai's HttpOptions.timeout is in MILLISECONDS.
+
+    Regression: _REQUEST_TIMEOUT was 60, which the SDK read as 60 milliseconds (0.06s) and
+    caused the Slot 3 Gemini failures. It must be 120_000 ms (120 seconds), never 60.
+    """
+    captured = []
+    _install_fake_genai(monkeypatch, captured)
+    monkeypatch.setenv("GEMINI_API_KEY", "k")
+    p = L.build_provider("gemini", Settings(llm_provider="gemini"))
+    assert isinstance(p, L.GeminiProvider)
+    http_options = captured[0]["http_options"]
+    assert http_options.timeout == 120_000, http_options
+    assert http_options.timeout != 60  # 60 ms = 0.06s request timeout
+    assert L.GeminiProvider._REQUEST_TIMEOUT == 120_000
+
+
 def test_gemini_missing_api_key_raises_config_error(monkeypatch):
     _install_fake_genai(monkeypatch, [])
     monkeypatch.delenv("GEMINI_API_KEY", raising=False)

@@ -418,7 +418,10 @@ class GeminiProvider(Provider):
     """
 
     _MAX_OUTPUT_TOKENS = 8000
-    _REQUEST_TIMEOUT = 60
+    # google-genai's HttpOptions.timeout is in MILLISECONDS (the SDK docs state the unit
+    # explicitly). A value of 60 therefore meant a 0.06s request timeout, which caused the
+    # Slot 3 Gemini failures. 120_000 ms = 120 seconds, matching the intended bound.
+    _REQUEST_TIMEOUT = 120_000
 
     def __init__(self, model: str, api_key: str):
         try:
