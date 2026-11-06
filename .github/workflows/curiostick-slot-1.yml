@@ -25,11 +25,12 @@ jobs:
     timeout-minutes: 60
     env:
       SLOT: "1"
-      # ── LLM — Google Gemini (primary scriptwriting engine) ──
-      LLM_PROVIDER: "gemini"
-      LLM_MODEL: "gemini-3.8-flash"
+      # ── LLM — NVIDIA NIM GPT-OSS-20B (OpenAI-compatible) ──
+      LLM_PROVIDER: "custom"
+      LLM_BASE_URL: "https://integrate.api.nvidia.com/v1"
+      NVIDIA_NIM_MODEL: "openai/gpt-oss-20b"
+      NVIDIA_NIM_API_KEY: ${{ secrets.NVIDIA_NIM_API_KEY }}
       LLM_TEMPERATURE: "0.6"
-      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
 
       # ── Fact verification (Phase 2) ──
       RESEARCH_VERIFY: "true"
