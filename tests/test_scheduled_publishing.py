@@ -397,7 +397,7 @@ def test_workflow_files_select_the_correct_slots():
         assert "$GITHUB_STEP_SUMMARY" in text, path                 # readable run summary
         assert 'default: false' in text, path                       # manual dispatch defaults to dry-run
         assert '${{ github.event_name }}" = "schedule"' in text, path  # scheduled runs pass --publish
-        assert 'LLM_MODEL: "gemini-2.5-flash"' in text, path
+        assert 'LLM_MODEL: "gemini-3.8-flash"' in text, path
         assert 'VISUAL_SOURCES: "pixabay,agnes"' in text, path
         assert 'AGNES_IMAGE_MODEL: "agnes-image-2.5-flash"' in text, path
         assert 'TTS_ENGINE: "edge"' in text, path

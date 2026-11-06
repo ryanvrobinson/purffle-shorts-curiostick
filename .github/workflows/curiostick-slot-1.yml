@@ -27,7 +27,7 @@ jobs:
       SLOT: "1"
       # ── LLM — Google Gemini (primary scriptwriting engine) ──
       LLM_PROVIDER: "gemini"
-      LLM_MODEL: "gemini-2.5-flash"
+      LLM_MODEL: "gemini-3.8-flash"
       LLM_TEMPERATURE: "0.6"
       GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
 

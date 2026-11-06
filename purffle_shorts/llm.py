@@ -57,7 +57,7 @@ PRESETS: dict[str, Preset] = {p.name: p for p in [
     Preset("anthropic", "Anthropic (Claude)", "", ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"),
            "claude-opus-5", kind="anthropic"),
     Preset("gemini", "Google Gemini", "", ("GEMINI_API_KEY", "GOOGLE_API_KEY"),
-           "gemini-2.5-flash", kind="gemini"),
+           "gemini-3.8-flash", kind="gemini"),
     Preset("groq", "Groq (Llama, fast)", "https://api.groq.com/openai/v1", ("GROQ_API_KEY",),
            "llama-3.3-70b-versatile"),
     Preset("openrouter", "OpenRouter (hundreds of models)", "https://openrouter.ai/api/v1",
@@ -410,7 +410,7 @@ class GeminiProvider(Provider):
     """Native Google Gemini via the officially supported google-genai SDK.
 
     Reads GEMINI_API_KEY (GOOGLE_API_KEY as fallback) from the environment. The model is configured
-    through GEMINI_MODEL / LLM_MODEL and defaults to gemini-2.5-flash, a currently supported model
+    through GEMINI_MODEL / LLM_MODEL and defaults to gemini-3.8-flash, a currently supported model
     that supports native structured JSON output. Output tokens are capped for cost control, JSON mode
     uses the SDK's response_mime_type/response_schema (not an OpenAI-compatible shim), and API
     failures raise LLMError with a clear, key-free message. This provider never falls back to another

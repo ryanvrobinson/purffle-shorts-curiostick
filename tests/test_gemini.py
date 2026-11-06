@@ -77,9 +77,9 @@ def test_gemini_provider_uses_sdk_and_caps_output_tokens(monkeypatch):
     captured = []
     _install_fake_genai(monkeypatch, captured)
     monkeypatch.setenv("GEMINI_API_KEY", "gem-key-123")
-    p = L.build_provider("gemini", Settings(llm_provider="gemini", llm_model="gemini-2.5-flash"))
+    p = L.build_provider("gemini", Settings(llm_provider="gemini", llm_model="gemini-3.8-flash"))
     assert isinstance(p, L.GeminiProvider)
-    assert p.model == "gemini-2.5-flash"
+    assert p.model == "gemini-3.8-flash"
     out = p.complete("sys", "user", schema={"type": "object"}, max_tokens=12000)
     assert out == '{"ok": true}'
     cfg = captured[-1]["config"]
@@ -96,7 +96,7 @@ def test_gemini_default_model_from_settings(monkeypatch):
     _install_fake_genai(monkeypatch, captured)
     monkeypatch.setenv("GEMINI_API_KEY", "k")
     p = L.build_provider("gemini", Settings(llm_provider="gemini"))
-    assert p.model == "gemini-2.5-flash"  # preset default
+    assert p.model == "gemini-3.8-flash"  # preset default
 
 
 def test_gemini_http_options_timeout_is_120_seconds_not_60_ms(monkeypatch):
@@ -223,7 +223,7 @@ def test_gemini_sanitization_drops_additional_properties(monkeypatch):
     captured = []
     _install_fake_genai(monkeypatch, captured)
     monkeypatch.setenv("GEMINI_API_KEY", "k")
-    p = L.build_provider("gemini", L.Settings(llm_provider="gemini", llm_model="gemini-2.5-flash"))
+    p = L.build_provider("gemini", L.Settings(llm_provider="gemini", llm_model="gemini-3.8-flash"))
     schema = {
         "type": "object",
         "additionalProperties": False,
@@ -294,11 +294,11 @@ def test_gemini_sanitization_preserves_output_structure():
 
 def test_gemini_request_configuration_sends_json_mime_and_sanitized_schema(monkeypatch):
     """The actual SDK GenerateContentConfig carries response_mime_type plus a
-    sanitized response_schema (no additional_properties) for gemini-2.5-flash."""
+    sanitized response_schema (no additional_properties) for gemini-3.8-flash."""
     captured = []
     _install_fake_genai(monkeypatch, captured)
     monkeypatch.setenv("GEMINI_API_KEY", "gem-key-123")
-    p = L.build_provider("gemini", L.Settings(llm_provider="gemini", llm_model="gemini-2.5-flash"))
+    p = L.build_provider("gemini", L.Settings(llm_provider="gemini", llm_model="gemini-3.8-flash"))
     p.complete("sys", "user", schema={"type": "object", "additionalProperties": False}, max_tokens=4000)
     cfg = captured[-1]["config"]
     assert cfg.kwargs["response_mime_type"] == "application/json"
