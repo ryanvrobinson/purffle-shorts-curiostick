@@ -10,9 +10,10 @@ from purffle_shorts.utils import PermanentError
 
 
 class FakeResp:
-    def __init__(self, status=200, data=None):
+    def __init__(self, status=200, data=None, headers=None):
         self.status_code, self._data = status, data or {}
         self.text = str(self._data)
+        self.headers = headers or {}
 
     def json(self):
         return self._data
@@ -449,3 +450,90 @@ def test_nemotron_empty_reply_retries_without_json_mode_and_more_tokens(monkeypa
     assert "response_format" in calls[0]
     assert "response_format" not in calls[1]
     assert calls[1]["max_tokens"] > calls[0]["max_tokens"]
+
+
+def _rate_limited_session(retry_after_seconds: float | None = None,
+                          error_message: str | None = None):
+    """Build a fake HTTP session that returns 429 once, then succeeds."""
+    calls = []
+
+    class S:
+        def post(self, url, json=None, headers=None, timeout=None):
+            calls.append(dict(json=json, headers=headers))
+            if len(calls) == 1:
+                headers = {}
+                if retry_after_seconds is not None:
+                    headers["Retry-After"] = str(retry_after_seconds)
+                data = {"error": {"message": error_message or "rate limit reached"}}
+                return FakeResp(429, data, headers=headers)
+            return _ok()
+
+    return S(), calls
+
+
+def test_groq_429_retry_after_header(monkeypatch):
+    """HTTP 429 with Retry-After header: retry after the suggested wait, then succeed."""
+    session, calls = _rate_limited_session(retry_after_seconds=1.0,
+                                           error_message="Rate limit reached. Please try again in 1 second.")
+    monkeypatch.setattr(L, "http", lambda: session)
+    p = L.OpenAICompatible(L.PRESETS["custom"], "openai/gpt-oss-20b", "k",
+                           "https://api.groq.com/openai/v1")
+    assert p.complete("system", "user") == '{"x": 1}'
+    assert len(calls) == 2, calls  # first 429, then success
+
+
+def test_groq_429_retry_duration_in_message(monkeypatch):
+    """HTTP 429 with retry duration embedded in the error message (no header)."""
+    session, calls = _rate_limited_session(retry_after_seconds=None,
+                                           error_message="Rate limit reached. Please try again in 2.5 seconds.")
+    monkeypatch.setattr(L, "http", lambda: session)
+    p = L.OpenAICompatible(L.PRESETS["custom"], "openai/gpt-oss-20b", "k",
+                           "https://api.groq.com/openai/v1")
+    assert p.complete("system", "user") == '{"x": 1}'
+    assert len(calls) == 2, calls  # first 429, then success
+
+
+def test_groq_429_no_retry_guidance_uses_backoff(monkeypatch):
+    """HTTP 429 without retry guidance: bounded exponential backoff with jitter, then succeed."""
+    session, calls = _rate_limited_session(retry_after_seconds=None,
+                                           error_message="Rate limit reached.")
+    monkeypatch.setattr(L, "http", lambda: session)
+    p = L.OpenAICompatible(L.PRESETS["custom"], "openai/gpt-oss-20b", "k",
+                           "https://api.groq.com/openai/v1")
+    assert p.complete("system", "user") == '{"x": 1}'
+    assert len(calls) == 2, calls  # first 429, then success
+
+
+def test_groq_429_exhausted_retry_budget(monkeypatch):
+    """HTTP 429 on every attempt: raise after exhausting the retry budget."""
+    calls = []
+
+    class S:
+        def post(self, url, json=None, headers=None, timeout=None):
+            calls.append(dict(json=json, headers=headers))
+            return FakeResp(429, {"error": {"message": "rate limit reached"}},
+                            headers={"Retry-After": "1"})
+
+    monkeypatch.setattr(L, "http", lambda: S())
+    p = L.OpenAICompatible(L.PRESETS["custom"], "openai/gpt-oss-20b", "k",
+                           "https://api.groq.com/openai/v1")
+    with pytest.raises(L.LLMError, match="rate limited"):
+        p.complete("system", "user")
+    assert len(calls) == L._MAX_429_RETRIES + 1, calls  # initial + MAX retries
+
+
+def test_groq_non_retryable_errors_not_retried(monkeypatch):
+    """HTTP 401/400 are permanent: not retried, raised immediately."""
+    calls = []
+
+    class S:
+        def post(self, url, json=None, headers=None, timeout=None):
+            calls.append(dict(json=json, headers=headers))
+            return FakeResp(401, {"error": {"message": "invalid API key"}})
+
+    monkeypatch.setattr(L, "http", lambda: S())
+    p = L.OpenAICompatible(L.PRESETS["custom"], "openai/gpt-oss-20b", "k",
+                           "https://api.groq.com/openai/v1")
+    with pytest.raises(PermanentError, match="HTTP 401"):
+        p.complete("system", "user")
+    assert len(calls) == 1, calls  # no retry on auth failure

@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import random
 import re
 import time
 from dataclasses import dataclass
@@ -23,6 +24,45 @@ from .utils import PermanentError, http, raise_for_status, redact, with_retries
 
 log = logging.getLogger("purffle")
 _LLM_REQUEST_TIMEOUT = (10, 120)
+
+# Groq TPM rate-limit (HTTP 429) handling.
+# Bounded retry budget: respect Retry-After or the provider's suggested wait,
+# otherwise use exponential backoff with jitter.
+_MAX_429_RETRIES = 3
+_BASE_429_WAIT = 2.0
+
+
+def _retry_after_seconds(resp, error_text: str) -> float | None:
+    """Parse a retry-after duration in seconds from an HTTP 429 response.
+
+    Checks the ``Retry-After`` response header first, then falls back to
+    parsing a duration from the error message body. Returns ``None`` when no
+    guidance is available, so the caller can fall back to backoff.
+    """
+    if resp is not None:
+        for key in ("Retry-After", "retry-after"):
+            val = resp.headers.get(key)
+            if val:
+                try:
+                    return float(val)
+                except ValueError:
+                    pass
+    # Groq-style messages: "Please try again in 17.97 seconds", etc.
+    for pat in (
+        r"retry after\s+([\d.]+)\s*seconds?",
+        r"try again in\s+([\d.]+)\s*seconds?",
+        r"wait\s+([\d.]+)\s*seconds?",
+        r"([\d.]+)\s*seconds?\s*before\s*retrying",
+        r"rate limit.*?([\d.]+)\s*s\b",
+        r"tpm.*?([\d.]+)\s*seconds?",
+    ):
+        m = re.search(pat, error_text, re.I)
+        if m:
+            try:
+                return float(m.group(1))
+            except ValueError:
+                pass
+    return None
 
 
 class LLMError(RuntimeError):
@@ -283,29 +323,57 @@ class OpenAICompatible(Provider):
         if self.name == "openrouter":
             headers["HTTP-Referer"] = "https://github.com/Chamanrajragu/purffle-shorts"
             headers["X-Title"] = "PurffleShorts"
-        try:
-            started = time.perf_counter()
-            r = http().post(f"{self.base_url}/chat/completions", json=payload, headers=headers,
-                            timeout=_LLM_REQUEST_TIMEOUT)
-            elapsed = time.perf_counter() - started
-            log.debug("%s HTTP %d in %.2fs", self, r.status_code, elapsed)
-            raise_for_status(r, f"{self}")
-        except requests.Timeout as e:
-            elapsed = time.perf_counter() - started
-            raise LLMError(
-                f"{self}: request timed out after {elapsed:.1f}s "
-                f"(connect/read limits {_LLM_REQUEST_TIMEOUT[0]}s/{_LLM_REQUEST_TIMEOUT[1]}s)"
-            ) from e
-        except PermanentError as e:
-            error_msg = str(e)
-            # Some endpoints (e.g. Groq) reject requests that combine response_format
-            # with a model that emits non-strict-JSON (reasoning content, code fences).
-            # Fall back to prompt-only JSON and let extract_json parse the output.
-            if "response_format" in error_msg or "json_validate" in error_msg:
-                self._json_mode = False
-                return self.complete(system, user, schema=schema,
-                                     temperature=temperature, max_tokens=max_tokens)
-            raise
+        attempt = 0
+        while True:
+            try:
+                started = time.perf_counter()
+                r = http().post(f"{self.base_url}/chat/completions", json=payload, headers=headers,
+                                timeout=_LLM_REQUEST_TIMEOUT)
+                elapsed = time.perf_counter() - started
+                log.debug("%s HTTP %d in %.2fs", self, r.status_code, elapsed)
+                raise_for_status(r, f"{self}")
+                break
+            except requests.Timeout as e:
+                elapsed = time.perf_counter() - started
+                raise LLMError(
+                    f"{self}: request timed out after {elapsed:.1f}s "
+                    f"(connect/read limits {_LLM_REQUEST_TIMEOUT[0]}s/{_LLM_REQUEST_TIMEOUT[1]}s)"
+                ) from e
+            except PermanentError as e:
+                error_msg = str(e)
+                # Some endpoints (e.g. Groq) reject requests that combine response_format
+                # with a model that emits non-strict-JSON (reasoning content, code fences).
+                # Fall back to prompt-only JSON and let extract_json parse the output.
+                if "response_format" in error_msg or "json_validate" in error_msg:
+                    self._json_mode = False
+                    return self.complete(system, user, schema=schema,
+                                         temperature=temperature, max_tokens=max_tokens)
+                raise
+            except RuntimeError as e:
+                # raise_for_status raises RuntimeError for retryable HTTP errors
+                # (408, 409, 429, 5xx). Only HTTP 429 rate limits are retried here
+                # with backoff; auth errors, bad requests and other permanent failures
+                # propagate immediately.
+                error_msg = str(e)
+                if "HTTP 429" not in error_msg:
+                    raise
+                if attempt >= _MAX_429_RETRIES:
+                    log.error(
+                        "%s rate limited (HTTP 429) after %d retries, giving up", self,
+                        _MAX_429_RETRIES,
+                    )
+                    raise LLMError(
+                        f"{self}: rate limited (HTTP 429) after {_MAX_429_RETRIES} retries, giving up"
+                    ) from e
+                wait = _retry_after_seconds(r, error_msg)
+                if wait is None:
+                    wait = _BASE_429_WAIT * (2 ** attempt) + random.uniform(0, 0.5)
+                log.warning(
+                    "%s rate limited (HTTP 429), retrying in %.1fs (attempt %d/%d)",
+                    self, wait, attempt + 1, _MAX_429_RETRIES,
+                )
+                time.sleep(wait)
+                attempt += 1
         data = r.json()
         try:
             choice = data["choices"][0]
