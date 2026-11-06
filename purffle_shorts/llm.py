@@ -313,7 +313,10 @@ class OpenAICompatible(Provider):
             payload["max_tokens"] = max_tokens
         if schema is not None and self._json_mode:
             payload["response_format"] = {"type": "json_object"}
-        if (self.name == "custom"
+        # Groq uses max_completion_tokens, not max_tokens.
+        if self.name == "custom" and "api.groq.com" in self.base_url.lower():
+            payload["max_completion_tokens"] = max_tokens
+        elif (self.name == "custom"
                 and "integrate.api.nvidia.com" in self.base_url.lower()
                 and self.model.lower().startswith("openai/gpt-oss-")):
             payload["reasoning_effort"] = "low"
@@ -324,6 +327,7 @@ class OpenAICompatible(Provider):
             headers["HTTP-Referer"] = "https://github.com/Chamanrajragu/purffle-shorts"
             headers["X-Title"] = "PurffleShorts"
         attempt = 0
+        total_429_wait = 0.0
         while True:
             try:
                 started = time.perf_counter()
@@ -368,6 +372,7 @@ class OpenAICompatible(Provider):
                 wait = _retry_after_seconds(r, error_msg)
                 if wait is None:
                     wait = _BASE_429_WAIT * (2 ** attempt) + random.uniform(0, 0.5)
+                total_429_wait += wait
                 log.warning(
                     "%s rate limited (HTTP 429), retrying in %.1fs (attempt %d/%d)",
                     self, wait, attempt + 1, _MAX_429_RETRIES,
@@ -397,8 +402,21 @@ class OpenAICompatible(Provider):
                 )
             reasoning_note = "; reasoning_content is not final output" if message.get("reasoning_content") else ""
             raise LLMError(f"{self}: empty reply (finish_reason={finish_reason}{reasoning_note})")
-        log.debug("%s finish_reason=%s usage=%s content_length=%d",
-                  self, finish_reason, data.get("usage"), len(content))
+        usage = data.get("usage", {}) or {}
+        input_tokens = usage.get("prompt_tokens", 0)
+        output_tokens = usage.get("completion_tokens", 0)
+        reasoning_tokens = 0
+        usage_details = usage.get("completion_tokens_details", {}) or {}
+        if isinstance(usage_details, dict):
+            reasoning_tokens = usage_details.get("reasoning_tokens", 0)
+        log.info(
+            "%s completed in %.2fs: input_tokens=%d output_tokens=%d reasoning_tokens=%d "
+            "finish_reason=%s content_length=%d",
+            self, elapsed, input_tokens, output_tokens, reasoning_tokens,
+            finish_reason, len(content),
+        )
+        if total_429_wait > 0:
+            log.info("%s total 429 wait time: %.2fs", self, total_429_wait)
         return content
 
 
@@ -624,6 +642,8 @@ class LLM:
     def complete_json(self, system: str, user: str, schema: dict | None = None,
                       max_tokens: int = 4000) -> dict[str, Any]:
         errors = []
+        total_started = time.perf_counter()
+        total_attempts = 0
         for p in self.providers:
             nvidia_gpt_oss = (
                 getattr(p, "name", "") == "custom"
@@ -640,6 +660,7 @@ class LLM:
                 if max_tokens < 16000:
                     limits.append(min(max_tokens * 2, 16000))
             for attempt, token_limit in enumerate(limits):
+                total_attempts += 1
                 # The retry is a genuinely different request: drop forced JSON mode (some endpoints
                 # return an empty body when JSON mode is required) and rely on the extract_json
                 # parser instead, on top of the larger token budget. Never the same call twice.
@@ -657,6 +678,13 @@ class LLM:
                     result = extract_json(text)
                     if p is not self.providers[0]:
                         log.info("Used fallback LLM %s", p)
+                    total_elapsed = time.perf_counter() - total_started
+                    log.info(
+                        "%s complete_json in %.2fs: %d attempts, "
+                        "input_words~%d output_words~%d",
+                        self, total_elapsed, total_attempts,
+                        len(system.split()) + len(user.split()), len(str(result).split()),
+                    )
                     return result
                 except Exception as e:
                     message = str(e).lower()

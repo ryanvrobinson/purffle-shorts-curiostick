@@ -72,7 +72,7 @@ def test_offline_script_uses_distinct_queries_for_a_generic_topic():
 
 def test_prompt_mentions_language_and_length():
     system, user = build_prompt("space", "facts", Settings(language="es", target_seconds=30), ["Old title"])
-    assert "Spanish" in user and "78 words" in user and "Old title" in user
+    assert "Spanish" in user and "between 70 and 85 words" in user and "Old title" in user
     assert "JSON" in system
     assert set(SCRIPT_SCHEMA["required"]) >= {"title", "scenes", "hashtags"}
     assert "most surprising well-established fact" in user
@@ -265,3 +265,34 @@ def test_write_script_rejects_undersized_without_recovery():
     with pytest.raises(LLMError, match="incomplete script"):
         write_script(llm, "cats", settings)
     assert len(llm.calls) == 2  # both attempts used, then raised
+
+def test_write_script_rejects_oversized_and_retries():
+    """An oversized initial script is rejected; the retry with a concise prompt produces an in-range script."""
+    settings = Settings(target_seconds=16)
+    words, n_scenes = scene_plan("facts", 16)
+
+    def replies():
+        # First attempt: oversized script (too many words)
+        yield _full_script_data(_scenes_data(n_scenes + 2, words // 2))
+        # Second attempt: in-range script
+        yield _full_script_data(_scenes_data(n_scenes, words // n_scenes))
+
+    llm = _WriteFakeLLM(replies())
+    script = write_script(llm, "cats", settings)
+
+    assert script.title == "X"
+    assert len(script.scenes) == n_scenes
+    assert len(llm.calls) == 2  # first oversized, then in-range
+
+
+def test_write_script_rejects_oversized_without_recovery():
+    """Two oversized attempts in a row raise LLMError."""
+    def replies():
+        yield _full_script_data(_scenes_data(10, 50))  # oversized
+        yield _full_script_data(_scenes_data(10, 50))  # still oversized
+
+    llm = _WriteFakeLLM(replies())
+    settings = Settings(target_seconds=16)
+    with pytest.raises(LLMError, match="overlong script"):
+        write_script(llm, "cats", settings)
+    assert len(llm.calls) == 2

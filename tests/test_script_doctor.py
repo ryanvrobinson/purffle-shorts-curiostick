@@ -119,7 +119,7 @@ def test_doctor_rewrite_with_wrong_length_is_ignored():
     llm = FakeLLM({"score": 40, "issues": ["too long"], "script": {"title": "Bloated", "scenes": _scenes(30, 20)}})
     with pytest.raises(ScriptQualityError, match="rendering was stopped"):
         review_script(llm, _draft(), Settings(target_seconds=16))
-    assert len(llm.calls) == 3
+    assert len(llm.calls) == 2
 
 
 def test_doctor_stops_after_bounded_attempts_if_score_stays_low():
@@ -129,9 +129,9 @@ def test_doctor_stops_after_bounded_attempts_if_score_stays_low():
         {"score": 55, "issues": ["Still vague"], "script": None},
     ])
     llm = FakeLLM(lambda user: next(replies))
-    with pytest.raises(ScriptQualityError, match="55.*70.*3 bounded rewrite"):
+    with pytest.raises(ScriptQualityError, match="68.*70.*2 bounded rewrite"):
         review_script(llm, _draft(), Settings(script_quality_threshold=70))
-    assert len(llm.calls) == 3
+    assert len(llm.calls) == 2
 
 
 def test_final_low_score_stops_make_before_rendering(tmp_path, monkeypatch):
@@ -175,7 +175,7 @@ def test_final_low_score_stops_make_before_rendering(tmp_path, monkeypatch):
     result = studio.make(topic="neutron stars", upload=False)
 
     assert not result.ok and "below the 90-point threshold" in result.error
-    assert llm.reviews == 3
+    assert llm.reviews == 2
 
 
 def test_low_score_gets_one_bounded_second_review():
@@ -228,7 +228,7 @@ def test_in_bounds_rewrite_without_score_gain_is_not_adopted():
     llm = FakeLLM(replies)
     with pytest.raises(ScriptQualityError, match="rendering was stopped"):
         review_script(llm, _draft(), Settings(target_seconds=16, script_quality_threshold=70))
-    assert len(llm.calls) == 3  # bounded retries happened, lower-score rewrite not adopted
+    assert len(llm.calls) == 2  # bounded retries happened, lower-score rewrite not adopted
 
 
 def test_doctor_failure_never_fails_the_video():
@@ -367,10 +367,10 @@ def test_both_rewrites_undersized_produces_clear_error_and_bounds_calls():
     llm = FakeLLM(replies)
     with pytest.raises(
         ScriptQualityError,
-        match="below the 70-point threshold after 3 bounded rewrite",
+        match="below the 70-point threshold after 2 bounded rewrite",
     ):
         review_script(llm, _curio_stick_draft(), settings)
-    assert len(llm.calls) == 3  # bounded, no endless retrying
+    assert len(llm.calls) == 2  # bounded, no endless retrying
 
 
 def test_rewrite_without_narration_is_ignored_then_retry_restores_narration():
@@ -471,4 +471,4 @@ def test_rewrite_keeps_blocking_issues_produces_clear_blocking_error():
         match="unresolved blocking factual/safety/usability issues",
     ):
         review_script(llm, _draft(), settings)
-    assert len(llm.calls) == 3  # bounded, no endless retrying
+    assert len(llm.calls) == 2  # bounded, no endless retrying

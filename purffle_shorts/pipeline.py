@@ -202,11 +202,17 @@ class Studio:
             self._step("script", pick.subject)
             insights = analytics.insights(self.history) if s.learn_from_stats else ""
             llm = self._llm_or_none()
+            script_started = time.perf_counter()
             script = write_script(llm, pick.subject, s, source=pick.source, avoid=self.history.recent_titles(),
                                   context=pick.context, style=style or pick.style or None, insights=insights)
+            script_took = time.perf_counter() - script_started
+            log.info("Initial script generation: %.2fs", script_took)
             if llm is not None and s.script_review != "off":
                 self._step("review", "Script Doctor")
+                review_started = time.perf_counter()
                 script = review_script(llm, script, s)
+                review_took = time.perf_counter() - review_started
+                log.info("Script Doctor: %.2fs", review_took)
             if llm is not None and s.research_verify:
                 self._step("research", "fact verification")
                 claims = research.extract_claims_from_script(script, s.language)
@@ -269,8 +275,11 @@ class Studio:
         (folder / "script.json").write_text(json.dumps(script.to_dict(), indent=2, ensure_ascii=False), encoding="utf-8")
         try:
             self._step("voice", f"{s.tts_engine} voice")
+            voice_started = time.perf_counter()
             speech = self._speak(script, work, s)
+            voice_took = time.perf_counter() - voice_started
             total = round(speech.duration + END_PAD, 3)
+            log.info("TTS: %.2fs (audio %.1fs + pad)", voice_took, speech.duration)
 
             # Pre-render duration guard: if the spoken audio already exceeds the
             # QC maximum, attempt a meaning-preserving script reduction before
@@ -325,6 +334,7 @@ class Studio:
                 media = _media_for(timeline, media_map)
                 credits = set(credits or ())
             else:
+                media_started = time.perf_counter()
                 jobs = [(script.scenes[st.index].search_query, script.scenes[st.index].image_prompt,
                          st.duration + T, script.scenes[st.index].narration) for st in timeline]
                 visuals = Visuals(s, self.history.used_media())
@@ -335,12 +345,13 @@ class Studio:
                 generated = sum(m.kind == "image" and m.source in AI_SOURCES for m in media)
                 photos = sum(m.kind == "image" and m.source not in AI_SOURCES for m in media)
                 fallbacks = sum(m.kind == "generated" for m in media)
+                media_took = time.perf_counter() - media_started
                 log.info("Visuals: %d video, %d generated image%s, %d stock photo%s, %d fallback background%s "
-                         "(mode: %s; sources: %s)",
+                         "(mode: %s; sources: %s; %.2fs)",
                          videos, generated, "" if generated == 1 else "s",
                          photos, "" if photos == 1 else "s",
                          fallbacks, "" if fallbacks == 1 else "s",
-                         s.visual_mode, ", ".join(s.visual_sources))
+                         s.visual_mode, ", ".join(s.visual_sources), media_took)
                 missing = [m for m in media if m.kind == "generated"]
                 if missing:
                     log.warning("%d of %d scenes have no real visual — those scenes use an animated gradient. "
@@ -368,7 +379,10 @@ class Studio:
 
             self._step("render", f"{s.width}x{s.height}")
             video = folder / ("short.mp4" if s.vertical else "video.mp4")
+            render_started = time.perf_counter()
             render_video(s, media, [st.duration for st in timeline], speech.audio, total, plan, video, work)
+            render_took = time.perf_counter() - render_started
+            log.info("Render: %.2fs", render_took)
 
             self._step("check")
             info = ffmpeg.probe(video)
@@ -464,7 +478,7 @@ class Studio:
                 self.history.link_idea(pick.idea_id, rid)
 
             took = time.time() - t0
-            log.info("Rendered %s (%.1fs video) in %.0fs -> %s", title, info["duration"], took, video)
+            log.info("Rendered %s (%.1fs video) in %.0fs total -> %s", title, info["duration"], took, video)
             result = Result(True, title, folder, video, "rendered", seconds=took, record_id=rid,
                             score=script.score, language=s.language)
             if upload:

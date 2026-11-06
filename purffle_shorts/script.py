@@ -256,7 +256,7 @@ Audience: {settings.audience}
 Language: {lang} for narration, title, hook_text, cast and description. search_query and image_prompt are ALWAYS English.
 
 {ctx}{ins}{avoid_block}Rules:
-- Total narration about {words} words (~{settings.target_seconds} seconds spoken), split into about {n_scenes} scenes. Use 25–35 seconds when that fully serves the story; do not pad or omit necessary explanation.
+- Total narration between {int(words * 0.9)} and {int(words * 1.1)} words (~{settings.target_seconds} seconds spoken), split into exactly {n_scenes} scenes.
 {_format_rules(style)}- Open with the most surprising well-established fact the story can support, or a precise curiosity gap if no such fact is available. No greeting, "Did you know?", or throat-clearing.
 - The first narration and first visual must show the same concrete subject; name the subject or its consequence immediately, not a vague phrase such as "a cosmic transformation."
 - Keep every scientific claim supportable. Never invent quotations, statistics, discoveries, or certainty; frame hypotheticals as hypothetical.
@@ -273,7 +273,9 @@ Language: {lang} for narration, title, hook_text, cast and description. search_q
 - description: a concise, accurate summary and one relevant question. No hashtags.
 - hashtags: 3-5 relevant hashtags. tags: 8-15 search keywords.
 - category: one of {", ".join(CATEGORIES)}.
-{src_rule}Return JSON with keys: topic, title, hook_text, angle, hooks (exactly three strings), selected_hook, cast, scenes (array of {{speaker, narration, search_query, image_prompt, visual_description}}), description, hashtags, tags, category, sources (when background information was supplied)."""
+{src_rule}Return JSON with keys: topic, title, hook_text, angle, hooks (exactly three strings), selected_hook, cast, scenes (array of {{speaker, narration, search_query, image_prompt, visual_description}}), description, hashtags, tags, category, sources (when background information was supplied).
+- HARD LIMIT: Narration total must stay within {int(words * 0.9)}–{int(words * 1.1)} words across exactly {n_scenes} scenes. No filler, no padding, no extra scenes.
+"""
     return system, user
 
 
@@ -490,10 +492,10 @@ def review_prompt(script: Script, settings: Settings, rewrite: bool,
     the same JSON structure and between {lo} and {hi} words (target {words}) in {n_scenes} scenes. Do not pad or cut
     scenes to hit the count; keep the same information density. Preserve scene order and a
     coherent progression from hook to payoff. Make the opening a specific, scientifically
-    defensible question or consequence. Fix every issue you listed: sharpen the hook, cut filler, make
-    vague lines concrete, remove any claim that may not be true, keep the payoff for the end, and end with a
-    short call to action. Do not invent facts, statistics, studies, or certainty. Put the rewritten script in "script".
-Format rules to keep:
+    defensible question or consequence. Fix ONLY the issues listed above — do not rewrite scenes that are
+already good. Sharpen the hook, cut filler, make vague lines concrete, remove any claim that may not be true,
+keep the payoff for the end. Do not invent facts, statistics, studies, or certainty. Put the rewritten script
+in "script". Format rules to keep:
 {_format_rules(script.style)}""" if rewrite else
             'Return only "score" and "issues".')
     parts = [
@@ -538,7 +540,7 @@ class ScriptQualityError(RuntimeError):
 # --------------------------------------------------------------------------------------
 
 DOCTOR_TARGET_SCORE = 90          # acceptance target: a script must score 90/100 to be rendered
-DOCTOR_MAX_REWRITES = 3           # at most three targeted rewrite attempts per draft
+DOCTOR_MAX_REWRITES = 2           # at most two targeted rewrite attempts per draft
 
 RUBRIC: tuple[tuple[str, int, str], ...] = (
     ("hook_strength", 20, "hook strength in the first two seconds — specific, scroll-stopping, honest"),
