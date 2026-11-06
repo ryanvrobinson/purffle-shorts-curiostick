@@ -32,7 +32,7 @@ jobs:
           python-version: "3.12"
 
       - name: Install project dependencies
-        run: pip install -e ".[dev]"
+        run: pip install -e ".[dev]" jsonschema>=4
 
       - name: Run Groq diagnostic tests
         env:
