@@ -398,11 +398,13 @@ def test_workflow_files_select_the_correct_slots():
         assert 'default: false' in text, path                       # manual dispatch defaults to dry-run
         assert '${{ github.event_name }}" = "schedule"' in text, path  # scheduled runs pass --publish
         assert 'LLM_PROVIDER: "custom"' in text, path
-        assert 'LLM_BASE_URL: "https://integrate.api.nvidia.com/v1"' in text, path
-        assert 'NVIDIA_NIM_MODEL: "nvidia/nemotron-3.5-lightning-30b-a3b"' in text, path
-        assert '${{ secrets.NVIDIA_NIM_API_KEY }}' in text, path
+        assert 'LLM_BASE_URL: "https://api.groq.com/openai/v1"' in text, path
+        assert 'GROQ_MODEL: "openai/gpt-oss-20b"' in text, path
+        assert '${{ secrets.GROQ_API_KEY }}' in text, path
         assert 'LLM_TEMPERATURE: "0.6"' in text, path
         assert 'GEMINI_API_KEY' not in text, path
+        assert 'NVIDIA_NIM_API_KEY' not in text, path
+        assert 'NVIDIA_NIM_MODEL' not in text, path
         assert 'VISUAL_SOURCES: "pixabay,agnes"' in text, path
         assert 'AGNES_IMAGE_MODEL: "agnes-image-2.5-flash"' in text, path
         assert 'TTS_ENGINE: "edge"' in text, path
