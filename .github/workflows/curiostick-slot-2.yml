@@ -33,6 +33,7 @@ jobs:
 
       # ── Fact verification (Phase 2) ──
       RESEARCH_VERIFY: "true"
+      LEARN_FROM_STATS: "true"
 
       # ── Visual sources — Pixabay stock + Agnes AI images, suitability choice ──
       VISUAL_SOURCES: "pixabay,agnes"
@@ -43,14 +44,14 @@ jobs:
       AGNES_API_KEY: ${{ secrets.AGNES_API_KEY }}
       AGNES_IMAGE_MODEL: "agnes-image-2.5-flash"
 
-      # ── Output — 45s vertical 1080x1920 @ 30 FPS ──
-      TARGET_SECONDS: "45"
+      # ── Output — 30s initial target, vertical 1080x1920 @ 30 FPS ──
+      TARGET_SECONDS: "30"
       ASPECT: "9:16"
       RESOLUTION: "1080x1920"
       FPS: "30"
 
       # ── Niches — CurioStick identity: Earth/space/nature mysteries ──
-      NICHES: "geography,geology,unusual Earth features,natural mysteries"
+      NICHES: "Earth's strangest geological features,Chicxulub and dinosaur extinction,deep-ocean discoveries and mysteries,geological anomalies and ancient landforms,rare natural phenomena,massive impacts and asteroid scars,planetary mysteries and cosmic events"
       TIMEZONE: "Asia/Kolkata"
       TTS_ENGINE: "edge"
 
@@ -62,6 +63,7 @@ jobs:
       YT_DAILY_LIMIT: "6"
       SYNTHETIC_MEDIA: "true"
       KEEP_VIDEOS: "true"
+      WATERMARK: "CurioStick"
 
     steps:
       - uses: actions/checkout@v4

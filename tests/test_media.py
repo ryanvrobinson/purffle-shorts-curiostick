@@ -419,7 +419,7 @@ def test_build_agnes_prompt_includes_narration_and_visuals():
         topic="octopus",
     )
     assert "octopus swimming in deep ocean" in prompt
-    assert "Scene narrative: The octopus has three hearts" in prompt
+    assert "Scene context: The octopus has three hearts" in prompt
     assert "documentary cinematography" in prompt
     assert "eye-level medium shot" in prompt
     assert "golden hour lighting" in prompt
@@ -446,7 +446,7 @@ def test_build_agnes_prompt_includes_topic_subject():
         topic="Hoodoo formations at Bryce Canyon",
     )
     assert "Hoodoo formations at Bryce Canyon" in prompt
-    assert "Scene narrative: A rare mineral glows" in prompt
+    assert "Scene context: A rare mineral glows" in prompt
 
 
 def test_build_agnes_prompt_visual_description_takes_precedence_over_topic():

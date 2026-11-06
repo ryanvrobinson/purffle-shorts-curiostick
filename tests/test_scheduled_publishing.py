@@ -24,10 +24,14 @@ from purffle_shorts.automation import (
 )
 from purffle_shorts.config import Settings
 from purffle_shorts.history import History
-from purffle_shorts.pipeline import Result, Studio
+from purffle_shorts.pipeline import Result
 from purffle_shorts.quality import QualityCheck, QualityReport
 
 IST = ZoneInfo("Asia/Kolkata")
+
+
+def future_run_date() -> str:
+    return (datetime.now(IST).date() + timedelta(days=2)).isoformat()
 
 
 def test_all_three_ist_slots_convert_to_the_right_utc_times():
@@ -167,7 +171,9 @@ def test_private_upload_with_future_publish_at(tmp_path, monkeypatch):
 
     settings = Settings(output_dir=str(tmp_path / "out"), data_dir=str(tmp_path / "data"),
                         upload=False, timezone="Asia/Kolkata")
-    auto = SlotAutomation(settings, slot=1, run_date="2026-11-01",
+    run_date = future_run_date()
+    expected_publish_at = Y.to_rfc3339(slot_publish_moments(run_date)[1])
+    auto = SlotAutomation(settings, slot=1, run_date=run_date,
                           dry_run=False, studio=studio, history=history)
     # Patch the quality gate so the fake video "passes" without ffmpeg.
     monkeypatch.setattr("purffle_shorts.automation.QualityGate",
@@ -178,14 +184,14 @@ def test_private_upload_with_future_publish_at(tmp_path, monkeypatch):
     assert result.ok is True
     assert result.uploaded is True
     assert result.youtube_id == "vid-slot-1"
-    assert result.publish_at_utc == "2026-11-01T03:30:00Z"
+    assert result.publish_at_utc == expected_publish_at
     assert result.dry_run is False
     assert len(studio.upload_calls) == 1
     rid, publish_at, slot, run_date = studio.upload_calls[0]
-    assert slot == 1 and run_date == "2026-11-01"
-    assert Y.to_rfc3339(publish_at) == "2026-11-01T03:30:00Z"   # future IST slot, in UTC
+    assert slot == 1 and run_date == auto.run_date
+    assert Y.to_rfc3339(publish_at) == expected_publish_at
     # The slot is durably recorded with its YouTube id.
-    assert history.is_slot_done("2026-11-01-slot-1") is True
+    assert history.is_slot_done(slot_key(run_date, 1)) is True
 
 
 def test_build_body_scheduled_is_private_with_future_publish_at():
@@ -210,7 +216,7 @@ def test_duplicate_slot_is_not_uploaded_twice(tmp_path, monkeypatch):
 
     settings = Settings(output_dir=str(tmp_path / "out"), data_dir=str(tmp_path / "data"),
                         upload=False, timezone="Asia/Kolkata")
-    auto = SlotAutomation(settings, slot=2, run_date="2026-11-01",
+    auto = SlotAutomation(settings, slot=2, run_date=future_run_date(),
                           dry_run=False, studio=studio, history=history)
 
     r1 = auto.run_slot()
@@ -235,7 +241,7 @@ def test_dry_run_never_publishes(tmp_path, monkeypatch):
 
     settings = Settings(output_dir=str(tmp_path / "out"), data_dir=str(tmp_path / "data"),
                         upload=False, timezone="Asia/Kolkata")
-    auto = SlotAutomation(settings, slot=1, run_date="2026-11-01",
+    auto = SlotAutomation(settings, slot=1, run_date=future_run_date(),
                           dry_run=True, studio=studio, history=history)
     result = auto.run_slot()
 
@@ -280,7 +286,8 @@ def test_quality_failure_blocks_upload_and_saves_details(tmp_path, monkeypatch):
 
     settings = Settings(output_dir=str(tmp_path / "out"), data_dir=str(tmp_path / "data"),
                         upload=False, timezone="Asia/Kolkata")
-    auto = SlotAutomation(settings, slot=3, run_date="2026-11-01",
+    run_date = future_run_date()
+    auto = SlotAutomation(settings, slot=3, run_date=run_date,
                           dry_run=False, studio=studio, history=history)
     result = auto.run_slot()
 
@@ -288,7 +295,7 @@ def test_quality_failure_blocks_upload_and_saves_details(tmp_path, monkeypatch):
     assert result.uploaded is False
     assert calls == []  # upload never attempted
     assert "aspect_ratio" in result.error
-    failure_file = tmp_path / "data" / "failures" / "2026-11-01-slot-3.json"
+    failure_file = tmp_path / "data" / "failures" / f"{run_date}-slot-3.json"
     assert failure_file.exists()
     payload = json.loads(failure_file.read_text(encoding="utf-8"))
     assert payload["slot"] == 3
@@ -307,7 +314,7 @@ def test_missing_credentials_are_recorded_not_crashed(tmp_path, monkeypatch):
 
     settings = Settings(output_dir=str(tmp_path / "out"), data_dir=str(tmp_path / "data"),
                         upload=False, timezone="Asia/Kolkata")
-    auto = SlotAutomation(settings, slot=1, run_date="2026-11-01",
+    auto = SlotAutomation(settings, slot=1, run_date=future_run_date(),
                           dry_run=False, studio=studio, history=history)
     studio.fail_upload = Y.NotAuthorized("token missing")
     result = auto.run_slot()
@@ -390,6 +397,14 @@ def test_workflow_files_select_the_correct_slots():
         assert "$GITHUB_STEP_SUMMARY" in text, path                 # readable run summary
         assert 'default: false' in text, path                       # manual dispatch defaults to dry-run
         assert '${{ github.event_name }}" = "schedule"' in text, path  # scheduled runs pass --publish
+        assert 'LLM_MODEL: "gemini-2.5-flash"' in text, path
+        assert 'VISUAL_SOURCES: "pixabay,agnes"' in text, path
+        assert 'AGNES_IMAGE_MODEL: "agnes-image-2.5-flash"' in text, path
+        assert 'TTS_ENGINE: "edge"' in text, path
+        assert 'YT_PRIVACY: "private"' in text, path
+        assert 'KEEP_VIDEOS: "true"' in text, path
+        assert 'WATERMARK: "CurioStick"' in text, path
+        assert 'TARGET_SECONDS: "30"' in text, path
 
 
 def test_workflow_cron_matches_ist_publish_time():

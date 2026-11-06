@@ -45,6 +45,13 @@ CREATE TABLE IF NOT EXISTS slot_uploads (
     updated_at TEXT,
     error TEXT
 );
+CREATE TABLE IF NOT EXISTS analytics_metrics (
+    youtube_id TEXT PRIMARY KEY,
+    views INTEGER, likes INTEGER, subscribers_gained INTEGER,
+    stayed_to_watch REAL, average_view_duration REAL, average_percentage_viewed REAL,
+    topic_category TEXT, video_duration REAL,
+    imported_at TEXT NOT NULL, source_file TEXT NOT NULL
+);
 """
 
 # Columns added after 2.0; existing databases get them on open.
@@ -173,6 +180,28 @@ class History:
         return self._all(
             "SELECT id, title, style, views, likes, comments FROM videos WHERE views IS NOT NULL "
             f"AND COALESCE(publish_at, uploaded_at) <= ? ORDER BY views {order} LIMIT ?", (cutoff, n))
+
+    def set_analytics_metrics(self, youtube_id: str, metrics: dict, source_file: str) -> None:
+        columns = (
+            "views", "likes", "subscribers_gained", "stayed_to_watch", "average_view_duration",
+            "average_percentage_viewed", "topic_category", "video_duration",
+        )
+        values = [metrics.get(col) for col in columns]
+        assignments = ", ".join(f"{col}=COALESCE(excluded.{col}, analytics_metrics.{col})" for col in columns)
+        self._exec(
+            "INSERT INTO analytics_metrics (youtube_id, views, likes, subscribers_gained, stayed_to_watch, "
+            "average_view_duration, average_percentage_viewed, topic_category, video_duration, imported_at, "
+            "source_file) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+            f"ON CONFLICT(youtube_id) DO UPDATE SET {assignments}, "
+            "imported_at=excluded.imported_at, source_file=excluded.source_file",
+            (youtube_id, *values, now_iso(), source_file),
+        )
+
+    def analytics_metrics(self) -> list[dict]:
+        return self._all(
+            "SELECT am.*, v.title, v.topic, v.style, v.duration AS recorded_duration "
+            "FROM analytics_metrics am LEFT JOIN videos v ON v.youtube_id = am.youtube_id "
+            "ORDER BY am.imported_at DESC")
 
     # -- idea queue (planner) --
     def add_idea(self, subject: str, style: str = "", notes: str = "") -> int:

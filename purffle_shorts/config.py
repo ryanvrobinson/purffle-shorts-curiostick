@@ -12,26 +12,13 @@ from dataclasses import dataclass, field, fields, replace
 from pathlib import Path
 
 DEFAULT_NICHES = [
-    "mind-blowing science facts",
-    "unsolved mysteries",
-    "dark history",
-    "space and the universe",
-    "psychology tricks",
-    "true crime cases",
-    "future technology and AI",
-    "money and finance tips",
-    "animal superpowers",
-    "ancient civilizations",
-    "the human body",
-    "strange but true facts",
-    "famous inventions and inventors",
-    "ocean mysteries",
-    "self-improvement and productivity",
-    "cars and engineering",
-    "video game history",
-    "weird laws around the world",
-    "survival facts",
-    "motivational stories",
+    "Earth's strangest geological features",
+    "Chicxulub and dinosaur extinction",
+    "deep-ocean discoveries and mysteries",
+    "geological anomalies and ancient landforms",
+    "rare natural phenomena",
+    "massive impacts and asteroid scars",
+    "planetary mysteries and cosmic events",
 ]
 
 
@@ -127,7 +114,7 @@ class Settings:
     trends_geo: str = "US"
     style: str = "auto"               # auto|facts|story|listicle|myth|quiz|motivational|news|explainer|dialogue|chat
     language: str = "en"
-    target_seconds: int = 40
+    target_seconds: int = 30
     channel_name: str = "PurffleStudios"
     audience: str = "curious general audience"
     rss_feeds: list[str] = field(default_factory=list)   # for TOPIC_SOURCES=rss

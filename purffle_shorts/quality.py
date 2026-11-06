@@ -15,15 +15,18 @@ from __future__ import annotations
 
 import json
 import logging
-import math
 import re
 import subprocess
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from . import ffmpeg
 from .config import ASPECTS, Settings, duration_window
+
+if TYPE_CHECKING:
+    from .pipeline import Result
 
 log = logging.getLogger("purffle")
 
@@ -135,6 +138,7 @@ class QualityGate:
 
         # 6. Missing audio / corrupted file (automated, part of streams)
         checks.append(self._check_audio_present(result.video))
+        checks.append(self._check_audio_audible(result.video))
 
         # 7. Black-frame detection (automated)
         checks.append(self._check_black_frames(result.video))
@@ -154,13 +158,18 @@ class QualityGate:
         # 12. Metadata file exists and is valid (automated)
         checks.append(self._check_metadata(result.folder))
 
-        # 13. Research verification present (automated)
+        # 13. Script narration and scene-to-visual mapping are complete (automated)
+        checks.append(self._check_script_complete(result.folder))
+        checks.append(self._check_hook(result.folder))
+        checks.append(self._check_scene_visual_mapping(result.folder))
+
+        # 14. Research verification present (automated)
         checks.append(self._check_research_verification(result))
 
-        # 14. Attribution present for stock visuals (automated)
+        # 15. Attribution present for stock visuals (automated)
         checks.append(self._check_attribution(result))
 
-        # 15. Render completed successfully (automated)
+        # 16. Render completed successfully (automated)
         checks.append(self._check_render_status(result))
 
         all_passed = all(c.passed for c in checks if c.method == "automated")
@@ -308,6 +317,83 @@ class QualityGate:
         except Exception as e:
             return QualityCheck("metadata", False, f"Failed to read metadata: {e}")
 
+    def _check_script_complete(self, folder: Path | None) -> QualityCheck:
+        if not folder:
+            return QualityCheck("script_complete", False, "No folder path provided")
+        path = folder / "script.json"
+        if not path.exists():
+            return QualityCheck("script_complete", False, "script.json not found")
+        try:
+            script = json.loads(path.read_text(encoding="utf-8"))
+            scenes = script.get("scenes")
+            if not script.get("topic") or not script.get("title") or not isinstance(scenes, list) or not scenes:
+                return QualityCheck("script_complete", False, "Script needs a topic, title and at least one scene")
+            missing = [
+                i + 1 for i, scene in enumerate(scenes)
+                if not scene.get("narration", "").strip()
+                or not scene.get("search_query", "").strip()
+                or not scene.get("image_prompt", "").strip()
+            ]
+            if missing:
+                return QualityCheck("script_complete", False,
+                                    f"Scene(s) {', '.join(map(str, missing))} lack narration or visual prompts")
+            return QualityCheck("script_complete", True, f"Complete script with {len(scenes)} scene(s)")
+        except (OSError, json.JSONDecodeError, AttributeError, TypeError) as e:
+            return QualityCheck("script_complete", False, f"Script could not be validated: {e}")
+
+    def _check_scene_visual_mapping(self, folder: Path | None) -> QualityCheck:
+        if not folder:
+            return QualityCheck("scene_visual_mapping", False, "No folder path provided")
+        script_path, metadata_path = folder / "script.json", folder / "metadata.json"
+        if not script_path.exists() or not metadata_path.exists():
+            return QualityCheck("scene_visual_mapping", False, "Script or video metadata is missing")
+        try:
+            script = json.loads(script_path.read_text(encoding="utf-8"))
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            scenes = script.get("scenes") or []
+            visuals = metadata.get("visuals") or []
+            if not scenes or len(scenes) != len(visuals):
+                return QualityCheck(
+                    "scene_visual_mapping", False,
+                    f"Expected one selected visual per narration scene; found {len(visuals)} for {len(scenes)} scene(s)",
+                )
+            missing = [
+                i + 1 for i, (scene, visual) in enumerate(zip(scenes, visuals))
+                if not scene.get("narration", "").strip()
+                or not scene.get("image_prompt", "").strip()
+                or not visual.get("source")
+                or not visual.get("kind")
+                or not visual.get("query", "").strip()
+            ]
+            if missing:
+                return QualityCheck("scene_visual_mapping", False,
+                                    f"Scene(s) {', '.join(map(str, missing))} lack a recorded visual selection")
+            return QualityCheck(
+                "scene_visual_mapping", True,
+                f"Recorded a visual prompt and selected asset for each of {len(scenes)} scene(s)",
+                details={"method": "automated", "scene_count": len(scenes)},
+            )
+        except (OSError, json.JSONDecodeError, AttributeError, TypeError) as e:
+            return QualityCheck("scene_visual_mapping", False, f"Scene visual mapping could not be validated: {e}")
+
+    def _check_hook(self, folder: Path | None) -> QualityCheck:
+        if not folder:
+            return QualityCheck("script_hook", False, "No folder path provided")
+        path = folder / "script.json"
+        if not path.exists():
+            return QualityCheck("script_hook", False, "script.json not found")
+        try:
+            scenes = json.loads(path.read_text(encoding="utf-8")).get("scenes") or []
+            if not scenes or not scenes[0].get("narration", "").strip():
+                return QualityCheck("script_hook", False, "Opening scene has no narration")
+            opening = scenes[0]["narration"].strip()
+            if re.match(r"^(?:did you know\b|welcome back\b|hello\b|hi everyone\b|hey everyone\b)", opening, re.I):
+                return QualityCheck("script_hook", False,
+                                    "Opening uses a greeting or generic 'Did you know?' hook")
+            return QualityCheck("script_hook", True, "Opening narration starts directly with the story")
+        except (OSError, json.JSONDecodeError, AttributeError, TypeError) as e:
+            return QualityCheck("script_hook", False, f"Opening hook could not be validated: {e}")
+
     def _check_render_status(self, result: Result) -> QualityCheck:
         """Check that render completed successfully (status is 'rendered')."""
         if result.status == "rendered":
@@ -334,6 +420,30 @@ class QualityGate:
         except Exception as e:
             return QualityCheck("audio_present", False, f"Audio check failed: {e}",
                                 details={"method": "automated"})
+
+    def _check_audio_audible(self, video_path: Path) -> QualityCheck:
+        """Reject digital silence or effectively inaudible audio tracks before scheduling."""
+        try:
+            proc = subprocess.run(
+                [
+                    ffmpeg.ffmpeg_bin(), "-hide_banner", "-nostdin", "-i", str(video_path),
+                    "-vn", "-af", "volumedetect", "-f", "null", "-",
+                ],
+                capture_output=True, text=True, timeout=120,
+            )
+            if proc.returncode:
+                return QualityCheck("audio_audible", False,
+                                    f"Audio level analysis failed: {proc.stderr[-500:]}")
+            match = re.search(r"max_volume:\s*(-inf|-?\d+(?:\.\d+)?)\s*dB", proc.stderr)
+            if not match:
+                return QualityCheck("audio_audible", False, "FFmpeg did not report an audio peak level")
+            peak = match.group(1)
+            if peak == "-inf" or float(peak) <= -60:
+                return QualityCheck("audio_audible", False,
+                                    f"Audio is silent or effectively inaudible (peak {peak} dBFS)")
+            return QualityCheck("audio_audible", True, f"Audio signal detected (peak {peak} dBFS)")
+        except (OSError, subprocess.SubprocessError) as e:
+            return QualityCheck("audio_audible", False, f"Audio level check failed: {e}")
 
     def _check_black_frames(self, video_path: Path) -> QualityCheck:
         """Detect black frames using ffmpeg's blackdetect filter (automated)."""

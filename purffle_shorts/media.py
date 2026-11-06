@@ -103,7 +103,7 @@ def build_agnes_prompt(
         subject = f"{topic}: {narration[:200]}".strip()
     else:
         subject = narration[:300].strip()
-    narration_context = f" Scene narrative: {narration[:200]}." if narration and narration != subject else ""
+    narration_context = f" Scene context: {narration[:200]}." if narration and narration != subject else ""
 
     # Cinematic base style for visual identity coherence.
     style = AGNES_STYLE_MODIFIERS.get(

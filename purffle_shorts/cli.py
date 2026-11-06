@@ -506,6 +506,16 @@ def cmd_stats(args, s: Settings) -> int:
     return 0
 
 
+def cmd_analytics_import(args, s: Settings) -> int:
+    from .analytics import import_csv
+    from .history import History
+
+    history = History(s.data_path / "history.db")
+    result = import_csv(args.csv_file, history)
+    print(f"Imported analytics for {result.imported} video(s); skipped {result.skipped} row(s).")
+    return 0 if result.imported else 1
+
+
 def cmd_mcp(args, s: Settings) -> int:
     from .mcp_server import Server
     Server(s).serve()
@@ -632,6 +642,11 @@ def build_parser() -> argparse.ArgumentParser:
     stt.add_argument("--env-file")
     stt.add_argument("-v", "--verbose", action="store_true")
     stt.set_defaults(func=cmd_stats)
+
+    ai = sub.add_parser("analytics-import", help="import a YouTube Studio analytics CSV export")
+    ai.add_argument("csv_file", metavar="CSV_FILE", help="CSV with a Video ID column and available metrics")
+    ai.add_argument("--env-file")
+    ai.set_defaults(func=cmd_analytics_import)
 
     mc = sub.add_parser("mcp", help="run as an MCP server (stdio) for Claude Desktop, Claude Code, Cursor...")
     mc.add_argument("--env-file")

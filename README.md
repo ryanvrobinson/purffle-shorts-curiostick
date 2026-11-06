@@ -343,6 +343,16 @@ YOUTUBE_API_KEY=...        # optional: reads public stats without asking for mor
 
 `purffle-shorts stats` (and the Studio's Channel page) can read view, like and comment counts of uploaded videos. With `LEARN_FROM_STATS=true`, new ideas may be informed by this data. Without `YOUTUBE_API_KEY`, run `auth` again to grant read access.
 
+The existing YouTube OAuth integration does not request the YouTube Analytics API scope, so retention metrics are never assumed to be available automatically. To import a YouTube Studio CSV export with a `Video ID` column, run:
+
+```bash
+purffle-shorts analytics-import path/to/analytics.csv
+```
+
+Available views, likes, subscribers gained, stayed-to-watch, average view duration, average percentage viewed, topic/category and duration metrics are stored locally in `data/history.db`. When at least three imported videos have a metric, `LEARN_FROM_STATS=true` adds the channel's own median as descriptive context—not as a target—to future scripts.
+
+To make imported metrics available to scheduled GitHub Actions runs, commit the updated `data/history.db` to `main`.
+
 ---
 
 ## 🧠 AI models
@@ -455,7 +465,7 @@ python -m purffle_shorts <command> [options]        # or `purffle-shorts <comman
 | `history` | Everything made so far, with links |
 | `studio` | Local web app |
 
-Common options: `--source queue|trending|wikipedia|reddit|rss|file|niche`, `--niche "space"`, `--style facts|story|listicle|myth|quiz|explainer|motivational|news|dialogue|chat|reddit`, `--lang`, `--duration 45`, `--aspect 9:16|16:9|1:1|4:5`, `--also-lang es,hi`, `--provider`, `--model`, `--no-review`, `--tts`, `--voice`, `--voice-b`, `--visuals`, `--caption-style`, `--grade`, `--transition`, `--resolution`, `--no-music`, `--no-upload`, `--privacy`, `--publish-times`, `--env-file`.
+Common options: `--source queue|trending|wikipedia|reddit|rss|file|niche`, `--niche "space"`, `--style facts|story|listicle|myth|quiz|explainer|motivational|news|dialogue|chat|reddit`, `--lang`, `--duration 30`, `--aspect 9:16|16:9|1:1|4:5`, `--also-lang es,hi`, `--provider`, `--model`, `--no-review`, `--tts`, `--voice`, `--voice-b`, `--visuals`, `--caption-style`, `--grade`, `--transition`, `--resolution`, `--no-music`, `--no-upload`, `--privacy`, `--publish-times`, `--env-file`.
 
 **Your own script:** every video folder has a `script.json`. Edit the narration, title or image prompts and render it again with `make --script path/to/script.json`. The files in [`examples/`](https://github.com/Chamanrajragu/purffle-shorts/tree/main/examples) show the format.
 

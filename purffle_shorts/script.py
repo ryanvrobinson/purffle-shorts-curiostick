@@ -194,7 +194,7 @@ def pick_style(settings: Settings, source: str) -> str:
 
 
 def scene_plan(style: str, target_seconds: int) -> tuple[int, int]:
-    """(words, scenes) for a target length. Chat messages are short, so a chat has more of them."""
+    """(words, scenes) for a target length, favoring a visual beat every few seconds."""
     words = int(target_seconds * WORDS_PER_SECOND)
     if style == "chat":
         return words, max(6, min(18, round(target_seconds / 2.8)))
@@ -202,7 +202,7 @@ def scene_plan(style: str, target_seconds: int) -> tuple[int, int]:
         return words, max(6, min(14, round(target_seconds / 3.5)))
     if style == "reddit":
         return words, max(5, min(12, round(target_seconds / 4.5)))
-    return words, max(4, min(10, round(target_seconds / 5.5)))
+    return words, max(4, min(10, round(target_seconds / 3.5)))
 
 
 def _format_rules(style: str) -> str:
@@ -248,26 +248,28 @@ def build_prompt(subject: str, style: str, settings: Settings, avoid: list[str],
 Subject: {subject}
 If the subject is broad, choose ONE specific, surprising, lesser-known topic inside it and name it in
 "angle" — the one defensible take this video will argue or show.
+Favor a story with clear visual evidence, an immediately understandable mystery, a verifiable surprise,
+and a concrete reveal. Avoid repeating recent subjects or relying on misleading mystery framing.
 Format: {STYLES[style]}
 Audience: {settings.audience}
 Language: {lang} for narration, title, hook_text, cast and description. search_query and image_prompt are ALWAYS English.
 
 {ctx}{ins}{avoid_block}Rules:
-- Total narration about {words} words (~{settings.target_seconds} seconds spoken), split into about {n_scenes} scenes.
-{_format_rules(style)}- Scene 1 is the hook: a bold claim or question that stops the scroll in under 2 seconds. Never "In this video", never a greeting.
-- Make the opening specific immediately: name the subject and its concrete consequence, or ask a precise question the video will answer. Avoid vague phrases such as "a cosmic transformation."
-- Keep the hook scientifically accurate. Frame hypothetical scenarios as hypotheticals, and do not imply an outcome is certain when it is not.
-- Every line earns its place: concrete details, numbers, names. Only well-established facts; no made-up statistics.
+- Total narration about {words} words (~{settings.target_seconds} seconds spoken), split into about {n_scenes} scenes. Use 25–35 seconds when that fully serves the story; do not pad or omit necessary explanation.
+{_format_rules(style)}- Open with the most surprising well-established fact the story can support, or a precise curiosity gap if no such fact is available. No greeting, "Did you know?", or throat-clearing.
+- The first narration and first visual must show the same concrete subject; name the subject or its consequence immediately, not a vague phrase such as "a cosmic transformation."
+- Keep every scientific claim supportable. Never invent quotations, statistics, discoveries, or certainty; frame hypotheticals as hypothetical.
+- Introduce the mystery early, escalate with one useful new detail per scene, and resolve it with a satisfying final payoff. Close the loop to the opening only when natural.
+- Every line earns its place. Aim for a new visual/story beat every 2–3 seconds when it helps; don't split a thought just to force a cut.
 - Propose THREE substantially different hooks in "hooks" (different angles, under 10 words each), then set "selected_hook" to the strongest one — the one Scene 1's narration delivers on.
-- Build one compelling narrative: introduce information progressively, one idea per scene, so curiosity builds scene by scene. Create curiosity without misleading viewers — every hook claim must be paid off honestly by the end.
-- The last scene lands a satisfying payoff, then a short call to action (max 8 words), e.g. asking viewers to comment or follow.
+- The last scene lands the payoff. Omit generic outros and calls to action; add a brief, natural prompt (max 6 words) only if it does not interrupt the story.
 - Narration is natural spoken text by a voice: no emojis, hashtags, labels, brackets or stage directions.
 - search_query: 1-4 English words describing concrete, filmable stock footage for that scene (e.g. "octopus underwater", "old library books"). No abstract words.
-- image_prompt: one vivid English sentence for an AI image of that scene, no text or letters in the image.
-- visual_description: what should be shown in this scene, one sentence.
+- image_prompt: one vivid English sentence for the exact subject/action in this scene, no text or letters in the image. Never substitute unrelated generic mystery imagery.
+- visual_description: identify the actual place, geological/biological/astronomical subject, and visible details for this scene in one sentence. Do not depict an unverified event as a real photograph.
 - title: max 60 characters, curiosity-driven but honest, no hashtags, no quotes.
 - hook_text: max 6 words shown on screen during the first seconds.
-- description: 2-3 sentences plus one question that invites comments. No hashtags.
+- description: a concise, accurate summary and one relevant question. No hashtags.
 - hashtags: 3-5 relevant hashtags. tags: 8-15 search keywords.
 - category: one of {", ".join(CATEGORIES)}.
 {src_rule}Return JSON with keys: topic, title, hook_text, angle, hooks (exactly three strings), selected_hook, cast, scenes (array of {{speaker, narration, search_query, image_prompt, visual_description}}), description, hashtags, tags, category, sources (when background information was supplied)."""

@@ -5,7 +5,7 @@ import logging
 import subprocess
 
 import pytest
-from PIL import Image
+from PIL import Image, ImageDraw
 
 from purffle_shorts import ffmpeg
 from purffle_shorts import media as M
@@ -190,7 +190,13 @@ def test_hybrid_pipeline_renders_pixabay_clips_and_agnes_images(settings, monkey
 
     def fake_agnes(prompt, dest, *args, **kwargs):
         assert "Scene context:" in prompt
-        Image.new("RGB", (720, 1280), (220, 40, 40)).save(dest)
+        image = Image.new("RGB", (720, 1280))
+        draw = ImageDraw.Draw(image)
+        for y in range(0, 1280, 32):
+            for x in range(0, 720, 32):
+                color = (220, 40, 40) if (x // 32 + y // 32) % 2 else (20, 180, 220)
+                draw.rectangle((x, y, x + 31, y + 31), fill=color)
+        image.save(dest)
         return dest
 
     monkeypatch.setattr(M, "http", lambda: Session())

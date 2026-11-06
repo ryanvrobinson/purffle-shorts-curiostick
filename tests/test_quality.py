@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -70,6 +71,48 @@ Another caption
         check = gate._check_file_exists(mock_video)
         assert check.passed is True
         assert "bytes" in check.message
+
+    def test_script_and_visual_mapping_checks(self, gate, tmp_path):
+        import json
+
+        folder = tmp_path / "story"
+        folder.mkdir()
+        (folder / "script.json").write_text(json.dumps({
+            "topic": "Chicxulub",
+            "title": "The crater that ended the dinosaurs",
+            "scenes": [{
+                "narration": "A buried crater points to the impact.",
+                "search_query": "Chicxulub crater",
+                "image_prompt": "A realistic aerial view of the Chicxulub crater region.",
+            }],
+        }), encoding="utf-8")
+        (folder / "metadata.json").write_text(json.dumps({
+            "visuals": [{"source": "pixabay", "kind": "video", "query": "Chicxulub crater"}],
+        }), encoding="utf-8")
+
+        assert gate._check_script_complete(folder).passed
+        assert gate._check_scene_visual_mapping(folder).passed
+
+        (folder / "metadata.json").write_text(json.dumps({"visuals": []}), encoding="utf-8")
+        mapping = gate._check_scene_visual_mapping(folder)
+        assert not mapping.passed and "one selected visual" in mapping.message
+
+        (folder / "script.json").write_text(json.dumps({
+            "scenes": [{"narration": "Did you know octopuses have three hearts?",
+                        "search_query": "octopus hearts", "image_prompt": "octopus"}],
+        }), encoding="utf-8")
+        hook = gate._check_hook(folder)
+        assert not hook.passed and "generic" in hook.message
+
+    @patch("purffle_shorts.quality.subprocess.run")
+    def test_audio_quality_rejects_silence_and_accepts_audible_signal(self, mock_run, gate, mock_video):
+        mock_run.return_value = SimpleNamespace(returncode=0, stderr="max_volume: -inf dB")
+        silent = gate._check_audio_audible(mock_video)
+        assert not silent.passed and "inaudible" in silent.message
+
+        mock_run.return_value = SimpleNamespace(returncode=0, stderr="max_volume: -18.4 dB")
+        audible = gate._check_audio_audible(mock_video)
+        assert audible.passed and "signal detected" in audible.message
 
     def test_check_file_exists_fail_missing(self, gate, mock_folder):
         """Test file exists check fails for missing file."""
@@ -142,6 +185,7 @@ Another caption
 
     @patch("purffle_shorts.ffmpeg.probe")
     def test_duration_uses_the_shared_target_window(self, mock_probe, gate):
+        gate = QualityGate(gate.settings.with_overrides(target_seconds=40))
         mock_probe.return_value = {"duration": 52.0}
         assert gate._check_duration(Path("video.mp4")).passed is True  # 40s + 30%
         mock_probe.return_value = {"duration": 53.0}

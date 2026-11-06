@@ -341,14 +341,6 @@ class Studio:
                             "script length (TARGET_SECONDS or the scene count) if this matters.",
                             info["duration"], abs(deviation) / s.target_seconds * 100, s.target_seconds)
 
-            # Phase 4: extended quality control
-            qc_report = QualityGate(s).check(Result(
-                ok=True, video=video, folder=folder, status="rendered"))
-            if not qc_report.passed:
-                log.warning("QC gate reported %d automated failure(s): %s",
-                            len(qc_report.automated_failures), qc_report.summary)
-                for adv in qc_report.heuristic_advisories:
-                    log.info("QC advisory (%s): %s", adv.name, adv.message)
             extract_frame(video, min(1.2, total / 3), folder / "cover.jpg")
             (folder / "captions.srt").write_text(srt(chunks), encoding="utf-8")
 
@@ -403,6 +395,14 @@ class Studio:
                     credits_lines.append(f"{m.query}: {m.attribution_line}")
             if credits_lines:
                 (folder / "credits.txt").write_text("\n".join(credits_lines) + "\n", encoding="utf-8")
+
+            qc_report = QualityGate(s).check(Result(
+                ok=True, video=video, folder=folder, status="rendered"))
+            if not qc_report.passed:
+                log.warning("QC gate reported %d automated failure(s): %s",
+                            len(qc_report.automated_failures), qc_report.summary)
+                for adv in qc_report.heuristic_advisories:
+                    log.info("QC advisory (%s): %s", adv.name, adv.message)
 
             rid = self.history.add_video(
                 subject=pick.subject, source=pick.source, topic=script.topic, style=script.style,

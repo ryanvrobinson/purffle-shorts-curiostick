@@ -11,6 +11,15 @@ def test_providers_command(capsys, tmp_path, monkeypatch):
     assert "anthropic" in out and "ollama" in out
 
 
+def test_analytics_import_command(tmp_path, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
+    source = tmp_path / "metrics.csv"
+    source.write_text("Video ID,Stayed to watch (%)\nvideo-1,62.5%\n", encoding="utf-8")
+
+    assert main(["analytics-import", str(source)]) == 0
+    assert "Imported analytics for 1 video(s)" in capsys.readouterr().out
+
+
 def test_overrides_from_flags(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     args = build_parser().parse_args(["make", "--lang", "es", "--visuals", "pexels,Pollinations", "--no-upload",

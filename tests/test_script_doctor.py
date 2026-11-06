@@ -72,7 +72,7 @@ def test_script_from_data_detects_a_conversation():
 
 
 def test_scene_plan_by_format():
-    assert scene_plan("facts", 40) == (104, 7)
+    assert scene_plan("facts", 40) == (104, 10)
     assert scene_plan("chat", 40)[1] == 14
     assert scene_plan("dialogue", 40)[1] == 11
 
@@ -82,7 +82,7 @@ def test_prompt_carries_format_rules_and_channel_insights():
     assert "text message" in user and '"Me"' in user and "What performed best: X" in user
     _, user = build_prompt("cats", "facts", Settings(), [])
     assert 'speaker is always "A"' in user
-    assert "name the subject and its concrete consequence" in user
+    assert "name the subject or its consequence immediately" in user
     _, rewrite = review_prompt(_draft(), Settings(), True)
     assert "scientifically" in rewrite and "defensible question or consequence" in rewrite
 
