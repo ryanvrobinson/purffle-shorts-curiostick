@@ -370,15 +370,15 @@ def test_youtube_upload_retries_transient_errors(monkeypatch, tmp_path):
 
 EXPECTED_WORKFLOWS = {
     ".github/workflows/curiostick-slot-1.yml": {
-        "slot": "1", "cron": "30 1 * * *",
+        "slot": "1", "cron": "30 3 * * *",
         "publish_utc": "03:30", "publish_ist": "09:00 AM",
     },
     ".github/workflows/curiostick-slot-2.yml": {
-        "slot": "2", "cron": "30 6 * * *",
+        "slot": "2", "cron": "30 8 * * *",
         "publish_utc": "08:30", "publish_ist": "2:00 PM",
     },
     ".github/workflows/curiostick-slot-3.yml": {
-        "slot": "3", "cron": "30 11 * * *",
+        "slot": "3", "cron": "30 13 * * *",
         "publish_utc": "13:30", "publish_ist": "7:00 PM",
     },
 }

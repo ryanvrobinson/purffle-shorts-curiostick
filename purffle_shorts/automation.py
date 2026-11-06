@@ -20,8 +20,41 @@ from .history import History, now_iso
 from . import youtube
 from .pipeline import Result, Studio
 from .quality import QualityGate, QualityReport
+from .llm import LLMError
 
 log = logging.getLogger("purffle")
+
+# ------------------------------------------------------------------ failure classification
+TEMPORARY_FAILURE_STAGES = {"tts", "footage", "render", "upload", "verify"}
+TEMPORARY_ERROR_HINTS = (
+    "429", "rate limit", "temporary", "network", "timeout",
+    "connection", "502", "503", "504", "unavailable", "overloaded",
+)
+
+PERMANENT_FAILURE_STAGES = {"script", "review", "qc"}
+
+# Bounded retry configuration
+MAX_RECOVERY_RETRIES = 3
+RETRY_BASE_SECONDS = 60
+RETRY_MAX_SECONDS = 3600
+
+
+def _is_temporary(error: str, stage: str) -> bool:
+    """Classify a failure as temporary (retryable) or permanent (content/config)."""
+    err = (error or "").lower()
+    if stage in TEMPORARY_FAILURE_STAGES:
+        return any(h in err for h in TEMPORARY_ERROR_HINTS) or stage in {"tts", "footage", "render"}
+    if stage in PERMANENT_FAILURE_STAGES:
+        return False
+    # Unknown stage: treat error-message hints as the decider
+    return any(h in err for h in TEMPORARY_ERROR_HINTS)
+
+
+def _retry_delay(retry_count: int) -> float:
+    """Exponential backoff with jitter, capped at RETRY_MAX_SECONDS."""
+    import random
+    delay = min(RETRY_BASE_SECONDS * (2 ** retry_count), RETRY_MAX_SECONDS)
+    return delay + random.uniform(0, delay * 0.25)
 
 # The three CurioStick publishing slots, Asia/Kolkata (UTC+5:30).
 SLOT_TIMES: dict[int, str] = {1: "09:00", 2: "14:00", 3: "19:00"}
@@ -418,7 +451,8 @@ class SlotAutomation:
 
     def __init__(self, settings: Settings, slot: int, run_date: str | None = None,
                  dry_run: bool = False, skip_quality: bool = False,
-                 studio: Studio | None = None, history: History | None = None):
+                 studio: Studio | None = None, history: History | None = None,
+                 recover: bool = True):
         if slot not in SLOT_TIMES:
             raise ConfigError(f"Invalid slot {slot}: choose 1 (09:00 IST), 2 (14:00 IST) or 3 (19:00 IST)")
         self.s = settings.with_overrides(upload=False)
@@ -427,6 +461,7 @@ class SlotAutomation:
         self.key = slot_key(self.run_date, self.slot)
         self.dry_run = dry_run
         self.skip_quality = skip_quality
+        self.recover = recover
         self.history = history or History(self.s.data_path / "history.db")
         self.studio = studio or Studio(self.s)
         self._failures_dir = self.s.data_path / "failures"
@@ -439,7 +474,11 @@ class SlotAutomation:
             return datetime.now(timezone.utc).date().isoformat()
 
     def run_slot(self) -> SlotRunResult:
-        """Generate one Short and schedule it for this slot's IST publication time."""
+        """Generate one Short and schedule it for this slot's IST publication time.
+
+        If a previous run for this slot+date failed and is recoverable, attempt
+        recovery first (reusing rendered assets when safe) before generating fresh.
+        """
         moments = slot_publish_moments(self.run_date, self.s.timezone)
         publish_at = moments[self.slot]                       # aware IST datetime
         publish_at_utc = youtube.to_rfc3339(publish_at)
@@ -448,6 +487,17 @@ class SlotAutomation:
         log.info("Slot %s (%s) for %s: publish target %s = %s UTC",
                  self.slot, SLOT_TIMES[self.slot], self.run_date,
                  publish_at.isoformat(), publish_at_utc)
+
+        # Recovery-first: if this slot previously failed and is retryable, try recovery.
+        if self.recover:
+            recovery = self.history.get_recovery_for_slot(self.key)
+            if recovery:
+                log.info("Found pending recovery for %s (attempt %d/%d, stage %s)",
+                         self.key, recovery["retry_count"], recovery["max_retries"],
+                         recovery["stage"])
+                out = self._attempt_recovery(recovery, publish_at, publish_at_utc, now)
+                self._write_summary(out)
+                return out
 
         out = self._run_slot(publish_at, publish_at_utc, now)
         self._write_summary(out)
@@ -481,8 +531,13 @@ class SlotAutomation:
         except Exception as e:  # setup problems (no LLM, no auth) stop this slot cleanly
             error = f"Video generation failed: {e}"
             log.error(error)
+            recoverable = not isinstance(e, (LLMError, youtube.NotAuthorized))
             self.history.record_slot(self.key, self.run_date, self.slot, publish_at_utc,
                                      "failed", error=error)
+            self.history.record_failure(
+                self.run_date, self.slot, self.key, None, "script", error,
+                recoverable=recoverable,
+            )
             return SlotRunResult(ok=False, slot=self.slot, run_date=self.run_date, key=self.key,
                                  publish_at_utc=publish_at_utc, publish_at_ist=publish_at.isoformat(),
                                  error=error)
@@ -491,6 +546,10 @@ class SlotAutomation:
             log.error(error)
             self.history.record_slot(self.key, self.run_date, self.slot, publish_at_utc,
                                      "failed", error=error)
+            self.history.record_failure(
+                self.run_date, self.slot, self.key, result.title, "script", error,
+                recoverable=True,
+            )
             return SlotRunResult(
                 ok=False, slot=self.slot, run_date=self.run_date, key=self.key,
                 publish_at_utc=publish_at_utc, publish_at_ist=publish_at.isoformat(),
@@ -506,6 +565,11 @@ class SlotAutomation:
                 self._save_failure_details(result, quality_report)
                 self.history.record_slot(self.key, self.run_date, self.slot, publish_at_utc,
                                          "failed", error=error)
+                self.history.record_failure(
+                    self.run_date, self.slot, self.key, result.title, "qc", error,
+                    recoverable=True, rendered=True,
+                    video_id=result.record_id,
+                )
                 return SlotRunResult(
                     ok=False, slot=self.slot, run_date=self.run_date, key=self.key,
                     publish_at_utc=publish_at_utc, publish_at_ist=publish_at.isoformat(),
@@ -526,8 +590,14 @@ class SlotAutomation:
         except Exception as e:  # NotAuthorized, network, quota: record, never blindly retry
             error = f"YouTube upload failed: {e}"
             log.error(error)
+            recoverable = not isinstance(e, youtube.NotAuthorized)
             self.history.record_slot(self.key, self.run_date, self.slot, publish_at_utc,
                                      "failed", error=error)
+            self.history.record_failure(
+                self.run_date, self.slot, self.key, result.title, "upload", error,
+                recoverable=recoverable, rendered=True, uploaded=False,
+                video_id=result.record_id,
+            )
             return SlotRunResult(
                 ok=False, slot=self.slot, run_date=self.run_date, key=self.key,
                 publish_at_utc=publish_at_utc, publish_at_ist=publish_at.isoformat(),
@@ -561,6 +631,121 @@ class SlotAutomation:
             ok=False, slot=self.slot, run_date=self.run_date, key=self.key,
             publish_at_utc=publish_at_utc, publish_at_ist=publish_at.isoformat(),
             video_result=result, quality_report=quality_report, error=error)
+
+    def _attempt_recovery(self, recovery: dict, publish_at: datetime,
+                          publish_at_utc: str, now: datetime) -> SlotRunResult:
+        """Attempt to recover a previously failed slot.
+
+        Reuses valid rendered videos when safe; otherwise regenerates.
+        Never publishes an already-published video twice.
+        """
+        recovery_id = recovery["id"]
+        error = recovery["error"]
+
+        # If already uploaded/scheduled, mark completed and skip.
+        if recovery.get("uploaded") and recovery.get("youtube_id"):
+            log.info("Slot %s already uploaded (video %s); marking recovery complete",
+                     self.key, recovery["youtube_id"])
+            self.history.mark_recovery_completed(recovery_id, "already-uploaded",
+                                                 recovery["youtube_id"])
+            self.history.record_slot(self.key, self.run_date, self.slot, publish_at_utc,
+                                     "scheduled", youtube_id=recovery["youtube_id"],
+                                     title=recovery.get("topic"))
+            return SlotRunResult(
+                ok=True, slot=self.slot, run_date=self.run_date, key=self.key,
+                publish_at_utc=publish_at_utc, publish_at_ist=publish_at.isoformat(),
+                uploaded=True, youtube_id=recovery["youtube_id"],
+                skipped=True, skip_reason="already uploaded from earlier attempt")
+
+        # Increment retry count; check if we've exhausted the budget.
+        self.history.increment_retry(recovery_id)
+        rec = self.history.get_recovery(recovery_id)
+        if rec and rec["retry_count"] >= rec["max_retries"]:
+            log.error("Slot %s recovery exhausted (%d attempts); marking failed",
+                      self.key, rec["max_retries"])
+            self.history.mark_recovery_failed(recovery_id, "exhausted")
+            self.history.record_slot(self.key, self.run_date, self.slot, publish_at_utc,
+                                     "failed", error=f"recovery exhausted: {error}")
+            return SlotRunResult(
+                ok=False, slot=self.slot, run_date=self.run_date, key=self.key,
+                publish_at_utc=publish_at_utc, publish_at_ist=publish_at.isoformat(),
+                error=f"recovery exhausted after {rec['max_retries']} attempts: {error}")
+
+        # If a video was already rendered, reuse it (QC + upload only).
+        if recovery.get("rendered") and recovery.get("video_id"):
+            log.info("Slot %s recovery: reusing rendered video #%d",
+                     self.key, recovery["video_id"])
+            # generates fresh; we override below
+            # Fetch the previously rendered record
+            rec_row = self.history.get(recovery["video_id"])
+            if rec_row and rec_row.get("video_path") and Path(rec_row["video_path"]).exists():
+                # Re-run quality gate on the existing video
+                from .pipeline import Result as _Result
+                existing_result = _Result(
+                    ok=True, title=rec_row.get("title", ""),
+                    folder=Path(rec_row["folder"]) if rec_row.get("folder") else None,
+                    video=Path(rec_row["video_path"]),
+                    status="rendered", record_id=recovery["video_id"],
+                    score=rec_row.get("score"), language=rec_row.get("language", ""),
+                )
+                if not self.skip_quality:
+                    quality_report = QualityGate(self.s).check(existing_result)
+                    if not quality_report.passed:
+                        err = f"quality gate failed on recovered video: {quality_report.summary}"
+                        log.error(err)
+                        self.history.record_slot(self.key, self.run_date, self.slot,
+                                                 publish_at_utc, "failed", error=err)
+                        return SlotRunResult(
+                            ok=False, slot=self.slot, run_date=self.run_date, key=self.key,
+                            publish_at_utc=publish_at_utc, publish_at_ist=publish_at.isoformat(),
+                            error=err)
+                # Upload the existing video
+                if not self.dry_run:
+                    try:
+                        status = self.studio.upload_scheduled(
+                            recovery["video_id"], publish_at, existing_result,
+                            slot=self.slot, run_date=self.run_date)
+                    except Exception as e:
+                        err = f"recovery upload failed: {e}"
+                        log.error(err)
+                        self.history.record_slot(self.key, self.run_date, self.slot,
+                                                 publish_at_utc, "failed", error=err)
+                        return SlotRunResult(
+                            ok=False, slot=self.slot, run_date=self.run_date, key=self.key,
+                            publish_at_utc=publish_at_utc, publish_at_ist=publish_at.isoformat(),
+                            error=err)
+                    rec2 = self.history.get(recovery["video_id"])
+                    if status == "scheduled":
+                        self.history.record_slot(self.key, self.run_date, self.slot,
+                                                 publish_at_utc, "scheduled",
+                                                 youtube_id=rec2.get("youtube_id"),
+                                                 title=rec2.get("title"))
+                        self.history.mark_recovery_completed(recovery_id, "retry-upload",
+                                                             rec2.get("youtube_id"))
+                        return SlotRunResult(
+                            ok=True, slot=self.slot, run_date=self.run_date, key=self.key,
+                            publish_at_utc=publish_at_utc, publish_at_ist=publish_at.isoformat(),
+                            uploaded=True, youtube_id=rec2.get("youtube_id"))
+                # Dry run: recovery succeeded up to upload point
+                self.history.mark_recovery_completed(recovery_id, "retry-dry-run")
+                self.history.record_slot(self.key, self.run_date, self.slot, publish_at_utc,
+                                         "scheduled", title=rec_row.get("title"))
+                return SlotRunResult(
+                    ok=True, slot=self.slot, run_date=self.run_date, key=self.key,
+                    publish_at_utc=publish_at_utc, publish_at_ist=publish_at.isoformat(),
+                    dry_run=True)
+
+        # No reusable video: generate fresh, but record this as a new attempt.
+        log.info("Slot %s recovery: no reusable video; generating fresh", self.key)
+        out = self._run_slot(publish_at, publish_at_utc, now)
+        # If the fresh generation also failed, the failure is already recorded by _run_slot.
+        # Mark this recovery attempt as completed (the new slot record supersedes it).
+        if not out.ok:
+            self.history.mark_recovery_failed(recovery_id, "regeneration-failed")
+        else:
+            self.history.mark_recovery_completed(recovery_id, "regeneration-success",
+                                                 out.youtube_id)
+        return out
 
     def _save_failure_details(self, result: Result, report: QualityReport) -> None:
         """Persist which check(s) failed so the failure can be reviewed later."""

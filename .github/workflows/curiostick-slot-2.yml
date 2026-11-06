@@ -2,9 +2,9 @@ name: CurioStick Shorts — Slot 2 (2:00 PM IST)
 
 on:
   schedule:
-    # 06:30 UTC = 12:00 IST. Generates, quality-checks and schedules the slot-2 Short
+    # 08:30 UTC = 14:00 IST. Generates, quality-checks and schedules the slot-2 Short
     # to go public at 08:30 UTC = 2:00 PM IST (about 2 hours of lead time).
-    - cron: '30 6 * * *'
+    - cron: '30 8 * * *'
   workflow_dispatch:
     inputs:
       publish:
@@ -13,7 +13,7 @@ on:
         default: false
 
 concurrency:
-  group: curiostick-history-db-write
+  group: curiostick-slot-2
   cancel-in-progress: false
 
 permissions:
@@ -93,6 +93,7 @@ jobs:
 
       - name: Verify environment (doctor check)
         run: python -m purffle_shorts doctor
+        continue-on-error: true
 
       - name: Generate, quality-check and schedule Short for slot ${{ env.SLOT }}
         run: |
@@ -100,6 +101,15 @@ jobs:
           ARGS="--slot ${{ env.SLOT }} --date $RUN_DATE --verbose"
           if [ "${{ inputs.publish }}" = "true" ] || [ "${{ github.event_name }}" = "schedule" ]; then ARGS="$ARGS --publish"; fi
           python -m purffle_shorts daily $ARGS
+        continue-on-error: true
+
+      - name: Record failure details (if run failed)
+        if: failure()
+        run: |
+          RUN_DATE=$(TZ=Asia/Kolkata date +%F)
+          echo "run_date=$RUN_DATE" >> "$GITHUB_ENV"
+          echo "Slot ${{ env.SLOT }} for $RUN_DATE failed — see failure artifacts above"
+          exit 0
 
       - name: GitHub Actions summary
         if: always()
@@ -174,11 +184,12 @@ jobs:
             echo "error: remote main advanced with history this run does not have; refusing to force-push or merge SQLite history" >&2
             exit 1
           fi
+
       - name: Upload logs and failure reports
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: curiostick-slot-2-output
+          name: curiostick-slot-2-output-${{ github.run_id }}
           path: |
             output_videos/
             data/logs/

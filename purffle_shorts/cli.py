@@ -576,6 +576,59 @@ def cmd_daily(args, s: Settings) -> int:
         return 1
 
 
+def cmd_recover(args, s: Settings) -> int:
+    """Recover failed slot runs from the persistent recovery queue."""
+    from .automation import SlotAutomation
+    from .history import History
+
+    history = History(s.data_path / "history.db")
+    pending = history.pending_recoveries(limit=100)
+
+    if args.slot is not None:
+        pending = [r for r in pending if r["slot"] == args.slot]
+    if args.date is not None:
+        pending = [r for r in pending if r["run_date"] == args.date]
+
+    if not pending:
+        print("No recoverable failed jobs in the queue.")
+        return 0
+
+    print(f"Found {len(pending)} recoverable failed job(s):")
+    for r in pending:
+        print(f"  #{r['id']}  {r['run_date']} slot-{r['slot']}  stage={r['stage']}  "
+              f"attempt={r['retry_count']}/{r['max_retries']}  "
+              f"recoverable={'yes' if r['recoverable'] else 'no'}")
+        if r["error"]:
+            print(f"      error: {r['error'][:120]}")
+
+    if args.dry_run:
+        print(
+            "\\nDry run: would attempt "
+            f"{len(pending)} job(s). "
+            "Use without --dry-run to execute."
+        )
+        return 0
+
+    recovered = 0
+    for r in pending:
+        automation = SlotAutomation(
+            s, slot=r["slot"], run_date=r["run_date"], recover=True,
+            history=history,
+        )
+        result = automation.run_slot()
+        if result.ok:
+            recovered += 1
+            print(f"  #{r['id']} recovered: {result.key} -> {result.status or 'ok'}")
+        else:
+            print(f"  #{r['id']} still failed: {result.error}")
+
+    print(
+        "\\nRecovered "
+        f"{recovered} of {len(pending)} job(s)."
+    )
+    return 0 if recovered == len(pending) else 1
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="purffle-shorts", description="Autonomous AI YouTube Shorts studio.")
     p.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
@@ -652,6 +705,15 @@ def build_parser() -> argparse.ArgumentParser:
     mc.add_argument("--env-file")
     mc.add_argument("-v", "--verbose", action="store_true")
     mc.set_defaults(func=cmd_mcp)
+
+    rec = sub.add_parser("recover", help="recover failed slot runs from the recovery queue")
+    rec.add_argument("--slot", type=int, choices=[1, 2, 3],
+                     help="only recover this slot")
+    rec.add_argument("--date", metavar="YYYY-MM-DD",
+                     help="only recover this Asia/Kolkata date")
+    rec.add_argument("--dry-run", action="store_true",
+                     help="list recoverable jobs without attempting them")
+    rec.set_defaults(func=cmd_recover)
 
     d = sub.add_parser("demo", help="render a sample Short with no API keys")
     _common(d)

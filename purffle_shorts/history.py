@@ -52,6 +52,28 @@ CREATE TABLE IF NOT EXISTS analytics_metrics (
     topic_category TEXT, video_duration REAL,
     imported_at TEXT NOT NULL, source_file TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS recovery_queue (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at TEXT NOT NULL,
+    run_date TEXT NOT NULL,           -- YYYY-MM-DD in Asia/Kolkata
+    slot INTEGER NOT NULL,            -- 1 = 09:00, 2 = 14:00, 3 = 19:00 IST
+    key TEXT NOT NULL,                -- YYYY-MM-DD-slot-N idempotency key
+    topic TEXT,
+    stage TEXT NOT NULL,              -- script | review | verify | tts | footage | render | qc | upload
+    error TEXT NOT NULL,              -- failure diagnostic
+    retry_count INTEGER NOT NULL DEFAULT 0,
+    max_retries INTEGER NOT NULL DEFAULT 3,
+    recoverable INTEGER NOT NULL DEFAULT 1,   -- 1 = retryable, 0 = permanent
+    rendered INTEGER NOT NULL DEFAULT 0,      -- 1 = video rendered, 0 = not
+    uploaded INTEGER NOT NULL DEFAULT 0,      -- 1 = uploaded/scheduled, 0 = not
+    video_id INTEGER,                   -- videos.id if a video was rendered
+    youtube_id TEXT,                    -- YouTube video ID if uploaded
+    status TEXT NOT NULL DEFAULT 'pending', -- pending | retrying | completed | failed | skipped
+    last_attempt_at TEXT,
+    next_retry_at TEXT,                 -- when to retry next (ISO format)
+    resolved_at TEXT,
+    resolved_by TEXT                    -- how it was resolved: retry | manual | skipped
+);
 """
 
 # Columns added after 2.0; existing databases get them on open.
@@ -286,3 +308,98 @@ class History:
     def list_slots_for_date(self, run_date: str) -> list[dict]:
         return self._all(
             "SELECT * FROM slot_uploads WHERE run_date = ? ORDER BY slot", (run_date,))
+
+    # ------------------------------------------------------------------ recovery queue
+    def record_failure(self, run_date: str, slot: int, key: str, topic: str | None,
+                       stage: str, error: str, recoverable: bool = True,
+                       rendered: bool = False, uploaded: bool = False,
+                       video_id: int | None = None, youtube_id: str | None = None,
+                       max_retries: int = 3) -> int:
+        """Record a failed slot attempt in the recovery queue.
+
+        Returns the recovery queue row id.
+        """
+        now = now_iso()
+        return self._exec(
+            """INSERT INTO recovery_queue
+               (created_at, run_date, slot, key, topic, stage, error,
+                retry_count, max_retries, recoverable, rendered, uploaded,
+                video_id, youtube_id, status, next_retry_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)""",
+            (now, run_date, int(slot), key, topic, stage, error,
+             0, max_retries, 1 if recoverable else 0,
+             1 if rendered else 0, 1 if uploaded else 0,
+             video_id, youtube_id, now),
+        )
+
+    def increment_retry(self, recovery_id: int) -> None:
+        """Bump the retry count and schedule the next retry with backoff."""
+        now = now_iso()
+        self._exec(
+            """UPDATE recovery_queue
+               SET retry_count = retry_count + 1,
+                   last_attempt_at = ?,
+                   next_retry_at = ?,
+                   status = 'retrying'
+               WHERE id = ?""",
+            (now, now, recovery_id),
+        )
+
+    def mark_recovery_completed(self, recovery_id: int, resolved_by: str,
+                                youtube_id: str | None = None) -> None:
+        """Mark a recovery queue entry as completed."""
+        now = now_iso()
+        fields = dict(status="completed", resolved_at=now, resolved_by=resolved_by)
+        if youtube_id:
+            fields["youtube_id"] = youtube_id
+        sets = ", ".join(f"{k} = ?" for k in fields)
+        self._exec(
+            f"UPDATE recovery_queue SET {sets} WHERE id = ?",
+            (*fields.values(), recovery_id),
+        )
+
+    def mark_recovery_failed(self, recovery_id: int, resolved_by: str = "exhausted") -> None:
+        """Mark a recovery queue entry as permanently failed after exhausting retries."""
+        now = now_iso()
+        self._exec(
+            "UPDATE recovery_queue SET status = 'failed', resolved_at = ?, resolved_by = ? WHERE id = ?",
+            (now, resolved_by, recovery_id),
+        )
+
+    def pending_recoveries(self, limit: int = 50) -> list[dict]:
+        """Return recovery queue entries that are due for retry.
+
+        Only pending or retrying entries with next_retry_at <= now are returned.
+        Permanently failed or completed entries are excluded.
+        """
+        now = now_iso()
+        return self._all(
+            """SELECT * FROM recovery_queue
+               WHERE status IN ('pending', 'retrying')
+                 AND recoverable = 1
+                 AND retry_count < max_retries
+                 AND (next_retry_at IS NULL OR next_retry_at <= ?)
+               ORDER BY created_at ASC LIMIT ?""",
+            (now, limit),
+        )
+
+    def get_recovery(self, recovery_id: int) -> dict | None:
+        rows = self._all("SELECT * FROM recovery_queue WHERE id = ?", (recovery_id,))
+        return rows[0] if rows else None
+
+    def get_recovery_for_slot(self, key: str) -> dict | None:
+        """Return the most recent pending recovery entry for a slot+date key."""
+        rows = self._all(
+            """SELECT * FROM recovery_queue
+               WHERE key = ? AND status IN ('pending', 'retrying')
+                 AND recoverable = 1
+                 AND retry_count < max_retries
+               ORDER BY created_at DESC LIMIT 1""",
+            (key,),
+        )
+        return rows[0] if rows else None
+
+    def recovery_stats(self) -> dict:
+        rows = self._all(
+            "SELECT status, COUNT(*) AS n FROM recovery_queue GROUP BY status")
+        return {r["status"]: r["n"] for r in rows}
