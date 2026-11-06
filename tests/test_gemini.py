@@ -184,3 +184,109 @@ def test_script_carries_angle_hooks_sources():
     assert len(s.hooks) == 3
     assert s.selected_hook == "hook one"
     assert s.sources == ["https://example.com/src"]
+
+
+def _walk_forbidden(schema):
+    found = []
+    if isinstance(schema, dict):
+        for key in ("additionalProperties", "additional_properties"):
+            if key in schema:
+                found.append(key)
+        for value in schema.values():
+            found += _walk_forbidden(value)
+    elif isinstance(schema, list):
+        for value in schema:
+            found += _walk_forbidden(value)
+    return found
+
+
+def test_gemini_sanitization_drops_additional_properties(monkeypatch):
+    """Regression: the exact reported 400 INVALID_ARGUMENT on additional_properties,
+    including nested inside array items, must not reach the Gemini request config."""
+    captured = []
+    _install_fake_genai(monkeypatch, captured)
+    monkeypatch.setenv("GEMINI_API_KEY", "k")
+    p = L.build_provider("gemini", L.Settings(llm_provider="gemini", llm_model="gemini-2.5-flash"))
+    schema = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "title": {"type": "string"},
+            "scenes": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "narration": {"type": "string"},
+                        "image_prompt": {"type": "string"},
+                    },
+                },
+            },
+        },
+    }
+    p.complete("sys", "user", schema=schema)
+    cfg = captured[-1]["config"]
+    assert cfg.kwargs["response_mime_type"] == "application/json"
+    sanitized = cfg.kwargs["response_schema"]
+    assert _walk_forbidden(sanitized) == []
+    assert sanitized["type"] == "object"
+    assert sanitized["properties"]["scenes"]["items"]["type"] == "object"
+    assert "narration" in sanitized["properties"]["scenes"]["items"]["properties"]
+    assert "image_prompt" in sanitized["properties"]["scenes"]["items"]["properties"]
+
+
+def test_gemini_sanitization_nullable_union():
+    """Nullable unions become type + nullable: true instead of a rejected type list."""
+    assert L._sanitize_gemini_schema({"type": ["string", "null"]}) == {
+        "type": "string",
+        "nullable": True,
+    }
+    assert L._sanitize_gemini_schema({"type": ["integer", "null"]}) == {
+        "type": "integer",
+        "nullable": True,
+    }
+    # A union with no concrete type degrades safely, never to a list.
+    assert L._sanitize_gemini_schema({"type": ["null"]}) == {
+        "type": "string",
+        "nullable": True,
+    }
+
+
+def test_gemini_sanitization_preserves_output_structure():
+    """Dropping additionalProperties must not drop properties/required/items/enum."""
+    schema = {
+        "type": "object",
+        "required": ["title"],
+        "additionalProperties": False,
+        "properties": {
+            "title": {"type": "string"},
+            "count": {"type": ["integer", "null"]},
+            "tags": {"type": "array", "items": {"type": "string"}},
+            "speaker": {"type": "string", "enum": ["A", "B"]},
+        },
+    }
+    clean = L._sanitize_gemini_schema(schema)
+    assert "additionalProperties" not in _walk_forbidden(clean)
+    assert clean["required"] == ["title"]
+    assert clean["properties"]["title"] == {"type": "string"}
+    assert clean["properties"]["count"] == {"type": "integer", "nullable": True}
+    assert clean["properties"]["tags"] == {"type": "array", "items": {"type": "string"}}
+    assert clean["properties"]["speaker"] == {"type": "string", "enum": ["A", "B"]}
+
+
+def test_gemini_request_configuration_sends_json_mime_and_sanitized_schema(monkeypatch):
+    """The actual SDK GenerateContentConfig carries response_mime_type plus a
+    sanitized response_schema (no additional_properties) for gemini-2.5-flash."""
+    captured = []
+    _install_fake_genai(monkeypatch, captured)
+    monkeypatch.setenv("GEMINI_API_KEY", "gem-key-123")
+    p = L.build_provider("gemini", L.Settings(llm_provider="gemini", llm_model="gemini-2.5-flash"))
+    p.complete("sys", "user", schema={"type": "object", "additionalProperties": False}, max_tokens=4000)
+    cfg = captured[-1]["config"]
+    assert cfg.kwargs["response_mime_type"] == "application/json"
+    assert cfg.kwargs["response_schema"] == {"type": "object"}
+    assert captured[0]["api_key"] == "gem-key-123"
+    # The key never reaches the config payload sent to the SDK.
+    assert "gem-key-123" not in str(cfg.kwargs)
+    assert "gem-key-123" not in str(captured[-1]["config"].kwargs)

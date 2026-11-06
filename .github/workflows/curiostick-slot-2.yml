@@ -119,7 +119,7 @@ jobs:
           # file wholesale, without force-pushing, and without a binary-file rebase conflict.
           REMOTE_DB="$(mktemp)"
           if git show origin/main:data/history.db > "$REMOTE_DB" 2>/dev/null; then
-            python3 - "$REMOTE_DB" "data/history.db" <<'PY'
+          python3 - "$REMOTE_DB" "data/history.db" <<'PY'
           import sqlite3, sys
           remote_path, local_path = sys.argv[1], sys.argv[2]
           rcon = sqlite3.connect(remote_path)
@@ -146,32 +146,31 @@ jobs:
           # If remote advanced between our fetch and this commit, reparent onto origin/main so the
           # push fast-forwards. Never force-push; never overwrite another slot's history.
           if git merge-base --is-ancestor origin/main HEAD; then
-            git push origin main
+          git push origin main
           else
-            RUN_DATE=$(TZ=Asia/Kolkata date +%F)
-            REMOTE_DB="$(mktemp)"
-            git show origin/main:data/history.db > "$REMOTE_DB" 2>/dev/null || true
-            if python3 - "$REMOTE_DB" "$RUN_DATE" "${SLOT}" <<'PY'
+          RUN_DATE=$(TZ=Asia/Kolkata date +%F)
+          REMOTE_DB="$(mktemp)"
+          git show origin/main:data/history.db > "$REMOTE_DB" 2>/dev/null || true
+          if python3 - "$REMOTE_DB" "$RUN_DATE" "${SLOT}" <<'PY'
           import sqlite3, sys
           path, run_date, slot = sys.argv[1], sys.argv[2], sys.argv[3]
           key = f"{run_date}-slot-{slot}"
           try:
-                conn = sqlite3.connect(path)
-                row = conn.execute(
-                    "SELECT 1 FROM slot_uploads WHERE key = ? AND status = 'scheduled'", (key,)).fetchone()
-                conn.close()
-                sys.exit(0 if row else 1)
+              conn = sqlite3.connect(path)
+              row = conn.execute(
+                  "SELECT 1 FROM slot_uploads WHERE key = ? AND status = 'scheduled'", (key,)).fetchone()
+              conn.close()
+              sys.exit(0 if row else 1)
           except Exception:
-                sys.exit(1)
+              sys.exit(1)
           PY
-            then
-              echo "Slot ${SLOT} for ${RUN_DATE} already recorded on remote; nothing to push."
-              exit 0
-            fi
+          then
+            echo "Slot ${SLOT} for ${RUN_DATE} already recorded on remote; nothing to push."
+            exit 0
+          fi
             echo "error: remote main advanced with history this run does not have; refusing to force-push or merge SQLite history" >&2
             exit 1
           fi
-
       - name: Upload logs and failure reports
         if: always()
         uses: actions/upload-artifact@v4

@@ -371,20 +371,33 @@ class AnthropicProvider(Provider):
         return text
 
 
-def _sanitize_gemini_schema(value: Any) -> Any:
-    """Convert JSON Schema constructs unsupported by google-genai's Pydantic types.
+# JSON Schema keys the Gemini API rejects for response_schema. They are validation
+# constraints, not structural fields, and the pipeline's normalize() already whitelists
+# the output fields, so dropping them cannot change the expected output structure.
+_GEMINI_UNSUPPORTED_SCHEMA_KEYS = {"additionalProperties", "additional_properties"}
 
-    google-genai expects each schema 'type' to be a string/enum. A JSON Schema union
-    such as ["number", "null"] reaches its enum converter as a list and crashes on
-    .upper() before any HTTP request is sent. Optional properties are already optional
-    unless listed in 'required', so retain the non-null type for these fields.
+def _sanitize_gemini_schema(value: Any) -> Any:
+    """Convert JSON Schema constructs the Gemini API rejects for structured output.
+
+    - additionalProperties / additional_properties are not accepted by the Gemini API
+      for response_schema and are dropped. They are validation constraints only, so the
+      expected output structure is preserved.
+    - A JSON Schema nullable union such as type: ["string", "null"] becomes
+      type: "string" plus nullable: true (Gemini-native). Optional properties are already
+      optional unless listed in 'required', so the non-null type is retained.
+    - Recurses into properties, items, any_of/one_of and defs so nested schemas are
+      sanitized before the request reaches the API.
     """
     if isinstance(value, dict):
         cleaned = {}
         for key, item in value.items():
+            if key in _GEMINI_UNSUPPORTED_SCHEMA_KEYS:
+                continue
             if key == "type" and isinstance(item, list):
                 non_null = [part for part in item if isinstance(part, str) and part.lower() != "null"]
-                cleaned[key] = non_null[0] if non_null else "string"
+                cleaned["type"] = non_null[0] if non_null else "string"
+                if len(item) != len(non_null):
+                    cleaned["nullable"] = True
             else:
                 cleaned[key] = _sanitize_gemini_schema(item)
         return cleaned
