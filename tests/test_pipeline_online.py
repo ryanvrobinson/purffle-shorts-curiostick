@@ -17,9 +17,11 @@ from .conftest import needs_ffmpeg
 SCRIPT = {
     "topic": "Octopus hearts", "title": "Why Octopuses Have Three Hearts", "hook_text": "3 HEARTS?!",
     "scenes": [
-        {"narration": "An octopus has three hearts.", "search_query": "octopus", "image_prompt": "octopus"},
-        {"narration": "Two pump blood through the gills.", "search_query": "octopus gills", "image_prompt": "gills"},
-        {"narration": "Follow for more ocean facts.", "search_query": "ocean", "image_prompt": "ocean"},
+        {"narration": "An octopus has three hearts, and they are remarkable.", "search_query": "octopus", "image_prompt": "octopus"},
+        {"narration": "Two of them pump blood through the gills, while the third serves the organs.", "search_query": "octopus gills", "image_prompt": "gills"},
+        {"narration": "Their blood is blue because it uses copper instead of iron to carry oxygen.", "search_query": "blue blood", "image_prompt": "octopus"},
+        {"narration": "When an octopus swims, the heart that serves the body actually stops beating.", "search_query": "octopus swim", "image_prompt": "octopus"},
+        {"narration": "Follow for more amazing ocean facts every single day.", "search_query": "ocean", "image_prompt": "ocean"},
     ],
     "description": "Three hearts, one octopus.", "hashtags": ["#octopus"], "tags": ["octopus"],
     "category": "science",
@@ -102,6 +104,10 @@ def test_keyed_pipeline_uploads_and_dedupes(online, monkeypatch):
     s, searches = online
     uploads = []
     monkeypatch.setattr(P.youtube, "upload", lambda settings, video, body: uploads.append(body) or {"id": "vid1"})
+    # Provide an authorized test-double service client so the duplicate-upload check
+    # can run without real OAuth tokens (auth logic itself stays in get_credentials).
+    monkeypatch.setattr(P.youtube, "service", lambda settings, interactive=False: object())
+    monkeypatch.setattr(P.youtube, "find_existing_video", lambda yt, marker: None)
     studio = P.Studio(s)
     r = studio.make()
     assert r.ok, r.error
@@ -116,7 +122,7 @@ def test_keyed_pipeline_uploads_and_dedupes(online, monkeypatch):
     assert "Footage: Pexels" in body["snippet"]["description"]
     assert not r.video.exists()                        # KEEP_VIDEOS=false removes the MP4 after upload
     used = studio.history.used_media()
-    assert len(used) == 3 and all(k.startswith("pexels:") for k in used)
+    assert len(used) == 5 and all(k.startswith("pexels:") for k in used)
 
 
 @needs_ffmpeg
@@ -220,14 +226,16 @@ def test_hybrid_pipeline_renders_pixabay_clips_and_agnes_images(settings, monkey
 
     assert r.ok, r.error
     assert [(source, kind) for source, kind, _ in rendered] == [
-        ("pixabay", "video"), ("agnes", "image"), ("pixabay", "video")]
+        ("pixabay", "video"), ("agnes", "image"), ("pixabay", "video"),
+        ("agnes", "image"), ("pixabay", "video"),
+    ]
     assert all(downloaded for _, _, downloaded in rendered)
     meta = json.loads((r.folder / "metadata.json").read_text(encoding="utf-8"))
     assert meta["visual_mode"] == "hybrid"
-    assert [v["source"] for v in meta["visuals"]] == ["pixabay", "agnes", "pixabay"]
+    assert [v["source"] for v in meta["visuals"]] == ["pixabay", "agnes", "pixabay", "agnes", "pixabay"]
     assert meta["visual_selection"][1]["chosen"]["source"] == "agnes"
     assert "hybrid" in meta["visual_selection"][1]["reason"]
-    assert "Visuals: 2 video, 1 generated image, 0 stock photos, 0 fallback background" in caplog.text
+    assert "Visuals: 3 video, 2 generated images, 0 stock photos, 0 fallback backgrounds" in caplog.text
     info = ffmpeg.probe(r.video)
     assert (info["width"], info["height"]) == (360, 640) and info["has_audio"]
 
@@ -236,6 +244,9 @@ def test_hybrid_pipeline_renders_pixabay_clips_and_agnes_images(settings, monkey
 def test_schedule_and_quota_queue(online, monkeypatch):
     s, _ = online
     monkeypatch.setattr(P.youtube, "upload", lambda settings, video, body: {"id": "v"})
+    # Authorized test-double service client for the duplicate-upload check (see test_keyed_pipeline_uploads_and_dedupes).
+    monkeypatch.setattr(P.youtube, "service", lambda settings, interactive=False: object())
+    monkeypatch.setattr(P.youtube, "find_existing_video", lambda yt, marker: None)
     s = s.with_overrides(publish_times=["09:00", "21:00"], keep_videos=True, daily_upload_limit=1)
     studio = P.Studio(s)
     first = studio.make()
@@ -257,6 +268,9 @@ def test_youtube_refusal_pauses_uploads_until_the_reset(online, monkeypatch):
     def refuse(settings, video, body):
         calls.append(video)
         raise P.youtube.QuotaExceeded("uploadLimitExceeded")
+    # Authorized test-double service client for the duplicate-upload check.
+    monkeypatch.setattr(P.youtube, "service", lambda settings, interactive=False: object())
+    monkeypatch.setattr(P.youtube, "find_existing_video", lambda yt, marker: None)
     monkeypatch.setattr(P.youtube, "upload", refuse)
     studio = P.Studio(s.with_overrides(keep_videos=True))
     first = studio.make()

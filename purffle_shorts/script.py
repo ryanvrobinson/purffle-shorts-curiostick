@@ -915,15 +915,14 @@ _DEMO_DIALOGUE = [
 ]
 
 _DEMO_REDDIT = [
-    ("Am I wrong for feeding my neighbor's cat every night for a whole year?", "orange cat window"),
-    ("Every evening at seven, this orange cat sat outside my kitchen door and cried like it hadn't eaten in days.",
-     "cat door"),
-    ("So I bought him food. Good food. It became our little routine.", "cat eating"),
-    ("Last week my neighbor knocked and asked why her cat was getting so fat.", "front door"),
-    ("Turns out she feeds him at six. The family across the street feeds him at eight.", "suburban street"),
-    ("He has been eating three dinners a night, at three different houses.", "fat cat sleeping"),
-    ("We made a group chat. He is on a diet now, and he is furious about it.", "grumpy cat"),
-    ("Would you have kept feeding him? Follow for the update.", "cat sunset"),
+    ("Am I wrong for feeding my neighbor's cat every night?", "orange cat window"),
+    ("He cried outside my kitchen door every evening at seven.", "cat door"),
+    ("So I bought him good food. It became our routine.", "cat eating"),
+    ("My neighbor knocked. Her cat was getting fat.", "front door"),
+    ("She feeds him at six. Across the street feeds him at eight.", "suburban street"),
+    ("Three dinners a night at three houses.", "fat cat sleeping"),
+    ("We made a group chat. Now he's on a diet and furious.", "grumpy cat"),
+    ("Would you have kept feeding him?", "cat sunset"),
 ]
 
 _DEMO_CHAT = [

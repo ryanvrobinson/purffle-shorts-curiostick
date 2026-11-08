@@ -89,8 +89,12 @@ def test_landscape_video_is_not_a_short(fast):
 
 
 SCRIPT = {"topic": "cats", "title": "Why Cats Purr", "hook_text": "PURR POWER", "cast": [], "category": "pets",
-          "scenes": [{"speaker": "A", "narration": f"Cats purr for reason number {i}.", "search_query": "cat",
-                      "image_prompt": "cat"} for i in range(4)],
+          "scenes": [
+              {"speaker": "A", "narration": "Cats purr for reason number one: it is a sign of contentment.", "search_query": "cat", "image_prompt": "cat"},
+              {"speaker": "A", "narration": "A cat's purr can heal bones and soothe stress in humans too.", "search_query": "cat", "image_prompt": "cat"},
+              {"speaker": "A", "narration": "They purr when happy, scared, or giving birth to their kittens.", "search_query": "cat", "image_prompt": "cat"},
+              {"speaker": "A", "narration": "The vibration is good for their health and helps them heal faster.", "search_query": "cat", "image_prompt": "cat"},
+          ],
           "description": "Purring.", "hashtags": ["#cats"], "tags": ["cats"]}
 
 
