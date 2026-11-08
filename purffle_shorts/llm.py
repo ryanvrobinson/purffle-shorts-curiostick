@@ -544,7 +544,9 @@ class GeminiProvider(Provider):
             return False, f"rate limited or quota exhausted ({message})"
         if code in (401, 403):
             return True, f"authentication or permission failure ({message})"
-        if code == 400:
+        if code is not None and 400 <= code < 500 and code not in (408, 409, 429):
+            # 400 Bad Request, 404 Not Found (dead or deprecated model), etc.: retrying cannot fix a
+            # bad request or a missing model, so fail fast instead of burning the retry budget.
             return True, f"request rejected ({message})"
         if isinstance(exc, self._genai.errors.ServerError):
             return False, f"Gemini API error ({message})"

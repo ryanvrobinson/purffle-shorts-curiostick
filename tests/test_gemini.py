@@ -14,7 +14,7 @@ from purffle_shorts.script import Scene, Script
 
 
 def _install_fake_genai(monkeypatch, captured=None, *, fail=False, rate_limited=False,
-                        auth_error=False, empty=False):
+                        auth_error=False, empty=False, not_found=False):
     """Replace ``google.genai`` with a fake that records constructor + generate_content args."""
     captured = [] if captured is None else captured
     mod = types.ModuleType("google.genai")
@@ -30,18 +30,21 @@ def _install_fake_genai(monkeypatch, captured=None, *, fail=False, rate_limited=
         def __init__(self, api_key=None, http_options=None):
             captured.append({"api_key": api_key, "http_options": http_options})
             self.models = FakeModels(captured, fail=fail, rate_limited=rate_limited,
-                                     auth_error=auth_error, empty=empty)
+                                     auth_error=auth_error, empty=empty, not_found=not_found)
 
     class FakeModels:
-        def __init__(self, captured, fail, rate_limited, auth_error, empty):
+        def __init__(self, captured, fail, rate_limited, auth_error, empty, not_found):
             self.captured = captured
-            self.fail, self.rate_limited, self.auth_error, self.empty = fail, rate_limited, auth_error, empty
+            self.fail, self.rate_limited, self.auth_error, self.empty, self.not_found = \
+                fail, rate_limited, auth_error, empty, not_found
             self.calls = 0
 
         def generate_content(self, model, contents, config=None, **kwargs):
             self.calls += 1
             call = {"model": model, "contents": contents, "config": config, "kwargs": kwargs}
             self.captured.append(call)
+            if self.not_found:
+                raise _api_error(404, "This model models/gemini-2.5-flash is no longer available")
             if self.fail:
                 raise _api_error(500, "server error")
             if self.rate_limited:
@@ -158,6 +161,28 @@ def test_gemini_auth_error_is_not_retried(monkeypatch):
         p.complete("sys", "user")
     assert sum(1 for c in captured if "model" in c) == 1  # no retry on auth failure
     # complete_json surfaces it as a clear LLMError rather than silently falling back.
+    chain = object.__new__(L.LLM)
+    chain.settings, chain.providers = Settings(), [p]
+    with pytest.raises(L.LLMError, match="All LLM providers failed"):
+        chain.complete_json("s", "u")
+
+
+def test_gemini_404_model_not_found_is_permanent_and_not_retried(monkeypatch):
+    """HTTP 404 (dead / deprecated model) is permanent: fail fast, never retry.
+
+    Regression: a deprecated model such as gemini-2.5-flash returns HTTP 404. Retrying it
+    burns the retry budget and delays the slot failure instead of surfacing "use a supported
+    model." 404 must be classified permanent so ``with_retries`` does not re-attempt it.
+    """
+    captured = []
+    _install_fake_genai(monkeypatch, captured, not_found=True)
+    monkeypatch.setenv("GEMINI_API_KEY", "k")
+    p = L.build_provider("gemini", Settings(llm_provider="gemini", llm_model="gemini-2.5-flash"))
+    with pytest.raises(L.PermanentError, match="no longer available"):
+        p.complete("sys", "user")
+    # Exactly one attempt: a permanent error is never retried.
+    assert sum(1 for c in captured if "model" in c) == 1
+    # complete_json surfaces it as a clear failure instead of silently falling through retries.
     chain = object.__new__(L.LLM)
     chain.settings, chain.providers = Settings(), [p]
     with pytest.raises(L.LLMError, match="All LLM providers failed"):
