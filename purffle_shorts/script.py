@@ -656,7 +656,12 @@ def doctor_prompt(script: Script, settings: Settings, rewrite: bool,
         f"Make the opening a specific, scientifically defensible question or consequence. Sharpen the "
         f"hook, cut filler, make vague lines concrete, remove any claim that may not be true, keep "
         f"the payoff for the end, and end with a short call to action (max 8 words). Do not invent "
-        f"facts, statistics, studies, or certainty. Put the COMPLETE rewritten script in \"script\" "
+        f"facts, statistics, studies, or certainty. For each factual claim flagged as a blocking issue: "
+        f"remove it entirely, or rewrite it using only well-established, supportable facts. Do not invent "
+        f"replacement mission dates, measurements, depths, or scientific certainty. If a claim cannot be "
+        f"verified, remove it — do not keep an unsupported assertion and do not keep re-listing it. Once "
+        f"removed or rewritten, a claim must not reappear in blocking_issues. Put the COMPLETE rewritten "
+        f"script in \\\"script\\\" "
         f"— the response must include every required field and must not be truncated.\n"
         f"Format rules to keep:\n" + _format_rules(script.style)
     ) if rewrite else 'Return only "score", "breakdown", "issues" and "blocking_issues".'

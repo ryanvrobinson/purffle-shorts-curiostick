@@ -1,5 +1,7 @@
 """Two-speaker scripts, the Script Doctor and translation — with fake LLMs, no network."""
 
+import logging
+
 import pytest
 
 from purffle_shorts.config import Settings
@@ -700,8 +702,6 @@ def test_duplicate_upload_check_failure_does_not_block(monkeypatch):
 # Hard gates (invalid structure, unresolved factual claims, missing narration,
 # unusable scene data) still block production regardless of score.
 
-import logging  # noqa: E402  (caplog level control)
-
 
 def _reply(score, blocking_issues=None, script=None):
     return {"score": score, "issues": [], "blocking_issues": blocking_issues or [], "script": script}
@@ -788,3 +788,135 @@ def test_rejected_rewrite_retains_script_and_score_at_50_threshold():
     # Retained draft is unchanged and keeps its correct score.
     assert script.score == 55
     assert script.title == "Draft"
+
+
+# ------------------------------------------------------------------ factual-claim recovery tests
+# Slot 1, 2026-11-11: Script Doctor flagged "Depth claim about lake may be
+# inaccurate." and "NASA probe plan is speculative." as blocking issues. The
+# rewrite loop must remove or rewrite such questionable claims (never invent
+# replacement facts/dates/measurements) and re-evaluate; production is allowed
+# only when all blocking claims are resolved AND the score is >= 50.
+
+
+def _blocking_reply(score, blocking, script):
+    return {"score": score, "issues": ["Unsupported claims"], "blocking_issues": blocking, "script": script}
+
+
+def _clean_reply(score, script):
+    return {"score": score, "issues": [], "blocking_issues": [], "script": script}
+
+
+def test_speculative_nasa_dates_removed_then_production_allowed(caplog):
+    """A rewrite that removes speculative mission dates (no replacement dates
+    invented) resolves the blocking issues and allows production at 50+."""
+    caplog.set_level(logging.INFO)
+    settings = Settings(target_seconds=16, script_quality_threshold=50)
+    # 41-word target, window 30..53; better script (36 words) is in range.
+
+    draft = _draft()
+    draft.score = 55
+    better = _full_script(_scenes(4, 9))  # 36 words, in range
+
+    def replies(user):
+        if len(llm.calls) == 1:
+            return _blocking_reply(
+                55,
+                ["NASA probe plan is speculative.", "Depth claim about lake may be inaccurate."],
+                better,
+            )
+        # The rewrite removed the speculative date claim; no replacement date invented.
+        return _clean_reply(70, better)
+
+    llm = FakeLLM(replies)
+    out = review_script(llm, draft, settings)
+
+    assert out.score == 70
+    assert out.blocking == [] and out.review == []
+    assert len(llm.calls) == 2  # one bounded rewrite
+    assert any("production_allowed=True" in r.getMessage() and "70" in r.getMessage()
+               for r in caplog.records)
+
+
+def test_uncertain_measurement_removed_then_production_allowed(caplog):
+    """A rewrite that drops an uncertain scientific measurement (no invented
+    replacement measurement) resolves blocking and allows production at 50+."""
+    caplog.set_level(logging.INFO)
+    settings = Settings(target_seconds=16, script_quality_threshold=50)
+    draft = _draft()
+    draft.score = 60
+    better = _full_script(_scenes(4, 9))
+
+    def replies(user):
+        if len(llm.calls) == 1:
+            return _blocking_reply(
+                60,
+                ["The depth figure for the lake is uncertain and unsupported."],
+                better,
+            )
+        return _clean_reply(68, better)
+
+    llm = FakeLLM(replies)
+    out = review_script(llm, draft, settings)
+
+    assert out.score == 68
+    assert out.blocking == []
+    assert len(llm.calls) == 2
+    assert any("production_allowed=True" in r.getMessage() for r in caplog.records)
+
+
+def test_unsupported_claim_not_silently_accepted():
+    """A high score does not bypass factual verification: unresolved blocking
+    claims still block production even when the score is well above 50."""
+    draft = _draft()
+    draft.score = 85
+    llm = FakeLLM(_blocking_reply(
+        85,
+        ["The claim that the probe launched in 2029 cannot be verified."],
+        _full_script(_scenes(4, 9)),
+    ))
+    with pytest.raises(ScriptQualityError, match="unresolved blocking"):
+        review_script(llm, draft, Settings(target_seconds=16, script_quality_threshold=50))
+    assert len(llm.calls) == 2  # bounded retries, then stop
+
+
+def test_unresolved_factual_claims_block_after_bounded_retries():
+    """Every rewrite keeps the same speculative claims; bounded retries then
+    block production with the exact reason recorded."""
+    draft = _draft()
+    draft.score = 55
+    llm = FakeLLM(lambda user: _blocking_reply(
+        70,
+        ["NASA probe plan is speculative."],
+        _full_script(_scenes(4, 9)),
+    ))
+    with pytest.raises(
+        ScriptQualityError,
+        match="unresolved blocking factual/safety/usability issues",
+    ):
+        review_script(llm, draft, Settings(target_seconds=16, script_quality_threshold=50))
+    assert len(llm.calls) == 2  # bounded, no endless retrying
+    # Draft is never replaced by the repeatedly-rejected rewrite.
+    assert draft.score == 55
+
+
+def test_factual_repair_score_association_after_rewrite():
+    """After a successful factual repair, the adopted rewrite's score is
+    associated with the new script (not the old draft's score)."""
+    settings = Settings(target_seconds=16, script_quality_threshold=50)
+    draft = _draft()
+    draft.score = 50
+    better = _full_script(_scenes(4, 9), title="Revised")
+
+    def replies(user):
+        if len(llm.calls) == 1:
+            return _blocking_reply(50, ["Depth claim about lake may be inaccurate."], better)
+        return _clean_reply(75, better)
+
+    llm = FakeLLM(replies)
+    out = review_script(llm, draft, settings)
+
+    assert out is not draft                     # the rewrite was adopted
+    assert out.title == "Revised"
+    assert out.score == 75                      # new script's score, not the draft's 50
+    assert out.blocking == []
+    assert len(llm.calls) == 2
