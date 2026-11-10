@@ -124,65 +124,35 @@ jobs:
           git config user.name "github-actions[bot]"
           git add -f data/history.db
           git diff --cached --quiet && exit 0
-          # Fetch remote first so other slots' history is absorbed before we commit, instead of after.
-          git fetch origin main || { echo "error: git fetch failed; not pushing history" >&2; exit 1; }
-          # Merge remote's slot_uploads records into the local history.db (idempotent by date+slot key;
-          # each slot owns its key). This preserves every slot's history without overwriting the SQLite
-          # file wholesale, without force-pushing, and without a binary-file rebase conflict.
-          REMOTE_DB="$(mktemp)"
-          if git show origin/main:data/history.db > "$REMOTE_DB" 2>/dev/null; then
-          python3 - "$REMOTE_DB" "data/history.db" <<'PY'
-          import sqlite3, sys
-          remote_path, local_path = sys.argv[1], sys.argv[2]
-          rcon = sqlite3.connect(remote_path)
-          lcon = sqlite3.connect(local_path)
-          rows = rcon.execute(
-              "SELECT key, run_date, slot, publish_at_utc, youtube_id, title, status, "
-              "created_at, updated_at, error FROM slot_uploads").fetchall()
-          for row in rows:
-              lcon.execute(
-                  "INSERT INTO slot_uploads (key, run_date, slot, publish_at_utc, youtube_id, title, "
-                  "status, created_at, updated_at, error) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
-                  "ON CONFLICT(key) DO UPDATE SET run_date=excluded.run_date, slot=excluded.slot, "
-                  "publish_at_utc=excluded.publish_at_utc, youtube_id=excluded.youtube_id, "
-                  "title=excluded.title, status=excluded.status, created_at=excluded.created_at, "
-                  "updated_at=excluded.updated_at, error=excluded.error", row)
-          lcon.commit()
-          rcon.close()
-          lcon.close()
-          PY
-          fi
-          git add -f data/history.db
-          git diff --cached --quiet && exit 0
-          git commit -m "chore: record CurioStick slot ${{ env.SLOT }} run (${{ github.run_id }})"
-          # If remote advanced between our fetch and this commit, reparent onto origin/main so the
-          # push fast-forwards. Never force-push; never overwrite another slot's history.
-          if git merge-base --is-ancestor origin/main HEAD; then
-          git push origin main
-          else
-          RUN_DATE=$(TZ=Asia/Kolkata date +%F)
-          REMOTE_DB="$(mktemp)"
-          git show origin/main:data/history.db > "$REMOTE_DB" 2>/dev/null || true
-          if python3 - "$REMOTE_DB" "$RUN_DATE" "${SLOT}" <<'PY'
-          import sqlite3, sys
-          path, run_date, slot = sys.argv[1], sys.argv[2], sys.argv[3]
-          key = f"{run_date}-slot-{slot}"
-          try:
-              conn = sqlite3.connect(path)
-              row = conn.execute(
-                  "SELECT 1 FROM slot_uploads WHERE key = ? AND status = 'scheduled'", (key,)).fetchone()
-              conn.close()
-              sys.exit(0 if row else 1)
-          except Exception:
-              sys.exit(1)
-          PY
-          then
-            echo "Slot ${SLOT} for ${RUN_DATE} already recorded on remote; nothing to push."
-            exit 0
-          fi
-            echo "error: remote main advanced with history this run does not have; refusing to force-push or merge SQLite history" >&2
-            exit 1
-          fi
+          # Bounded push-with-reconciliation loop. Remote slot runs only append to
+          # data/history.db (idempotent by date+slot key; each slot owns its key), so
+          # we merge remote history into our database, commit on top of origin/main,
+          # and fast-forward push. Never force-push; never overwrite another slot's
+          # records; never reset or discard history.
+          MAX_ATTEMPTS=5
+          attempt=0
+          while [ $attempt -lt $MAX_ATTEMPTS ]; do
+            attempt=$((attempt + 1))
+            git fetch origin main || { echo "error: git fetch failed; not pushing history" >&2; exit 1; }
+            # Merge remote's slot_uploads records into the local history.db
+            # (idempotent by date+slot key). Preserves every slot's history without
+            # overwriting the SQLite file wholesale or force-pushing.
+            REMOTE_DB="$(mktemp)"
+            if git show origin/main:data/history.db > "$REMOTE_DB" 2>/dev/null; then
+          python3 scripts/merge_slot_history.py "$REMOTE_DB" "data/history.db"
+            fi
+            git add -f data/history.db
+            git diff --cached --quiet && { echo "no changes to push"; exit 0; }
+            # Commit directly on top of origin/main so the push fast-forwards.
+            NEW_COMMIT="$(git commit-tree $(git write-tree) -p origin/main -m 'chore: record CurioStick slot ${{ env.SLOT }} run (${{ github.run_id }}')"
+            git update-ref refs/heads/main "$NEW_COMMIT"
+            if git merge-base --is-ancestor origin/main HEAD; then
+            git push origin main && exit 0
+            fi
+            # Remote advanced between commit and push: reconcile again on the next attempt.
+          done
+          echo "error: failed to push history after $MAX_ATTEMPTS attempts; refusing to force-push" >&2
+          exit 1
 
       - name: Upload logs and failure reports
         if: always()

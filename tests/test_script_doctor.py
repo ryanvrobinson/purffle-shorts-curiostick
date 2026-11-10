@@ -474,6 +474,39 @@ def test_rewrite_keeps_blocking_issues_produces_clear_blocking_error():
         review_script(llm, _draft(), settings)
     assert len(llm.calls) == 2  # bounded, no endless retrying
 
+
+def test_rewrite_rejected_for_invalid_structure_retains_draft():
+    """A rewrite whose script fails the structure check (e.g. a scene with no
+    narration) is ignored and the draft is retained with its correct score."""
+    script = _draft()
+    script.score = 70
+    invalid = {
+        "title": "T", "hook_text": "H", "cast": [], "scenes": [
+            {"speaker": "A", "narration": "", "search_query": "q", "image_prompt": "p"},
+        ],
+        "description": "d", "hashtags": [], "tags": [], "category": "pets",
+    }
+    llm = FakeLLM({"score": 88, "issues": ["structure"], "blocking_issues": ["structure"], "script": invalid})
+    settings = Settings(script_quality_threshold=90)
+    with pytest.raises(ScriptQualityError, match="unresolved blocking"):
+        review_script(llm, script, settings)
+    assert len(llm.calls) == 2  # bounded, no endless retrying
+    # The rejected rewrite must not overwrite the retained draft's score.
+    assert script.score == 70
+
+
+def test_rejected_higher_scoring_rewrite_retains_correct_score():
+    """A rewrite that scores higher but carries no usable script must not
+    overwrite the retained draft's score (the Slot 1 regression)."""
+    script = _draft()
+    script.score = 90  # already passes the threshold
+    llm = FakeLLM({"score": 95, "issues": [], "script": None})  # no script -> not adopted
+    out = review_script(llm, script, Settings(script_quality_threshold=90))
+    assert out is script                      # same retained object
+    assert out.score == 90                    # retained draft's score, not the rejected 95
+    assert len(llm.calls) == 1                # score >= threshold: no retry
+
+
 # ------------------------------------------------------------------ hook-only rewrite regression tests
 
 def _script_with_bad_hook():

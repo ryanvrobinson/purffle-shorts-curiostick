@@ -162,6 +162,7 @@ class Script:
     selected_hook: str = ""            # the hook that made it into the final script
     sources: list[str] = field(default_factory=list)  # source references when research material was supplied
     verification_report: dict | None = None  # claim-based fact verification report (Phase 2)
+    breakdown: dict[str, int] | None = None  # last Script Doctor rubric score breakdown (category -> points)
 
     @property
     def narration(self) -> str:
@@ -397,6 +398,7 @@ def normalize(data: dict, subject: str, style: str, language: str) -> Script:
         selected_hook=str(data.get("selected_hook") or "").strip(),
         sources=[str(s).strip() for s in (data.get("sources") or []) if str(s).strip()],
         verification_report=data.get("verification_report"),
+        breakdown=data.get("breakdown"),
     )
 
 
@@ -518,7 +520,10 @@ def review_prompt(script: Script, settings: Settings, rewrite: bool,
     coherent progression from hook to payoff. Make the opening a specific, scientifically
     defensible question or consequence. Fix ONLY the issues listed above — do not rewrite scenes that are
 already good. Sharpen the hook, cut filler, make vague lines concrete, remove any claim that may not be true,
-keep the payoff for the end. Do not invent facts, statistics, studies, or certainty. Put the rewritten script
+keep the payoff for the end. Do not invent facts, statistics, studies, or certainty. Deliver concrete,
+measurable improvements: a sharper opening hook, a clear curiosity gap that pulls viewers through, a logical
+narrative progression scene to scene, factually precise claims only, and a satisfying payoff in the final scene.
+Put the rewritten script
 in "script". Format rules to keep:
 {_format_rules(script.style)}""" if rewrite else
             'Return only "score" and "issues".')
@@ -530,6 +535,8 @@ in "script". Format rules to keep:
     findings = []
     if script.score is not None:
         findings.append(f"previous Script Doctor score: {script.score}/100")
+    if script.breakdown:
+        findings.append(f"previous score breakdown: {script.breakdown}")
     if script.review:
         findings.append(f"previous issues: {'; '.join(script.review)}")
     if findings:
@@ -661,6 +668,8 @@ def doctor_prompt(script: Script, settings: Settings, rewrite: bool,
     findings = []
     if script.score is not None:
         findings.append(f"previous Script Doctor score: {script.score}/100")
+    if script.breakdown:
+        findings.append(f"previous score breakdown: {script.breakdown}")
     if script.review:
         findings.append(f"previous issues: {'; '.join(script.review)}")
     if findings:
@@ -795,8 +804,22 @@ def review_script(llm, script: Script, settings: Settings) -> Script:
                     )
 
         score = score if score is not None else current.score
-        result.score, result.review = score, issues
-        result.blocking = combined_blocking
+        adopted = result is not current
+        # Set the review/score/blocking on the script we return: always in
+        # score-only mode, and in rewrite mode only when the rewrite was
+        # accepted. A rejected rewrite must never overwrite the retained
+        # script's score, review findings, or blocking issues.
+        should_set_review = (not rewrite) or adopted
+        if should_set_review:
+            result.score = score
+            result.review = issues
+            result.blocking = combined_blocking
+            result.breakdown = data.get("breakdown") or {}
+        else:
+            # Rejected rewrite: keep the retained script's score/review/blocking
+            # intact. `score` (the rejected rewrite's score) is used only for
+            # logging and for the feedback below.
+            result.breakdown = current.breakdown or {}
 
         if combined_blocking:
             if rewrite and attempt + 1 < attempts:
@@ -824,8 +847,9 @@ def review_script(llm, script: Script, settings: Settings) -> Script:
                     f"Script Doctor score {score} remains below the {threshold}-point threshold "
                     f"after {attempts} bounded rewrite(s); rendering was stopped.")
             log.warning("Script Doctor score %d is below the %d-point threshold", score, threshold)
-        changed = "rewritten" if result is not current else "kept"
-        log.info("Script Doctor: %s/100, %s%s", score if score is not None else "?", changed,
+        changed = "rewritten" if adopted else "kept"
+        log.info("Script Doctor attempt %d/%d: %s/100, %s%s",
+                 attempt + 1, attempts, score if score is not None else "?", changed,
                  f" — {issues[0]}" if issues else "")
         return result
     return current
