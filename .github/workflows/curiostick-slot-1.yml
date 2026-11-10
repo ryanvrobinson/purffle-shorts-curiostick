@@ -101,7 +101,6 @@ jobs:
           ARGS="--slot ${{ env.SLOT }} --date $RUN_DATE --verbose"
           if [ "${{ inputs.publish }}" = "true" ] || [ "${{ github.event_name }}" = "schedule" ]; then ARGS="$ARGS --publish"; fi
           python -m purffle_shorts daily $ARGS
-        continue-on-error: true
 
       - name: Record failure details (if run failed)
         if: failure()
@@ -195,4 +194,6 @@ jobs:
             data/logs/
             data/failures/
             data/run-summary.md
-          retention-days: 1
+          retention-days: 30  # KEEP_VIDEOS=true: keep MP4s, scripts, subtitles, attribution and failure reports
+                               # for 30 days (subject to GitHub Actions storage limits). MP4s are never
+                               # committed into Git history; see docs/retention.md.

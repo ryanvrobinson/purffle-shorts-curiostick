@@ -31,7 +31,30 @@ CREATE TABLE IF NOT EXISTS ideas (
     subject TEXT NOT NULL,
     style TEXT, notes TEXT,
     status TEXT NOT NULL DEFAULT 'pending',   -- pending | used
-    used_at TEXT, video_id INTEGER
+    used_at TEXT, video_id INTEGER,
+    series_id TEXT,          -- the series this idea belongs to (may be NULL)
+    episode_number INTEGER   -- episode within the series (1-based)
+);
+CREATE TABLE IF NOT EXISTS series (
+    series_id TEXT PRIMARY KEY,           -- stable id, e.g. "chicxulub-2026-10-31"
+    title TEXT NOT NULL,                   -- series theme / title
+    description TEXT,
+    total_episodes INTEGER NOT NULL DEFAULT 3,
+    status TEXT NOT NULL DEFAULT 'planned', -- planned | active | completed
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS series_episodes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    series_id TEXT NOT NULL,
+    episode_number INTEGER NOT NULL,
+    headline TEXT,
+    slot INTEGER,                          -- planned slot 1-3
+    run_date TEXT,                         -- planned Asia/Kolkata date
+    status TEXT NOT NULL DEFAULT 'pending', -- pending | produced | published | failed
+    youtube_id TEXT,
+    recovery_status TEXT,
+    created_at TEXT NOT NULL,
+    UNIQUE(series_id, episode_number)
 );
 CREATE TABLE IF NOT EXISTS slot_uploads (
     key TEXT PRIMARY KEY,            -- YYYY-MM-DD-slot-N (Asia/Kolkata date + slot 1-3)
@@ -104,6 +127,10 @@ class History:
             for col, kind in VIDEO_COLUMNS.items():
                 if col not in have:
                     c.execute(f"ALTER TABLE videos ADD COLUMN {col} {kind}")
+            have_ideas = {r["name"] for r in c.execute("PRAGMA table_info(ideas)")}
+            for col, kind in (("series_id", "TEXT"), ("episode_number", "INTEGER")):
+                if col not in have_ideas:
+                    c.execute(f"ALTER TABLE ideas ADD COLUMN {col} {kind}")
 
     @contextmanager
     def _db(self) -> Iterator[sqlite3.Connection]:
@@ -226,23 +253,18 @@ class History:
             "ORDER BY am.imported_at DESC")
 
     # -- idea queue (planner) --
-    def add_idea(self, subject: str, style: str = "", notes: str = "") -> int:
-        return self._exec("INSERT INTO ideas (created_at, subject, style, notes) VALUES (?, ?, ?, ?)",
-                          (now_iso(), subject.strip(), style or None, notes or None))
+    def add_idea(self, subject: str, style: str = "", notes: str = "",
+                 series_id: str | None = None, episode_number: int | None = None) -> int:
+        return self._exec(
+            "INSERT INTO ideas (created_at, subject, style, notes, series_id, episode_number) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (now_iso(), subject.strip(), style or None, notes or None, series_id, episode_number),
+        )
 
     def ideas(self, status: str | None = "pending", limit: int = 200) -> list[dict]:
         if status:
             return self._all("SELECT * FROM ideas WHERE status = ? ORDER BY id LIMIT ?", (status, limit))
         return self._all("SELECT * FROM ideas ORDER BY id DESC LIMIT ?", (limit,))
-
-    def claim_idea(self) -> dict | None:
-        """Take the oldest pending idea (atomically, so parallel workers never get the same one)."""
-        with self._db() as c:
-            row = c.execute("SELECT * FROM ideas WHERE status = 'pending' ORDER BY id LIMIT 1").fetchone()
-            if not row:
-                return None
-            c.execute("UPDATE ideas SET status = 'used', used_at = ? WHERE id = ?", (now_iso(), row["id"]))
-            return dict(row)
 
     def link_idea(self, idea_id: int, video_id: int) -> None:
         self._exec("UPDATE ideas SET video_id = ? WHERE id = ?", (video_id, idea_id))
@@ -403,3 +425,125 @@ class History:
         rows = self._all(
             "SELECT status, COUNT(*) AS n FROM recovery_queue GROUP BY status")
         return {r["status"]: r["n"] for r in rows}
+
+    # ------------------------------------------------------------------ series tracking
+    def add_series(self, series_id: str, title: str, description: str = "",
+                   total_episodes: int = 3) -> None:
+        """Register a multi-part series (idempotent by series_id)."""
+        self._exec(
+            "INSERT INTO series (series_id, title, description, total_episodes, status, created_at) "
+            "VALUES (?, ?, ?, ?, 'planned', ?) "
+            "ON CONFLICT(series_id) DO UPDATE SET title=excluded.title, "
+            "description=excluded.description, total_episodes=excluded.total_episodes",
+            (series_id, title, description, total_episodes, now_iso()),
+        )
+
+    def add_series_episode(self, series_id: str, episode_number: int, headline: str,
+                           slot: int | None = None, run_date: str | None = None) -> int:
+        """Record a planned series episode (idempotent by series_id + episode_number)."""
+        row = self._all(
+            "SELECT id FROM series_episodes WHERE series_id = ? AND episode_number = ?",
+            (series_id, episode_number),
+        )
+        if row:
+            self._exec(
+                "UPDATE series_episodes SET headline = COALESCE(?, headline), slot = COALESCE(?, slot), "
+                "run_date = COALESCE(?, run_date) WHERE id = ?",
+                (headline, slot, run_date, row[0]["id"]),
+            )
+            return row[0]["id"]
+        return self._exec(
+            "INSERT INTO series_episodes (series_id, episode_number, headline, slot, run_date, "
+            "status, created_at) VALUES (?, ?, ?, ?, ?, 'pending', ?)",
+            (series_id, episode_number, headline, slot, run_date, now_iso()),
+        )
+
+    def get_series(self, series_id: str) -> dict | None:
+        rows = self._all("SELECT * FROM series WHERE series_id = ?", (series_id,))
+        return rows[0] if rows else None
+
+    def series_episodes(self, series_id: str) -> list[dict]:
+        return self._all(
+            "SELECT * FROM series_episodes WHERE series_id = ? ORDER BY episode_number",
+            (series_id,),
+        )
+
+    def all_series(self) -> list[dict]:
+        return self._all("SELECT * FROM series ORDER BY created_at DESC")
+
+    def mark_episode_status(self, series_id: str, episode_number: int, status: str,
+                            youtube_id: str | None = None,
+                            recovery_status: str | None = None) -> None:
+        """Update a series episode's production/publishing/recovery status."""
+        sets = ["status = ?"]
+        args: list = [status]
+        if youtube_id is not None:
+            sets.append("youtube_id = ?")
+            args.append(youtube_id)
+        if recovery_status is not None:
+            sets.append("recovery_status = ?")
+            args.append(recovery_status)
+        args += [series_id, episode_number]
+        self._exec(
+            f"UPDATE series_episodes SET {', '.join(sets)} WHERE series_id = ? AND episode_number = ?",
+            tuple(args),
+        )
+
+    def next_due_episode(self, series_id: str) -> dict | None:
+        """The lowest-numbered pending episode of a series whose predecessors are complete.
+
+        Never returns Part 3 before Part 2, and never skips an episode.
+        """
+        episodes = self.series_episodes(series_id)
+        produced = {
+            e["episode_number"]
+            for e in episodes
+            if e["status"] in ("produced", "published")
+        }
+        for e in episodes:
+            if e["status"] != "pending":
+                continue
+            if e["episode_number"] == 1 or all(
+                n in produced for n in range(1, e["episode_number"])
+            ):
+                return e
+        return None
+
+    def plan_overview(self) -> dict:
+        series = self.all_series()
+        out = []
+        for s in series:
+            eps = self.series_episodes(s["series_id"])
+            out.append({
+                "series_id": s["series_id"],
+                "title": s["title"],
+                "status": s["status"],
+                "episodes": len(eps),
+                "produced": sum(1 for e in eps if e["status"] in ("produced", "published")),
+                "published": sum(1 for e in eps if e["status"] == "published"),
+            })
+        return {"series": out, "total_series": len(series)}
+
+    # ------------------------------------------------------------------ idea queue with series ordering
+    def claim_idea(self) -> dict | None:
+        """Take the oldest pending idea whose series predecessors are complete.
+
+        Never skips an episode and never publishes Part N+1 before Part N.
+        """
+        with self._db() as c:
+            rows = c.execute(
+                "SELECT * FROM ideas WHERE status = 'pending' ORDER BY id").fetchall()
+            for row in rows:
+                sid = row["series_id"]
+                ep = row["episode_number"]
+                if sid is not None and ep is not None and ep > 1:
+                    preds = c.execute(
+                        "SELECT 1 FROM ideas WHERE series_id = ? AND episode_number < ? "
+                        "AND status != 'used' LIMIT 1",
+                        (sid, ep)).fetchone()
+                    if preds:
+                        continue  # predecessor still pending: do not claim out of order
+                c.execute("UPDATE ideas SET status = 'used', used_at = ? WHERE id = ?",
+                          (now_iso(), row["id"]))
+                return dict(row)
+            return None

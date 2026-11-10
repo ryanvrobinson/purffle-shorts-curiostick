@@ -17,7 +17,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from . import analytics, ffmpeg, notify, research, topics, tts, youtube
-from .config import Settings, duration_window
+from .config import Settings, duration_window, short_duration_bounds
 from .history import History, now_iso
 from .llm import LLM, LLMConfigError, LLMNotConfigured
 from .media import AI_SOURCES, MediaItem, Visuals
@@ -360,8 +360,13 @@ class Studio:
             # Pre-render duration guard: if the spoken audio already exceeds the
             # QC maximum, attempt a meaning-preserving script reduction before
             # rendering anything. This catches overlong scripts early instead of
-            # rendering a 45s video that QC will reject.
-            max_dur = duration_window(s.target_seconds)[1]
+            # rendering a too-long video that QC will reject.
+            max_dur = float(duration_window(s.target_seconds)[1])
+            # Hard maximum for the 30-second Shorts format: the rendered video must
+            # never exceed the target plus only the documented encoding tolerance.
+            short = short_duration_bounds(s.target_seconds)
+            if short is not None:
+                max_dur = min(max_dur, short[1])
             if total > max_dur:
                 log.warning(
                     "Narration too long (%.1fs incl. pad; max %.1fs), attempting script reduction",

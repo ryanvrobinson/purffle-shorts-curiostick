@@ -10,7 +10,7 @@ import os
 import sys
 import time
 from dataclasses import dataclass
-from datetime import datetime, time as dtime, timezone
+from datetime import datetime, time as dtime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 from zoneinfo import ZoneInfo
@@ -421,6 +421,31 @@ def slot_publish_moments(run_date: str | None = None,
     return moments
 
 
+def next_available_moment(now: datetime | None = None,
+                          timezone_name: str = "Asia/Kolkata") -> datetime:
+    """The next publishing slot moment at or after ``now`` (09:00 / 14:00 / 19:00 IST).
+
+    Implements the CurioStick catch-up policy: when a slot's nominal publication
+    time has passed, the video is published at the next available future slot
+    instead of being dropped or published into the past. A small lead time keeps
+    the schedule realistic for unattended runs.
+    """
+    from zoneinfo import ZoneInfo
+
+    tz = ZoneInfo(timezone_name)
+    now = (now or datetime.now(timezone.utc)).astimezone(tz)
+    lead = timedelta(minutes=5)
+    day = now.date()
+    for offset in range(0, 3):
+        d = day + timedelta(days=offset)
+        for slot in (1, 2, 3):
+            hh, mm = (int(x) for x in SLOT_TIMES[slot].split(":"))
+            cand = datetime.combine(d, dtime(hh, mm), tzinfo=tz)
+            if cand >= now + lead:
+                return cand
+    raise RuntimeError("No future publishing slot found")
+
+
 @dataclass
 class SlotRunResult:
     """Result of running one publishing slot."""
@@ -488,6 +513,22 @@ class SlotAutomation:
                  self.slot, SLOT_TIMES[self.slot], self.run_date,
                  publish_at.isoformat(), publish_at_utc)
 
+        # Catch-up policy: if this slot's nominal publication time has passed and the
+        # video was not already produced, publish at the next available future slot
+        # instead of dropping it or publishing into the past. Dry runs keep the
+        # original target (nothing is scheduled) so a manual dry-run still works
+        # after the nominal slot time.
+        if (not self.dry_run and publish_at <= now
+                and not self.history.is_slot_done(self.key)):
+            catch_up = next_available_moment(now, self.s.timezone)
+            log.warning(
+                "Slot %s (%s) for %s: publish target %s is in the past; "
+                "catching up at %s",
+                self.slot, SLOT_TIMES[self.slot], self.run_date,
+                publish_at.isoformat(), catch_up.isoformat())
+            publish_at = catch_up
+            publish_at_utc = youtube.to_rfc3339(catch_up)
+
         # Recovery-first: if this slot previously failed and is retryable, try recovery.
         if self.recover:
             recovery = self.history.get_recovery_for_slot(self.key)
@@ -514,16 +555,41 @@ class SlotAutomation:
                 publish_at_utc=publish_at_utc, publish_at_ist=publish_at.isoformat(),
                 skipped=True, skip_reason=msg, youtube_id=existing.get("youtube_id"))
 
-        # 2. Never publish into the past: if the slot time passed, skip and record it.
+        # 2. Never publish into the past: if the slot time passed, never publish late.
         if publish_at <= now:
-            msg = f"Slot {self.slot} publish time {publish_at.isoformat()} is in the past; skipping slot"
-            log.warning(msg)
-            self.history.record_slot(self.key, self.run_date, self.slot, publish_at_utc,
-                                     "skipped", error="publish time passed")
-            return SlotRunResult(
-                ok=True, slot=self.slot, run_date=self.run_date, key=self.key,
-                publish_at_utc=publish_at_utc, publish_at_ist=publish_at.isoformat(),
-                skipped=True, skip_reason=msg, error=msg)
+            if self.history.is_slot_done(self.key):
+                # Already produced (e.g. by an earlier catch-up run).
+                existing = self.history.get_slot(self.key)
+                if existing is None:
+                    existing = {}
+                msg = f"Slot {self.slot} for {self.run_date} already scheduled (video {existing.get('youtube_id')})"
+                log.info(msg)
+                return SlotRunResult(
+                    ok=True, slot=self.slot, run_date=self.run_date, key=self.key,
+                    publish_at_utc=publish_at_utc, publish_at_ist=publish_at.isoformat(),
+                    skipped=True, skip_reason=msg, youtube_id=existing.get("youtube_id"))
+            if self.dry_run:
+                # Manual dry-runs still work after the nominal slot time: generate and
+                # quality-check, but never schedule into the past.
+                log.warning(
+                    "Slot %s (%s) for %s: publish target %s is in the past; "
+                    "dry run only, nothing will be scheduled",
+                    self.slot, SLOT_TIMES[self.slot], self.run_date, publish_at.isoformat())
+            else:
+                # Real run: the slot was missed. Record it accurately and queue a
+                # bounded catch-up recovery that publishes at the next available slot.
+                msg = f"Slot {self.slot} publish time {publish_at.isoformat()} is in the past; missed slot, not publishing late"
+                log.warning(msg)
+                self.history.record_slot(self.key, self.run_date, self.slot, publish_at_utc,
+                                         "missed", error="publish time passed")
+                self.history.record_failure(
+                    self.run_date, self.slot, self.key, None, "schedule", msg,
+                    recoverable=True, rendered=False, uploaded=False,
+                )
+                return SlotRunResult(
+                    ok=False, slot=self.slot, run_date=self.run_date, key=self.key,
+                    publish_at_utc=publish_at_utc, publish_at_ist=publish_at.isoformat(),
+                    skipped=True, skip_reason=msg, error=msg)
 
         # 3. Generate the video (topic, script, voice, footage, render).
         try:

@@ -251,8 +251,8 @@ def test_dry_run_never_publishes(tmp_path, monkeypatch):
     assert calls == []  # nothing uploaded
 
 
-def test_past_slot_is_skipped_not_published(tmp_path, monkeypatch):
-    """A slot whose publication time has passed is skipped, never published late."""
+def test_past_slot_catches_up_to_next_available_slot(tmp_path, monkeypatch):
+    """A missed slot is caught up at the next available future slot, never published late."""
     history = History(tmp_path / "history.db")
     studio = FakeStudio(tmp_path, history)
     calls = []
@@ -267,12 +267,68 @@ def test_past_slot_is_skipped_not_published(tmp_path, monkeypatch):
                           dry_run=False, studio=studio, history=history)
     result = auto.run_slot()
 
-    assert result.skipped is True
+    # The missed slot is caught up at a future slot; never published into the past.
     assert result.ok is True
-    assert "past" in result.skip_reason.lower()
-    assert calls == []  # not published into the past
+    assert result.uploaded is True
+    assert result.youtube_id == "vid-slot-1"
+    published = datetime.fromisoformat(result.publish_at_utc.replace("Z", "+00:00"))
+    assert published > datetime.now(timezone.utc)
+    assert calls == []  # upload_scheduled is faked; no direct Y.upload call
     row = history.get_slot(slot_key(yesterday, 1))
-    assert row["status"] == "skipped"
+    assert row["status"] == "scheduled"
+    assert row["publish_at_utc"] == result.publish_at_utc
+
+
+def test_past_slot_dry_run_works_after_slot_time(tmp_path, monkeypatch):
+    """Manual dry-run after the nominal slot time: generates + QC, never schedules."""
+    history = History(tmp_path / "history.db")
+    studio = FakeStudio(tmp_path, history)
+    calls = []
+    monkeypatch.setattr(Y, "upload", lambda settings, video, body: calls.append(body) or {"id": "v"})
+    monkeypatch.setattr("purffle_shorts.automation.QualityGate",
+                        lambda settings: FakeGate())
+
+    yesterday = "2026-10-30"
+    settings = Settings(output_dir=str(tmp_path / "out"), data_dir=str(tmp_path / "data"),
+                        upload=False, timezone="Asia/Kolkata")
+    auto = SlotAutomation(settings, slot=1, run_date=yesterday,
+                          dry_run=True, studio=studio, history=history)
+    result = auto.run_slot()
+
+    assert result.ok is True
+    assert result.dry_run is True
+    assert result.uploaded is False
+    assert calls == []  # nothing scheduled into the past
+    # A dry run never publishes, so the slot is not marked done.
+    assert history.is_slot_done(slot_key(yesterday, 1)) is False
+
+
+def test_past_slot_run_slot_records_missed_never_success(tmp_path):
+    """_run_slot with a past publish time records a missed slot, never success,
+    never publishes into the past (defense-in-depth when called directly)."""
+    history = History(tmp_path / "history.db")
+    settings = Settings(output_dir=str(tmp_path / "out"), data_dir=str(tmp_path / "data"),
+                        upload=False, timezone="Asia/Kolkata")
+    auto = SlotAutomation(settings, slot=1, run_date="2026-10-30",
+                          dry_run=False, history=history)
+
+    IST = ZoneInfo("Asia/Kolkata")
+    past = datetime(2026, 10, 30, 9, 0, tzinfo=IST)   # nominal slot time
+    now = datetime(2026, 10, 30, 10, 0, tzinfo=IST)   # after the slot passed
+
+    result = auto._run_slot(past, Y.to_rfc3339(past), now)
+
+    assert result.ok is False
+    assert result.skipped is True
+    assert "past" in result.skip_reason.lower()
+    assert "is in the past" in result.error
+    assert "not publishing late" in result.error
+    row = history.get_slot(slot_key("2026-10-30", 1))
+    assert row["status"] == "missed"
+    assert row["error"] == "publish time passed"
+    # A missed slot queues a bounded catch-up recovery, not a silent success.
+    recs = history.pending_recoveries(limit=10)
+    assert any(r["key"] == slot_key("2026-10-30", 1) for r in recs)
 
 
 def test_quality_failure_blocks_upload_and_saves_details(tmp_path, monkeypatch):

@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from . import ffmpeg
-from .config import ASPECTS, Settings, duration_window
+from .config import ASPECTS, Settings, duration_window, short_duration_bounds
 from .script import HOOK_BAD_PATTERNS
 
 if TYPE_CHECKING:
@@ -259,17 +259,37 @@ class QualityGate:
                 return QualityCheck("duration", False, "Invalid duration")
 
             min_dur, max_dur = duration_window(self.settings.target_seconds)
+            # The 30-second Shorts format uses a strict window: preferred 27-30s
+            # with a hard maximum of 30s plus only the encoding tolerance.
+            short = short_duration_bounds(self.settings.target_seconds)
+            if short is not None:
+                min_dur, max_dur = short
 
+            if short is not None:
+                # Shorts contract: the hard maximum is never exceeded; the
+                # preferred minimum is advisory because narration pace varies
+                # by voice and must not be forced with unnatural TTS speed.
+                if duration > max_dur:
+                    return QualityCheck(
+                        "duration", False,
+                        f"Duration {duration:.1f}s exceeds hard maximum {max_dur}s")
+                if duration < min_dur:
+                    return QualityCheck(
+                        "duration", True,
+                        f"Duration {duration:.1f}s under preferred minimum {min_dur}s "
+                        f"(hard cap {max_dur}s)",
+                        details={"method": "automated", "advisory": "under_preferred_min"})
+                return QualityCheck(
+                    "duration", True,
+                    f"Duration {duration:.1f}s within preferred range ({min_dur}-{max_dur}s)")
             if duration < min_dur:
                 return QualityCheck(
                     "duration", False,
-                    f"Duration {duration:.1f}s below minimum {min_dur}s"
-                )
+                    f"Duration {duration:.1f}s below minimum {min_dur}s")
             if duration > max_dur:
                 return QualityCheck(
                     "duration", False,
-                    f"Duration {duration:.1f}s exceeds maximum {max_dur}s"
-                )
+                    f"Duration {duration:.1f}s exceeds maximum {max_dur}s")
 
             return QualityCheck(
                 "duration", True,

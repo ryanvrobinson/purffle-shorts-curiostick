@@ -329,6 +329,14 @@ KINETIC_ORANGE = "#FF7A18"
 EXIT_MODES = {"auto", "none", "dust", "dissolve"}
 CENTER_Y = {"upper": 0.30, "center": 0.56, "lower": 0.68}
 
+# ------------------------------------------------------------------ subscribe end card
+# One reusable animated end card rendered into every Short, inside the total
+# duration (never appended after it). Roughly 2-3 seconds: a reveal, a subtle
+# scale pulse and an optional bell, then a fade. No fake clickable controls.
+END_CARD_SECONDS = 2.5
+END_CARD_TEXT = "SUBSCRIBE FOR MORE"
+END_CARD_BELL = "\U0001f514"  # bell glyph; drawn as a fallback shape when unsupported
+
 
 def _rgba(hex_color: str | None, alpha: int = 255) -> tuple[int, int, int, int]:
     """A colour as RGBA. ``None`` becomes fully transparent, so a style with no stroke simply has none."""
@@ -1187,6 +1195,151 @@ def post_card_png(settings: Settings, font_path: Path | None, community: str, us
     return dest, (W - cw) // 2, y0
 
 
+# ------------------------------------------------------------------------------------------ subscribe end card
+def _draw_bell(d: ImageDraw.ImageDraw, cx: int, cy: int, size: int, fill) -> None:
+    """A small, restrained bell icon centered at (cx, cy). Drawn with primitives so
+    it never depends on an emoji-capable font."""
+    r = size * 0.28
+    # bell bowl
+    d.ellipse((cx - r, cy - r * 0.5, cx + r, cy + r * 0.5), outline=fill, width=max(2, int(size * 0.05)))
+    # flared rim
+    rim = size * 0.10
+    d.arc((cx - r - rim, cy - r * 0.55, cx + r + rim, cy - r * 0.45), start=180, end=360, fill=fill,
+          width=max(2, int(size * 0.05)))
+    # top loop
+    loop = size * 0.16
+    d.arc((cx - loop, cy - r - loop, cx + loop, cy - r + loop * 0.4), start=0, end=180, fill=fill,
+          width=max(2, int(size * 0.05)))
+    # clapper
+    d.line((cx, cy + r * 0.45, cx, cy + r * 0.9), fill=fill, width=max(2, int(size * 0.05)))
+
+
+def _end_card_frame(
+    settings: Settings,
+    font_path: Path | None,
+    work: Path,
+    name: str,
+    scale: float,
+    alpha: int,
+    glow: bool,
+    bell: bool,
+) -> Path:
+    """One end-card state: the subscribe button at ``scale`` with ``alpha``, an
+    optional restrained glow and an optional bell. Full frame so it composites
+    cleanly over the footage."""
+    W, H = settings.width, settings.height
+    img = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+
+    bw = int(W * 0.70 * scale)
+    bh = int(H * 0.14 * scale)
+    bh = max(bh, 40)
+    bx = (W - bw) // 2
+    by = int(H * 0.58) - bh // 2
+    radius = max(8, int(bh * 0.5))
+
+    if glow:
+        glow_pad = int(bh * 0.6)
+        gx = bx - glow_pad
+        gy = by - glow_pad
+        gw = bw + 2 * glow_pad
+        gh = bh + 2 * glow_pad
+        glow_img = Image.new("RGBA", (gw, gh), (0, 0, 0, 0))
+        gd = ImageDraw.Draw(glow_img)
+        gd.rounded_rectangle((0, 0, gw - 1, gh - 1), radius=radius + glow_pad,
+                             fill=(255, 122, 24, 34))
+        glow_img = glow_img.filter(ImageFilter.GaussianBlur(radius=max(4, int(bh * 0.25))))
+        img.alpha_composite(glow_img, (gx, gy))
+
+    # button body
+    body = Image.new("RGBA", (bw, bh), (0, 0, 0, 0))
+    bd = ImageDraw.Draw(body)
+    bd.rounded_rectangle((0, 0, bw - 1, bh - 1), radius=radius,
+                         fill=(11, 11, 15, alpha),
+                         outline=(255, 255, 255, max(40, int(90 * alpha / 255))), width=max(2, int(bh * 0.03)))
+    # inner restrained moving outline (a thinner accent stroke inside the button)
+    bd.rounded_rectangle((3, 3, bw - 4, bh - 4), radius=max(2, radius - 3),
+                         outline=(255, 122, 24, max(60, int(140 * alpha / 255))),
+                         width=max(1, int(bh * 0.02)))
+
+    # text
+    font = load_font(font_path, max(20, int(bh * 0.55)), weight=800)
+    tw = font.getlength(END_CARD_TEXT)
+    ascent, descent = font.getmetrics()
+    tx = (bw - tw) // 2
+    ty = (bh - (ascent + descent)) // 2 + ascent
+    bd.text((tx, ty), END_CARD_TEXT, font=font, anchor="ls",
+            fill=(255, 255, 255, alpha), stroke_width=max(1, int(bh * 0.015)),
+            stroke_fill=(0, 0, 0, int(120 * alpha / 255)))
+
+    # bell
+    if bell:
+        bell_size = int(bh * 0.55)
+        _draw_bell(bd, bw - int(bh * 0.35), bh // 2, bell_size,
+                   (255, 255, 255, alpha))
+
+    img.alpha_composite(body, (bx, by))
+    dest = work / name
+    img.save(dest, compress_level=1)
+    return dest
+
+
+def build_end_card(settings: Settings, font_path: Path | None, total: float, work: Path
+                   ) -> tuple[Path, int, int, float, float] | None:
+    """Build the reusable animated subscribe end card.
+
+    Returns ``(playlist, x, y, start, duration)`` or ``None`` when it cannot be
+    built. The card plays inside ``[start, start + duration]`` which lies within
+    ``[0, total]`` so it never extends the video past its total duration.
+    """
+    try:
+        from PIL import ImageFilter  # noqa: F401 (used in _end_card_frame)
+    except Exception:
+        return None
+    work.mkdir(parents=True, exist_ok=True)
+    dur = END_CARD_SECONDS
+    start = max(0.0, total - dur)
+    if start <= 0:
+        return None
+
+    # Key states: reveal (scale up), hold with pulse + bell, then fade out.
+    states = [
+        (0.00, 0.18, 0.55, 110, False, False),
+        (0.18, 0.42, 1.00, 235, True, False),
+        (0.42, 0.78, 1.00, 255, True, False),
+        (0.78, 1.30, 1.06, 255, True, True),
+        (1.30, 1.72, 1.00, 255, True, True),
+        (1.72, 2.20, 1.00, 210, True, False),
+        (2.20, 2.50, 1.00, 90, False, False),
+    ]
+
+    fps = settings.fps
+    entries: list[tuple[str, float]] = []
+    t = start
+    for i, (s0, s1, scale, alpha, glow, bell) in enumerate(states):
+        name = f"endcard{i:02d}.png"
+        _end_card_frame(settings, font_path, work, name, scale, alpha, glow, bell)
+        until = min(start + dur, start + s1)
+        if until - t > 0.005:
+            entries.append((name, until - t))
+            t = until
+    # Blank tail so the card fully leaves before the video ends.
+    blank = work / "endcard_blank.png"
+    Image.new("RGBA", (settings.width, settings.height), (0, 0, 0, 0)).save(blank, compress_level=1)
+    if start + dur - t > 0.005:
+        entries.append(("endcard_blank.png", start + dur - t))
+    if not entries:
+        return None
+
+    lines = ["ffconcat version 1.0"]
+    for name, length in entries:
+        lines += [f"file '{name}'", f"duration {length:.4f}"]
+    lines.append(f"file '{entries[-1][0]}'")
+    playlist = work / "endcard.ffconcat"
+    playlist.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return playlist, 0, 0, start, dur
+
+
 # ------------------------------------------------------------------------------------------ plan
 @dataclass
 class OverlayPlan:
@@ -1203,6 +1356,8 @@ class OverlayPlan:
     chat: tuple[Path, int, int] | None = None  # (ffconcat playlist, x, y) for chat stories
     card: tuple[Path, int, int] | None = None  # (png, x, y) post card for Reddit-style stories
     card_until: float = 0.0
+    end_card: tuple[Path, int, int, float, float] | None = None
+    # (playlist, x, y, start, duration) animated subscribe end card inside the total duration
 
 
 def build_overlays(settings: Settings, chunks: list[Chunk], total: float, hook_text: str, work: Path, *,
@@ -1270,4 +1425,8 @@ def build_overlays(settings: Settings, chunks: list[Chunk], total: float, hook_t
         # Chat stories keep the conversation readable: the call-to-action takes the hook's place above it.
         plan.cta = cta_png(settings, ui_font, cta_text, work / "cta.png", y_ratio=0.10 if chat else 0.30)
         plan.cta_from = cta_from
+    # Reusable animated subscribe end card, inside the total duration (never after it).
+    ec = build_end_card(settings, font_path, total, work)
+    if ec is not None:
+        plan.end_card = ec
     return plan
