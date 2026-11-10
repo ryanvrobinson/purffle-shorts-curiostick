@@ -157,7 +157,7 @@ class Settings:
     anthropic_effort: str = ""        # low|medium|high|xhigh|max (blank = API default)
     gemini_api_key: str = ""          # GEMINI_API_KEY (or GOOGLE_API_KEY) — never logged
     script_review: str = "rewrite"    # off|score|rewrite — the Script Doctor's second pass
-    script_quality_threshold: int = 50   # Script Doctor 2.0 acceptance target (0-100)
+    script_quality_threshold: int = 90   # Script Doctor 2.0 acceptance target (0-100)
     learn_from_stats: bool = False    # show the LLM which of your videos got the most / fewest views
     research_verify: bool = False     # claim-based fact verification; off by default (Phase 2)
     verify_provider: str = ""         # provider used to verify claims; empty = no verification

@@ -570,7 +570,7 @@ class ScriptQualityError(RuntimeError):
 # Script Doctor 2.0 — deterministic gates + a 100-point rubric + bounded targeted rewrites.
 # --------------------------------------------------------------------------------------
 
-DOCTOR_TARGET_SCORE = 50          # acceptance target: a script must score 50/100 to be rendered
+DOCTOR_TARGET_SCORE = 90          # acceptance target: a script must score 90/100 to be rendered
 DOCTOR_MAX_REWRITES = 2           # at most two targeted rewrite attempts per draft
 
 RUBRIC: tuple[tuple[str, int, str], ...] = (
@@ -851,17 +851,6 @@ def review_script(llm, script: Script, settings: Settings) -> Script:
         log.info("Script Doctor attempt %d/%d: %s/100, %s%s",
                  attempt + 1, attempts, score if score is not None else "?", changed,
                  f" — {issues[0]}" if issues else "")
-        # Log the final score, review findings and whether production was allowed.
-        # Hard gates (structure / factual claims / narration) are enforced above;
-        # this line records the score-gate decision for the audit trail.
-        production_allowed = (score is None or score >= threshold) and not combined_blocking
-        log.info(
-            "Script Doctor final: %s/100 vs threshold %d: production_allowed=%s, findings=%s",
-            score if score is not None else "?",
-            threshold,
-            production_allowed,
-            "; ".join(issues) or "none",
-        )
         return result
     return current
 

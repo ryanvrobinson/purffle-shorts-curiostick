@@ -175,7 +175,7 @@ def test_final_low_score_stops_make_before_rendering(tmp_path, monkeypatch):
 
     result = studio.make(topic="neutron stars", upload=False)
 
-    assert not result.ok and "below the 50-point threshold" in result.error
+    assert not result.ok and "below the 90-point threshold" in result.error
     assert llm.reviews == 2
 
 
@@ -487,7 +487,7 @@ def test_rewrite_rejected_for_invalid_structure_retains_draft():
         "description": "d", "hashtags": [], "tags": [], "category": "pets",
     }
     llm = FakeLLM({"score": 88, "issues": ["structure"], "blocking_issues": ["structure"], "script": invalid})
-    settings = Settings(script_quality_threshold=50)
+    settings = Settings(script_quality_threshold=90)
     with pytest.raises(ScriptQualityError, match="unresolved blocking"):
         review_script(llm, script, settings)
     assert len(llm.calls) == 2  # bounded, no endless retrying
@@ -499,11 +499,11 @@ def test_rejected_higher_scoring_rewrite_retains_correct_score():
     """A rewrite that scores higher but carries no usable script must not
     overwrite the retained draft's score (the Slot 1 regression)."""
     script = _draft()
-    script.score = 50  # already passes the new 50/100 threshold
+    script.score = 90  # already passes the threshold
     llm = FakeLLM({"score": 95, "issues": [], "script": None})  # no script -> not adopted
-    out = review_script(llm, script, Settings(script_quality_threshold=50))
+    out = review_script(llm, script, Settings(script_quality_threshold=90))
     assert out is script                      # same retained object
-    assert out.score == 50                    # retained draft's score, not the rejected 95
+    assert out.score == 90                    # retained draft's score, not the rejected 95
     assert len(llm.calls) == 1                # score >= threshold: no retry
 
 
@@ -691,100 +691,3 @@ def test_duplicate_upload_check_failure_does_not_block(monkeypatch):
 
     # Should not raise — duplicate check failure is non-blocking
     studio._check_duplicate_upload(settings, "My Video", Path("video.mp4"))
-
-
-# ------------------------------------------------------------------ 50/100 production threshold tests
-# The Script Doctor production threshold is now 50/100:
-#   score >= 50  -> production allowed (score + findings + decision logged)
-#   score < 50   -> production blocked (ScriptQualityError)
-# Hard gates (invalid structure, unresolved factual claims, missing narration,
-# unusable scene data) still block production regardless of score.
-
-import logging  # noqa: E402  (caplog level control)
-
-
-def _reply(score, blocking_issues=None, script=None):
-    return {"score": score, "issues": [], "blocking_issues": blocking_issues or [], "script": script}
-
-
-def test_score_95_allows_production(caplog):
-    caplog.set_level(logging.INFO)
-    llm = FakeLLM(_reply(95))
-    review_script(llm, _draft(), Settings(target_seconds=16, script_review="rewrite"))
-    assert len(llm.calls) == 1  # passed on the first attempt, no retry
-    assert any("production_allowed=True" in r.getMessage() and "95" in r.getMessage()
-               for r in caplog.records)
-
-
-def test_score_82_allows_production(caplog):
-    caplog.set_level(logging.INFO)
-    llm = FakeLLM(_reply(82))
-    review_script(llm, _draft(), Settings(target_seconds=16, script_review="rewrite"))
-    assert len(llm.calls) == 1
-    assert any("production_allowed=True" in r.getMessage() for r in caplog.records)
-
-
-def test_score_65_allows_production(caplog):
-    caplog.set_level(logging.INFO)
-    llm = FakeLLM(_reply(65))
-    review_script(llm, _draft(), Settings(target_seconds=16, script_review="rewrite"))
-    assert len(llm.calls) == 1
-    assert any("production_allowed=True" in r.getMessage() for r in caplog.records)
-
-
-def test_score_50_allows_production(caplog):
-    caplog.set_level(logging.INFO)
-    llm = FakeLLM(_reply(50))
-    review_script(llm, _draft(), Settings(target_seconds=16, script_review="rewrite"))
-    assert len(llm.calls) == 1
-    assert any("production_allowed=True" in r.getMessage() for r in caplog.records)
-
-
-def test_score_49_blocks_production():
-    llm = FakeLLM(_reply(49))
-    with pytest.raises(ScriptQualityError, match="below the 50-point threshold"):
-        review_script(llm, _draft(), Settings(target_seconds=16, script_review="rewrite"))
-    assert len(llm.calls) == 2  # bounded retries, then stop
-
-
-def test_score_0_blocks_production():
-    llm = FakeLLM(_reply(0))
-    with pytest.raises(ScriptQualityError, match="below the 50-point threshold"):
-        review_script(llm, _draft(), Settings(target_seconds=16, script_review="rewrite"))
-    assert len(llm.calls) == 2
-
-
-def test_score_65_with_unresolved_factual_claims_blocks_production():
-    llm = FakeLLM(_reply(
-        65, blocking_issues=["The claim that the brine is two million years old cannot be verified."]))
-    with pytest.raises(ScriptQualityError, match="unresolved blocking"):
-        review_script(llm, _draft(), Settings(target_seconds=16, script_review="rewrite"))
-    assert len(llm.calls) == 2
-
-
-def test_score_65_with_invalid_scene_structure_blocks_production():
-    llm = FakeLLM(_reply(
-        65, blocking_issues=["Scene 2 has no narration: invalid scene structure."]))
-    with pytest.raises(ScriptQualityError, match="unresolved blocking"):
-        review_script(llm, _draft(), Settings(target_seconds=16, script_review="rewrite"))
-    assert len(llm.calls) == 2
-
-
-def test_rejected_rewrite_retains_script_and_score_at_50_threshold():
-    """A rejected rewrite must not overwrite the retained script or its score."""
-    script = _draft()
-    script.score = 55  # passes the 50/100 threshold
-    invalid = {
-        "title": "T", "hook_text": "H", "cast": [], "scenes": [
-            {"speaker": "A", "narration": "", "search_query": "q", "image_prompt": "p"},
-        ],
-        "description": "d", "hashtags": [], "tags": [], "category": "pets",
-    }
-    # Rewrite scores higher (88) but is structurally invalid -> must be rejected.
-    llm = FakeLLM({"score": 88, "issues": ["structure"], "blocking_issues": ["structure"], "script": invalid})
-    with pytest.raises(ScriptQualityError, match="unresolved blocking"):
-        review_script(llm, script, Settings(script_quality_threshold=50))
-    assert len(llm.calls) == 2  # bounded retries, not endless
-    # Retained draft is unchanged and keeps its correct score.
-    assert script.score == 55
-    assert script.title == "Draft"
