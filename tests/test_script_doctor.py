@@ -920,3 +920,138 @@ def test_factual_repair_score_association_after_rewrite():
     assert out.score == 75                      # new script's score, not the draft's 50
     assert out.blocking == []
     assert len(llm.calls) == 2
+
+
+# ------------------------------------------------------------------ 95-word / length and scene-level repair tests
+def test_95_word_rewrite_in_range_not_rejected_for_length():
+    """A 95-word rewrite inside the permitted window is not rejected for length."""
+    settings = Settings(target_seconds=40, script_quality_threshold=50)
+    target = scene_plan("facts", 40)[0]  # 104-word target
+    lo, hi = int(0.75 * target), int(1.3 * target)  # 78 .. 135
+    assert lo <= 95 <= hi  # 95 words is inside the permitted window
+
+    draft = _draft()
+    draft.score = 40
+    # 5 scenes x 19 words = 95 words, in range
+    better = _full_script(_scenes(5, 19), title="Ninety-five")
+
+    def replies(user):
+        assert f"between {lo} and {hi} words" in user
+        return _clean_reply(70, better)
+
+    llm = FakeLLM(replies)
+    out = review_script(llm, draft, settings)
+
+    assert out.title == "Ninety-five"
+    assert out.score == 70
+    assert out.blocking == []
+    # Passed on the first attempt: not rejected for length, no bounded retry.
+    assert len(llm.calls) == 1
+
+
+def test_incomplete_sentence_scene_7_repaired():
+    """Scene 7 with an incomplete sentence is rewritten into a complete sentence."""
+    settings = Settings(target_seconds=16, script_quality_threshold=50)
+    scenes = _scenes(8, 9)
+    scenes[6]["narration"] = "water-rich ejecta that"  # incomplete fragment
+    draft = normalize(_full_script(scenes), "cats", "facts", "en")
+    draft.score = 50
+    draft.blocking = ["Scene 7 incomplete sentence about water-rich ejecta."]
+    # 8 scenes x 6 words = 48 words, inside the permitted 30..53 window.
+    better = _full_script(_scenes(8, 6), title="Repaired")
+
+    def replies(user):
+        if len(llm.calls) == 1:
+            return _blocking_reply(50, ["Scene 7 incomplete sentence about water-rich ejecta."], better)
+        return _clean_reply(65, better)
+
+    llm = FakeLLM(replies)
+    out = review_script(llm, draft, settings)
+
+    assert out.score == 65
+    assert out.blocking == []
+    assert len(llm.calls) == 2  # one bounded rewrite repaired the incomplete sentence
+    # The prompt targeted Scene 7 and its narration, and asked for a complete sentence.
+    assert "Scene 7" in llm.calls[0]["user"]
+    assert "water-rich ejecta that" in llm.calls[0]["user"]
+    assert "complete, grammatical spoken sentence" in llm.calls[0]["user"]
+
+
+def test_vague_final_payoff_repaired():
+    """A vague final-scene payoff is rewritten to answer the opening mystery explicitly."""
+    settings = Settings(target_seconds=16, script_quality_threshold=50)
+    draft = _draft()
+    draft.score = 50
+    draft.blocking = ["Final scene payoff too vague."]
+    better = _full_script(_scenes(4, 9), title="Payoff")
+
+    def replies(user):
+        if len(llm.calls) == 1:
+            return _blocking_reply(50, ["Final scene payoff too vague."], better)
+        return _clean_reply(60, better)
+
+    llm = FakeLLM(replies)
+    out = review_script(llm, draft, settings)
+
+    assert out.score == 60
+    assert out.blocking == []
+    assert len(llm.calls) == 2
+    # The prompt asked the final scene to answer the opening mystery explicitly.
+    assert "final scene" in llm.calls[0]["user"].lower()
+    assert "answer the opening mystery explicitly" in llm.calls[0]["user"]
+
+
+def test_repaired_candidate_score_50_passes(caplog):
+    """A repaired candidate scoring exactly 50 passes the quality gate."""
+    caplog.set_level(logging.INFO)
+    settings = Settings(target_seconds=16, script_quality_threshold=50)
+    draft = _draft()
+    draft.score = 45
+    better = _full_script(_scenes(4, 9), title="Fixed")
+
+    def replies(user):
+        if len(llm.calls) == 1:
+            return _blocking_reply(45, ["Some issue"], better)
+        return _clean_reply(50, better)
+
+    llm = FakeLLM(replies)
+    out = review_script(llm, draft, settings)
+
+    assert out.score == 50
+    assert out.blocking == []
+    assert any("production_allowed=True" in r.getMessage() and "50" in r.getMessage()
+               for r in caplog.records)
+
+
+def test_candidate_score_49_fails():
+    """A candidate scoring 49 is below the 50/100 threshold and blocks production."""
+    draft = _draft()
+    draft.score = 60
+    llm = FakeLLM(_clean_reply(49, _full_script(_scenes(4, 9))))
+    with pytest.raises(ScriptQualityError, match="below the 50-point threshold"):
+        review_script(llm, draft, Settings(target_seconds=16, script_quality_threshold=50))
+    assert len(llm.calls) == 2  # bounded retries, then stop
+
+
+def test_all_workflows_use_same_threshold():
+    """All three slot workflows set SCRIPT_QUALITY_THRESHOLD to 50."""
+    import yaml
+    for slot in ("1", "2", "3"):
+        with open(f".github/workflows/curiostick-slot-{slot}.yml") as fh:
+            doc = yaml.safe_load(fh)
+        found = []
+
+        def walk(node, acc):
+            if isinstance(node, dict):
+                for k, v in node.items():
+                    if k == "env" and isinstance(v, dict) and "SCRIPT_QUALITY_THRESHOLD" in v:
+                        acc.append(v["SCRIPT_QUALITY_THRESHOLD"])
+                    walk(v, acc)
+            elif isinstance(node, list):
+                for item in node:
+                    walk(item, acc)
+
+        walk(doc, found)
+        assert "50" in found, (
+            f"slot {slot}: no SCRIPT_QUALITY_THRESHOLD=50 found; env values={found}"
+        )

@@ -36,6 +36,9 @@ jobs:
       RESEARCH_VERIFY: "true"
       LEARN_FROM_STATS: "true"
 
+      # ── Script Doctor production threshold ──
+      SCRIPT_QUALITY_THRESHOLD: "50"
+
       # ── Visual sources — Pixabay stock + Agnes AI images, suitability choice ──
       VISUAL_SOURCES: "pixabay,agnes"
       VISUAL_CHOICE: "suitability"

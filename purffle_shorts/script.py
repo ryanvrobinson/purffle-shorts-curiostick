@@ -514,18 +514,45 @@ def review_prompt(script: Script, settings: Settings, rewrite: bool,
              if k not in ("style", "language", "score", "review", "blocking")}
     system = ("You are a ruthless YouTube Shorts retention editor. You know that viewers decide in 1-2 "
               "seconds and swipe away at any slow moment. You reply with a single JSON object and nothing else.")
+    # Scene-targeted rewrite: expose exact scene numbers and narration for
+    # every scene referenced by a blocking issue so the model fixes the
+    # right scenes and preserves the rest unchanged.
+    referenced_scenes = []
+    for issue in (script.blocking or []):
+        for token in str(issue).split():
+            if token.isdigit():
+                referenced_scenes.append(int(token))
+        low = str(issue).lower()
+        if any(k in low for k in ("final scene", "last scene", "closing scene")):
+            referenced_scenes.append(len(script.scenes))
+    referenced_scenes = sorted(set(referenced_scenes))
+    scene_detail_lines = []
+    for idx in referenced_scenes:
+        if 1 <= idx <= len(script.scenes):
+            scene_detail_lines.append(
+                "  Scene " + str(idx) + ": " + script.scenes[idx - 1].narration)
+    scene_detail_block = (
+        "\nScene-level blocking details — rewrite these exact scenes:\n"
+        + "\n".join(scene_detail_lines)
+        + "\n"
+        if scene_detail_lines
+        else ""
+    )
+
     task = (f"""Then rewrite it into the strongest version you can. Keep the same subject, format, language ({lang}),
     the same JSON structure and between {lo} and {hi} words (target {words}) in {n_scenes} scenes. Do not pad or cut
     scenes to hit the count; keep the same information density. Preserve scene order and a
     coherent progression from hook to payoff. Make the opening a specific, scientifically
     defensible question or consequence. Fix ONLY the issues listed above — do not rewrite scenes that are
 already good. Sharpen the hook, cut filler, make vague lines concrete, remove any claim that may not be true,
-keep the payoff for the end. Do not invent facts, statistics, studies, or certainty. Deliver concrete,
-measurable improvements: a sharper opening hook, a clear curiosity gap that pulls viewers through, a logical
-narrative progression scene to scene, factually precise claims only, and a satisfying payoff in the final scene.
+keep the payoff for the end. Do not invent facts, statistics, studies, or certainty. {scene_detail_block}
+Rewrite any scene flagged as incomplete so that it is a complete, grammatical spoken sentence.
+The final scene must answer the opening mystery explicitly and concretely, not vaguely.
+Deliver concrete, measurable improvements: a sharper opening hook, a clear curiosity gap that pulls viewers through,
+a logical narrative progression scene to scene, factually precise claims only, and a satisfying payoff in the final scene.
 Put the rewritten script
 in "script". Format rules to keep:
-{_format_rules(script.style)}""" if rewrite else
+    {_format_rules(script.style)}""" if rewrite else
             'Return only "score" and "issues".')
     parts = [
         f"""Review this YouTube Short script ({STYLES[script.style]}).
@@ -648,6 +675,30 @@ def doctor_prompt(script: Script, settings: Settings, rewrite: bool,
     system = ("You are a ruthless YouTube Shorts retention editor. Viewers decide in 1-2 seconds and "
               "swipe away at any slow moment. Score honestly against the rubric: a high score never "
               "excuses a blocking flaw. Reply with a single JSON object and nothing else.")
+    # Scene-targeted rewrite: expose exact scene numbers and narration for
+    # every scene referenced by a blocking issue so the model fixes the
+    # right scenes and preserves the rest unchanged.
+    referenced_scenes = []
+    for issue in (script.blocking or []):
+        for token in str(issue).split():
+            if token.isdigit():
+                referenced_scenes.append(int(token))
+        low = str(issue).lower()
+        if any(k in low for k in ("final scene", "last scene", "closing scene")):
+            referenced_scenes.append(len(script.scenes))
+    referenced_scenes = sorted(set(referenced_scenes))
+    scene_detail_lines = []
+    for idx in referenced_scenes:
+        if 1 <= idx <= len(script.scenes):
+            scene_detail_lines.append("  Scene " + str(idx) + ": " + script.scenes[idx - 1].narration)
+    scene_detail_block = (
+        "\nScene-level blocking details — rewrite these exact scenes:\n"
+        + "\n".join(scene_detail_lines)
+        + "\n"
+        if scene_detail_lines
+        else ""
+    )
+
     task = (
         f"Then rewrite the script to fix every blocking issue listed above. Keep the same subject, format, "
         f"language ({lang}), the same JSON structure and between {lo} and {hi} words (target {words}) "
@@ -660,10 +711,15 @@ def doctor_prompt(script: Script, settings: Settings, rewrite: bool,
         f"remove it entirely, or rewrite it using only well-established, supportable facts. Do not invent "
         f"replacement mission dates, measurements, depths, or scientific certainty. If a claim cannot be "
         f"verified, remove it — do not keep an unsupported assertion and do not keep re-listing it. Once "
-        f"removed or rewritten, a claim must not reappear in blocking_issues. Put the COMPLETE rewritten "
-        f"script in \\\"script\\\" "
-        f"— the response must include every required field and must not be truncated.\n"
-        f"Format rules to keep:\n" + _format_rules(script.style)
+        f"removed or rewritten, a claim must not reappear in blocking_issues. "
+        f"{scene_detail_block}"
+        f"Rewrite any scene flagged as incomplete so that it is a complete, grammatical spoken sentence. "
+        f"The final scene must answer the opening mystery explicitly and concretely, not vaguely. "
+        f"Preserve scientific accuracy, scene order, the topic, and series continuity. Do not add filler "
+        f"to reach the word target. Put the COMPLETE rewritten script under the script key — the response "
+        f"must include every required field and must not be truncated.\n"
+        f"Format rules to keep:\n"
+ + _format_rules(script.style)
     ) if rewrite else 'Return only "score", "breakdown", "issues" and "blocking_issues".'
     parts = [
         f"""Review this YouTube Short script ({STYLES[script.style]}).
@@ -779,7 +835,12 @@ def review_script(llm, script: Script, settings: Settings) -> Script:
                 if in_range and score_gain and blocking_resolved and not candidate_structural:
                     result = better
                 else:
+                    rejection_reason = None
                     if not in_range:
+                        rejection_reason = (
+                            f"word-count ({n} words; permitted {int(0.75 * target)}.."
+                            f"{int(1.3 * target)}, target {target})"
+                        )
                         feedback.append(
                             f"The last rewrite had {n} words; the target is between "
                             f"{int(0.75 * target)} and {int(1.3 * target)} words (target {target}). "
@@ -787,25 +848,33 @@ def review_script(llm, script: Script, settings: Settings) -> Script:
                             "hook-to-payoff progression — do not cut content to hit a shorter count."
                         )
                     elif previous_score is not None and score is not None and score < previous_score:
+                        rejection_reason = f"score ({score} below current {previous_score})"
                         feedback.append(
                             f"The last rewrite scored {score}, below the current draft's "
                             f"{previous_score}. Keep what works and only fix the listed issues."
                         )
                     elif blocking_issues:
+                        rejection_reason = f"unresolved blockers ({'; '.join(blocking_issues)})"
                         feedback.append(
                             "The last rewrite still has unresolved blocking issues: "
                             + "; ".join(blocking_issues)
                             + ". Fix those issues before resubmitting."
                         )
                     elif candidate_structural:
+                        rejection_reason = f"structure ({'; '.join(candidate_structural)})"
                         feedback.append(
                             "The last rewrite failed the structure check: "
                             + "; ".join(candidate_structural)
                         )
                     log.warning(
-                        "Script Doctor rewrite ignored: %d words for a %d-word target or unresolved issues",
+                        "Script Doctor rewrite ignored: candidate %d words (permitted %d..%d), "
+                        "score %s/100, rejection reason: %s, remaining blockers: %s",
                         n,
-                        target,
+                        int(0.75 * target),
+                        int(1.3 * target),
+                        score if score is not None else "?",
+                        rejection_reason or "unknown",
+                        "; ".join(blocking_issues) if blocking_issues else "none",
                     )
 
         score = score if score is not None else current.score
