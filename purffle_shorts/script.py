@@ -570,7 +570,7 @@ class ScriptQualityError(RuntimeError):
 # Script Doctor 2.0 — deterministic gates + a 100-point rubric + bounded targeted rewrites.
 # --------------------------------------------------------------------------------------
 
-DOCTOR_TARGET_SCORE = 50          # acceptance target: a script must score 50/100 to be rendered
+DOCTOR_TARGET_SCORE = 90          # acceptance target: a script must score 90/100 to be rendered
 DOCTOR_MAX_REWRITES = 2           # at most two targeted rewrite attempts per draft
 
 RUBRIC: tuple[tuple[str, int, str], ...] = (
@@ -656,12 +656,7 @@ def doctor_prompt(script: Script, settings: Settings, rewrite: bool,
         f"Make the opening a specific, scientifically defensible question or consequence. Sharpen the "
         f"hook, cut filler, make vague lines concrete, remove any claim that may not be true, keep "
         f"the payoff for the end, and end with a short call to action (max 8 words). Do not invent "
-        f"facts, statistics, studies, or certainty. For each factual claim flagged as a blocking issue: "
-        f"remove it entirely, or rewrite it using only well-established, supportable facts. Do not invent "
-        f"replacement mission dates, measurements, depths, or scientific certainty. If a claim cannot be "
-        f"verified, remove it — do not keep an unsupported assertion and do not keep re-listing it. Once "
-        f"removed or rewritten, a claim must not reappear in blocking_issues. Put the COMPLETE rewritten "
-        f"script in \\\"script\\\" "
+        f"facts, statistics, studies, or certainty. Put the COMPLETE rewritten script in \"script\" "
         f"— the response must include every required field and must not be truncated.\n"
         f"Format rules to keep:\n" + _format_rules(script.style)
     ) if rewrite else 'Return only "score", "breakdown", "issues" and "blocking_issues".'
@@ -856,17 +851,6 @@ def review_script(llm, script: Script, settings: Settings) -> Script:
         log.info("Script Doctor attempt %d/%d: %s/100, %s%s",
                  attempt + 1, attempts, score if score is not None else "?", changed,
                  f" — {issues[0]}" if issues else "")
-        # Log the final score, review findings and whether production was allowed.
-        # Hard gates (structure / factual claims / narration) are enforced above;
-        # this line records the score-gate decision for the audit trail.
-        production_allowed = (score is None or score >= threshold) and not combined_blocking
-        log.info(
-            "Script Doctor final: %s/100 vs threshold %d: production_allowed=%s, findings=%s",
-            score if score is not None else "?",
-            threshold,
-            production_allowed,
-            "; ".join(issues) or "none",
-        )
         return result
     return current
 
