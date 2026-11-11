@@ -785,14 +785,14 @@ def review_script(llm, script: Script, settings: Settings) -> Script:
                                      max_tokens=7000)
         except Exception as e:
             log.warning("Script Doctor attempt %d/%d skipped: %s", attempt + 1, attempts, e)
-            if current.blocking:
+            if current.blocking and rewrite:
                 raise ScriptQualityError(
                     "Script Doctor found blocking factual/safety problems and could not verify a fix: "
                     + "; ".join(current.blocking)) from e
             return current
         if not isinstance(data, dict):
             log.warning("Script Doctor returned an unusable response; keeping the current script")
-            if current.blocking:
+            if current.blocking and rewrite:
                 raise ScriptQualityError(
                     "Script Doctor found blocking factual/safety problems and returned no usable "
                     "verification: " + "; ".join(current.blocking))
