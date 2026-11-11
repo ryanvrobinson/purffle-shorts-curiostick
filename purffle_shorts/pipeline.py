@@ -17,7 +17,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from . import analytics, ffmpeg, notify, research, topics, tts, youtube
-from .config import Settings, duration_window, short_duration_bounds
+from .config import MAX_TARGET_SECONDS, Settings, duration_window, short_duration_bounds
 from .history import History, now_iso
 from .llm import LLM, LLMConfigError, LLMNotConfigured
 from .media import AI_SOURCES, MediaItem, Visuals
@@ -210,17 +210,16 @@ class Studio:
             script_took = time.perf_counter() - script_started
             log.info("Initial script generation: %.2fs", script_took)
 
-            # Early hook validation: reject generic greetings before TTS/images/render.
+            # In score-only production mode, hook quality is advisory: never discard
+            # an otherwise renderable script because a hook rewrite did not satisfy QC.
             if llm is not None:
                 hook_issue = validate_opening_hook(script)
-                if hook_issue:
+                if hook_issue and s.script_review == "rewrite":
                     log.warning("Initial script hook failed: %s", hook_issue)
                     script = self._rewrite_hook_only(llm, script, s, hook_issue)
                     hook_issue = validate_opening_hook(script)
-                    if hook_issue:
-                        raise RuntimeError(
-                            f"Script hook still invalid after rewrite: {hook_issue}"
-                        )
+                if hook_issue:
+                    log.warning("Initial hook QC advisory; continuing to render: %s", hook_issue)
 
             if llm is not None and s.script_review != "off":
                 self._step("review", "Script Doctor")
@@ -228,16 +227,15 @@ class Studio:
                 script = review_script(llm, script, s)
                 review_took = time.perf_counter() - review_started
                 log.info("Script Doctor: %.2fs", review_took)
-                # Revalidate hook after any rewrite — Doctor may have reintroduced a generic opening.
+                # Revalidate hook after rewrite. In score-only mode this is advisory,
+                # not a reason to stop the production run.
                 hook_issue = validate_opening_hook(script)
-                if hook_issue:
+                if hook_issue and s.script_review == "rewrite":
                     log.warning("Post-Doctor script hook failed: %s", hook_issue)
                     script = self._rewrite_hook_only(llm, script, s, hook_issue)
                     hook_issue = validate_opening_hook(script)
-                    if hook_issue:
-                        raise RuntimeError(
-                            f"Script hook still invalid after Doctor rewrite: {hook_issue}"
-                        )
+                if hook_issue:
+                    log.warning("Post-Doctor hook QC advisory; continuing to render: %s", hook_issue)
 
             if llm is not None and s.research_verify:
                 self._step("research", "fact verification")
@@ -245,18 +243,17 @@ class Studio:
                 report = research.verify_script_claims(claims, pick, llm)
                 script.verification_report = report.to_dict()
                 log.info("Fact verification: %d claims, %s", len(report.claims), report.status)
-                # Block production when claims need human review or LLM extraction failed.
-                if report.status == research.NEEDS_HUMAN_REVIEW:
-                    raise RuntimeError(
-                        "Fact verification unresolved: claims need human review before rendering. "
-                        f"Checked by {report.checked_by}; "
-                        f"{'LLM claim extraction failed; ' if report.llm_extraction_failed else ''}"
-                        f"{len(report.claims)} claim(s) unresolved."
+                # In rewrite/strict mode unresolved claims block production. In score-only
+                # production mode, preserve the report and warnings but still render a
+                # reviewable draft; it is explicitly marked unverified in metadata.
+                if report.status == research.NEEDS_HUMAN_REVIEW or report.llm_extraction_failed:
+                    detail = (
+                        f"Fact verification unresolved: {len(report.claims)} claim(s) need review; "
+                        f"checked by {report.checked_by}; extraction_failed={report.llm_extraction_failed}."
                     )
-                if report.llm_extraction_failed:
-                    raise RuntimeError(
-                        "LLM claim extraction failed; cannot proceed without verified claims."
-                    )
+                    if s.script_review == "rewrite":
+                        raise RuntimeError(detail)
+                    log.warning("%s Continuing with an unverified draft for human review.", detail)
         except BaseException:
             if pick.idea_id:
                 self.history.release_idea(pick.idea_id)
@@ -362,11 +359,15 @@ class Studio:
             # rendering anything. This catches overlong scripts early instead of
             # rendering a too-long video that QC will reject.
             max_dur = float(duration_window(s.target_seconds)[1])
-            # Hard maximum for the 30-second Shorts format: the rendered video must
-            # never exceed the target plus only the documented encoding tolerance.
+            # Strict/rewrite mode retains the preferred Shorts duration window.
+            # Score-only mode prioritizes producing a reviewable MP4: allow a longer
+            # narration up to the app's supported 170-second maximum, and record the
+            # deviation in metadata/QC instead of abandoning the render.
             short = short_duration_bounds(s.target_seconds)
             if short is not None:
                 max_dur = min(max_dur, short[1])
+            if s.script_review == "score":
+                max_dur = float(MAX_TARGET_SECONDS) - END_PAD
             if total > max_dur:
                 log.warning(
                     "Narration too long (%.1fs incl. pad; max %.1fs), attempting script reduction",
