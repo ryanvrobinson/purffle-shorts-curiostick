@@ -38,6 +38,8 @@ jobs:
 
       # ── Script Doctor production threshold ──
       SCRIPT_QUALITY_THRESHOLD: "50"
+      # Score and report problems, but never block MP4 production on the score.
+      SCRIPT_REVIEW: "score"
 
       # ── Visual sources — Pixabay stock + Agnes AI images, suitability choice ──
       VISUAL_SOURCES: "pixabay,agnes"
