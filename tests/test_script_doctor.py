@@ -249,6 +249,19 @@ def test_doctor_score_only_and_off():
     assert off.calls == []
 
 
+def test_score_only_keeps_rendering_when_doctor_reports_blockers_or_low_score():
+    llm = FakeLLM({
+        "score": 32,
+        "issues": ["Scene 7 is incomplete", "The ending is weak"],
+        "blocking_issues": ["Scene 7 sentence incomplete"],
+    })
+    draft = _draft()
+    out = review_script(llm, draft, Settings(script_review="score", script_quality_threshold=50))
+    assert out is draft
+    assert out.score == 32
+    assert "Scene 7 sentence incomplete" in out.blocking
+
+
 def test_translation_keeps_footage_and_speakers():
     src = normalize({"title": "Hi", "cast": ["A1", "B1"], "scenes": _scenes(4, speakers="AB")}, "x", "dialogue", "en")
 
