@@ -363,6 +363,44 @@ def test_readonly_scope_for_stats():
     assert "https://www.googleapis.com/auth/youtube.upload" in scopes
 
 
+# ------------------------------------------------------------------ get_credentials: successful token refresh
+
+
+def test_successful_token_refresh(tmp_path):
+    """Expired credentials with a valid refresh token are refreshed automatically."""
+    token = tmp_path / "token.json"
+    token.write_text('{"refresh_token": "rt", "token": "old_access", "expiry": "2020-01-01T00:00:00Z"}')
+    s = Settings(token_file=str(token), client_secrets="credentials.json")
+
+    fake_creds = FakeCreds(refresh_token="rt", valid=False, expired=True)
+    with patch("google.oauth2.credentials.Credentials.from_authorized_user_file",
+               return_value=fake_creds), \
+         patch("google.auth.transport.requests.Request"):
+        creds = Y.get_credentials(s, interactive=False)
+
+    # After refresh, creds should be valid and not expired.
+    assert creds.valid is True
+    assert creds.expired is False
+    assert creds.refresh_token == "rt"
+    # Token file should be rewritten with refreshed credentials.
+    assert json.loads(token.read_text())["refresh_token"] == "rt"
+
+
+def test_non_interactive_with_valid_credentials(tmp_path):
+    """Non-interactive mode works when credentials are already valid (not expired)."""
+    token = tmp_path / "token.json"
+    token.write_text('{"refresh_token": "rt", "token": "access", "expiry": "2099-01-01T00:00:00Z"}')
+    s = Settings(token_file=str(token), client_secrets="credentials.json")
+
+    fake_creds = FakeCreds(refresh_token="rt", valid=True, expired=False)
+    with patch("google.oauth2.credentials.Credentials.from_authorized_user_file",
+               return_value=fake_creds):
+        creds = Y.get_credentials(s, interactive=False)
+
+    assert creds.valid is True
+    assert creds.refresh_token == "rt"
+
+
 # ------------------------------------------------------------------ upload preserves MP4 on auth failure
 
 
