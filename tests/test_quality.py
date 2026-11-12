@@ -174,6 +174,56 @@ Another caption
         assert check.passed is True
 
     @patch("purffle_shorts.ffmpeg.probe")
+    def test_duration_uses_the_strict_short_window(self, mock_probe, gate):
+        """Target 40s uses the Short window: hard max is 40.0s, no tolerance above it."""
+        gate = QualityGate(gate.settings.with_overrides(target_seconds=40))
+        mock_probe.return_value = {"duration": 30.0}
+        check = gate._check_duration(Path("video.mp4"))
+        assert check.passed is True  # under preferred minimum 36s, advisory only
+        mock_probe.return_value = {"duration": 35.7}
+        assert gate._check_duration(Path("video.mp4")).passed is True  # under 36s, advisory only
+        mock_probe.return_value = {"duration": 39.9}
+        assert gate._check_duration(Path("video.mp4")).passed is True  # just under the cap
+        mock_probe.return_value = {"duration": 40.0}
+        assert gate._check_duration(Path("video.mp4")).passed is True  # exactly at the cap
+        mock_probe.return_value = {"duration": 40.1}
+        assert gate._check_duration(Path("video.mp4")).passed is False  # exceeds hard maximum
+
+    @patch("purffle_shorts.ffmpeg.probe")
+    def test_short_cap_is_40_seconds_even_for_a_30_second_target(self, mock_probe, gate):
+        """Production runs TARGET_SECONDS=30, but the QC hard cap stays 40s:
+        30.0, 32.1, 35.7 and 39.9 all pass; anything over 40.0 fails."""
+        gate = QualityGate(gate.settings.with_overrides(target_seconds=30))
+        for duration in (30.0, 32.1, 35.7, 39.9, 40.0):
+            mock_probe.return_value = {"duration": duration}
+            assert gate._check_duration(Path("video.mp4")).passed is True, duration
+        mock_probe.return_value = {"duration": 40.1}
+        assert gate._check_duration(Path("video.mp4")).passed is False
+        mock_probe.return_value = {"duration": 45.0}
+        assert gate._check_duration(Path("video.mp4")).passed is False
+
+    def test_all_three_workflow_slots_share_one_duration_configuration(self):
+        """Every CurioStick slot loads the same TARGET_SECONDS, and the QC hard
+        cap each slot enforces is the 40s format maximum -- not the target itself."""
+        import re
+
+        from purffle_shorts.config import short_duration_bounds
+        targets = {}
+        tests_root = Path(__file__).resolve().parent.parent
+        for slot in (1, 2, 3):
+            path = tests_root / f".github/workflows/curiostick-slot-{slot}.yml"
+            match = re.search(
+                r'^\s*TARGET_SECONDS: "(\d+)"\s*$',
+                path.read_text(encoding="utf-8"), re.MULTILINE,
+            )
+            assert match is not None, f"slot {slot} does not set TARGET_SECONDS"
+            targets[slot] = int(match.group(1))
+        assert len(set(targets.values())) == 1, targets
+        target = targets[1]
+        _, maximum = short_duration_bounds(target)
+        assert maximum == 40.0  # the hard cap is the 40s format maximum for all three slots
+
+    @patch("purffle_shorts.ffmpeg.probe")
     def test_duration_window_is_never_impossible(self, mock_probe, settings):
         """A short request is clamped so the quality window has a valid minimum and maximum."""
         gate = QualityGate(settings.with_overrides(target_seconds=10))
@@ -185,8 +235,9 @@ Another caption
 
     @patch("purffle_shorts.ffmpeg.probe")
     def test_duration_uses_the_shared_target_window(self, mock_probe, gate):
-        gate = QualityGate(gate.settings.with_overrides(target_seconds=40))
-        mock_probe.return_value = {"duration": 52.0}
-        assert gate._check_duration(Path("video.mp4")).passed is True  # 40s + 30%
-        mock_probe.return_value = {"duration": 53.0}
+        """Targets above the Short range use the general +/-30% window."""
+        gate = QualityGate(gate.settings.with_overrides(target_seconds=60))
+        mock_probe.return_value = {"duration": 78.0}
+        assert gate._check_duration(Path("video.mp4")).passed is True  # 60 + 30%
+        mock_probe.return_value = {"duration": 79.0}
         assert gate._check_duration(Path("video.mp4")).passed is False

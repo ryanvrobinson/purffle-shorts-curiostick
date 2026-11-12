@@ -243,17 +243,41 @@ class Studio:
                 report = research.verify_script_claims(claims, pick, llm)
                 script.verification_report = report.to_dict()
                 log.info("Fact verification: %d claims, %s", len(report.claims), report.status)
-                # In rewrite/strict mode unresolved claims block production. In score-only
-                # production mode, preserve the report and warnings but still render a
-                # reviewable draft; it is explicitly marked unverified in metadata.
-                if report.status == research.NEEDS_HUMAN_REVIEW or report.llm_extraction_failed:
-                    detail = (
-                        f"Fact verification unresolved: {len(report.claims)} claim(s) need review; "
-                        f"checked by {report.checked_by}; extraction_failed={report.llm_extraction_failed}."
-                    )
-                    if s.script_review == "rewrite":
-                        raise RuntimeError(detail)
-                    log.warning("%s Continuing with an unverified draft for human review.", detail)
+                # Unsupported claims are rewritten and verified again. Unresolved claims
+                # are never silently relabeled as verified.
+                if report.status == research.NEEDS_HUMAN_REVIEW:
+                    unresolved = [c for c in report.claims if c.status == research.NEEDS_HUMAN_REVIEW]
+                    if unresolved:
+                        repaired = self._rewrite_unverified_claims(
+                            llm, script, unresolved, s, pick)
+                        if repaired is not None:
+                            script = repaired
+                            claims = research.extract_claims_from_script(script, s.language)
+                            report = research.verify_script_claims(claims, pick, llm)
+                            script.verification_report = report.to_dict()
+                            log.info(
+                                "Fact verification after claim rewrite: %d claims, %s",
+                                len(report.claims), report.status,
+                            )
+                # In rewrite/strict mode unresolved claims or extraction failures block
+                # production. In score-only production mode, preserve the report and
+                # warnings but still render a reviewable draft; it is explicitly marked
+                # unverified in metadata.
+                if s.script_review == "rewrite":
+                    if report.status == research.NEEDS_HUMAN_REVIEW or report.llm_extraction_failed:
+                        raise RuntimeError(
+                            "Fact verification unresolved: claims need human review before rendering. "
+                            f"Checked by {report.checked_by}; "
+                            f"{'LLM claim extraction failed; ' if report.llm_extraction_failed else ''}"
+                            f"{len(report.claims)} claim(s) unresolved."
+                        )
+                else:
+                    if report.status == research.NEEDS_HUMAN_REVIEW or report.llm_extraction_failed:
+                        detail = (
+                            f"Fact verification unresolved: {len(report.claims)} claim(s) need review; "
+                            f"checked by {report.checked_by}; extraction_failed={report.llm_extraction_failed}."
+                        )
+                        log.warning("%s Continuing with an unverified draft for human review.", detail)
         except BaseException:
             if pick.idea_id:
                 self.history.release_idea(pick.idea_id)
@@ -297,6 +321,58 @@ class Studio:
                 scene.visual_source = script.scenes[i].visual_source
                 scene.attribution = script.scenes[i].attribution
         return rewritten
+
+    # ------------------------------------------------------------------ unverified-claim repair
+    def _rewrite_unverified_claims(self, llm, script: Script, unresolved: list,
+                                   settings: Settings, pick) -> Script | None:
+        """Rewrite only the scenes whose claims lack source support.
+
+        Verified scenes and every other story element are preserved verbatim;
+        only the narration of flagged scenes is replaced with wording that can
+        be backed by the gathered sources (unsupported specificity is dropped,
+        never invented). Returns None when no trustworthy rewrite is available,
+        so the caller keeps blocking instead of rendering unresolved claims.
+        """
+        from .script import SCRIPT_SCHEMA, build_prompt, normalize
+
+        scene_indices = sorted(
+            {c.scene_index for c in unresolved if c.scene_index is not None})
+        if not scene_indices:
+            return None
+        scenes = script.scenes
+        flagged = "\n".join(f"  Scene {i + 1}: {scenes[i].narration}" for i in scene_indices)
+        system, user = build_prompt(
+            script.topic, script.style, settings, [],
+            context=pick.context or "",
+            insights=(
+                "REWRITE ONLY THE SCENES LISTED BELOW. Every other scene, the hook, "
+                "the sources, scene order and length must stay unchanged.\n"
+                + flagged
+                + "\n\nReplace each listed narration with wording whose factual claims "
+                "are supported by the cited background sources: drop unsupported "
+                "statistics, names, dates and certainty; keep what the sources confirm. "
+                "Do not invent facts, studies or quotes. Return the complete script JSON."
+            ),
+        )
+        try:
+            data = llm.complete_json(system, user, SCRIPT_SCHEMA, max_tokens=8000)
+        except Exception as e:
+            log.warning("Unverified-claim rewrite failed: %s", redact(e))
+            return None
+        if not isinstance(data, dict):
+            return None
+        try:
+            rewritten = normalize(data, script.topic, script.style, script.language)
+        except ValueError as e:
+            log.warning("Unverified-claim rewrite could not be normalized: %s", e)
+            return None
+        if len(rewritten.scenes) != len(scenes):
+            log.warning("Unverified-claim rewrite changed the scene count; keeping the draft")
+            return None
+        # Adopt only the flagged scenes' narration; everything else is preserved.
+        for i in scene_indices:
+            scenes[i].narration = rewritten.scenes[i].narration
+        return script
 
     # ------------------------------------------------------------------ one video
     def make(self, topic: str | None = None, *, source: str | None = None, upload: bool | None = None,
@@ -352,22 +428,24 @@ class Studio:
             speech = self._speak(script, work, s)
             voice_took = time.perf_counter() - voice_started
             total = round(speech.duration + END_PAD, 3)
-            log.info("TTS: %.2fs (audio %.1fs + pad)", voice_took, speech.duration)
+            # voice_took is wall-clock synthesis time (retries/network included);
+            # speech.duration is the actual audio length. total = audio + pad is the
+            # single authoritative render duration used by the timeline, captions and FFmpeg.
+            log.info(
+                "TTS: audio %.1fs + %.1fs pad = %.1fs total (synthesis took %.2fs wall)",
+                speech.duration, END_PAD, total, voice_took,
+            )
 
             # Pre-render duration guard: if the spoken audio already exceeds the
             # QC maximum, attempt a meaning-preserving script reduction before
             # rendering anything. This catches overlong scripts early instead of
             # rendering a too-long video that QC will reject.
             max_dur = float(duration_window(s.target_seconds)[1])
-            # Strict/rewrite mode retains the preferred Shorts duration window.
-            # Score-only mode prioritizes producing a reviewable MP4: allow a longer
-            # narration up to the app's supported 170-second maximum, and record the
-            # deviation in metadata/QC instead of abandoning the render.
+            # Hard maximum for the 40-second Shorts format: the rendered video must
+            # never exceed the target (40s). No tolerance is added above the cap.
             short = short_duration_bounds(s.target_seconds)
             if short is not None:
                 max_dur = min(max_dur, short[1])
-            if s.script_review == "score":
-                max_dur = float(MAX_TARGET_SECONDS) - END_PAD
             if total > max_dur:
                 log.warning(
                     "Narration too long (%.1fs incl. pad; max %.1fs), attempting script reduction",

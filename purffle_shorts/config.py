@@ -78,17 +78,17 @@ ASPECTS = {"9:16": (1080, 1920), "16:9": (1920, 1080), "1:1": (1080, 1080), "4:5
 MIN_TARGET_SECONDS = 15
 MAX_TARGET_SECONDS = 170
 
-# Hard duration contract for the 30-second Shorts format:
-#   * preferred rendered duration: 27-30 seconds
-#   * hard maximum: 30 seconds, plus only a small documented technical encoding
-#     tolerance (FFmpeg container/padding can add a fraction of a second)
-#   * narration: roughly 55-60 spoken words, end card inside the total duration
-SHORT_FORMAT_MAX_TARGET = 35          # targets at or below this use the strict window
+# Hard duration contract for the 40-second Shorts format:
+#   * hard maximum: 40 seconds for the rendered MP4 (measured with ffprobe, not estimated)
+#   * preferred narration band: 90% of the requested target up to the 40s cap
+#     (a 30s target -> 27-40s; a 40s target -> 36-40s). Under-minimum results
+#     are advisory and never fail QC; nothing above the cap ever passes.
+#   * narration: roughly 95-115 spoken words at ~2.6 words/second, end card inside 40s
+SHORT_FORMAT_MAX_TARGET = 40          # targets at or below this use the strict window
 SHORT_FORMAT_MIN_TARGET = 25          # below this, the general ±30% window applies
-SHORT_FORMAT_MIN_SECONDS = 27.0
-SHORT_FORMAT_MAX_SECONDS = 30.0
-SHORT_ENCODING_TOLERANCE = 0.5        # documented technical encoding tolerance above 30s
-SHORT_NARRATION_WORDS = (55, 60)      # target spoken-word range for a 30s Short
+SHORT_FORMAT_MAX_SECONDS = 40.0       # hard maximum for the rendered MP4
+SHORT_ENCODING_TOLERANCE = 0.0        # no tolerance added above the hard cap; QC cap == 40.0s
+SHORT_NARRATION_WORDS = (95, 115)     # target spoken-word range for a 40s Short
 
 
 def aspect_resolution(aspect: str) -> tuple[int, int] | None:
@@ -108,17 +108,20 @@ def duration_window(target_seconds: int | float | str) -> tuple[int, int]:
 
 
 def short_duration_bounds(target_seconds: int | float | str) -> tuple[float, float] | None:
-    """Strict duration bounds for the 30-second Shorts format.
+    """Strict duration bounds for the 40-second Shorts format.
 
     Returns ``(min_seconds, max_seconds)`` when the target is a Short
     (``target <= SHORT_FORMAT_MAX_TARGET``), else ``None`` so the general
-    ``duration_window`` applies. The hard maximum is the target itself plus only
-    the documented encoding tolerance; nothing may exceed it.
+    ``duration_window`` applies. The hard maximum is the format cap
+    (``SHORT_FORMAT_MAX_SECONDS`` plus ``SHORT_ENCODING_TOLERANCE`` = 40.0s)
+    for *every* short target: a 30s target is capped at 40s, not at 30s. The
+    preferred minimum is 90% of the requested target; nothing above the cap
+    ever passes QC.
     """
     target = clamp_target_seconds(target_seconds)
     if SHORT_FORMAT_MIN_TARGET <= target <= SHORT_FORMAT_MAX_TARGET:
-        return (SHORT_FORMAT_MIN_SECONDS,
-                float(target) + SHORT_ENCODING_TOLERANCE)
+        return (target * 0.9,
+                SHORT_FORMAT_MAX_SECONDS + SHORT_ENCODING_TOLERANCE)
     return None
 
 
@@ -141,7 +144,7 @@ class Settings:
     trends_geo: str = "US"
     style: str = "auto"               # auto|facts|story|listicle|myth|quiz|motivational|news|explainer|dialogue|chat
     language: str = "en"
-    target_seconds: int = 30
+    target_seconds: int = 40
     channel_name: str = "PurffleStudios"
     audience: str = "curious general audience"
     rss_feeds: list[str] = field(default_factory=list)   # for TOPIC_SOURCES=rss
