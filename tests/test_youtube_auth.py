@@ -49,13 +49,32 @@ class FakeCreds:
 class FakeFlow:
     """Stand-in for google_auth_oauthlib.flow.InstalledAppFlow."""
 
-    def __init__(self, creds: FakeCreds, auth_url="https://accounts.google.com/o/oauth2/v2/auth?state=xyz",
-                 state="xyz", redirect_uri="http://localhost", fail_token=False):
+    def __init__(self, creds: FakeCreds, auth_url: str | None = None,
+                 state: str = "xyz", redirect_uri: str = "http://localhost",
+                 fail_token: bool = False):
         self._creds = creds
-        self.auth_url = auth_url
         self.state = state
         self.redirect_uri = redirect_uri
         self.fetch_token_called_with = None
+        self.fail_token = fail_token
+        # Generate a realistic authorization URL with scope, matching what
+        # google-auth-oauthlib's authorization_url() produces when scopes are
+        # passed to from_client_secrets_file().
+        import urllib.parse
+        self.auth_url = auth_url or (
+            "https://accounts.google.com/o/oauth2/v2/auth"
+            "?response_type=code"
+            "&client_id=test-client-id.apps.googleusercontent.com"
+            "&scope=" + urllib.parse.quote(
+                "https://www.googleapis.com/auth/youtube.upload"
+            )
+            + f"&state={state}"
+            "&code_challenge=test_challenge"
+            "&code_challenge_method=S256"
+            "&access_type=offline"
+            "&prompt=consent"
+            "&include_granted_scopes=true"
+        )
         self.fail_token = fail_token
 
     @classmethod
@@ -414,6 +433,46 @@ def test_authorization_url_contains_scope_parameter(tmp_path):
     scope_value = params.get("scope", [""])[0]
     assert scope_value, "scope parameter must not be empty"
     assert "https://www.googleapis.com/auth/youtube.upload" in scope_value
+
+
+# ------------------------------------------------------------------ end-to-end: full CLI auth path with mocked browser
+
+
+def test_get_credentials_interactive_scope_diagnostic(tmp_path, monkeypatch, capsys):
+    """End-to-end: get_credentials() -> _run_interactive_flow() generates an
+    authorization URL whose scope is diagnosed as present and correct.
+
+    This tests the actual CLI path: cmd_auth() -> get_credentials() ->
+    _run_interactive_flow(), with InstalledAppFlow mocked and user input
+    simulated. The diagnostic output must report scope present, YouTube
+    upload included, and localhost redirect URI.
+    """
+    token = tmp_path / "token.json"
+    s = Settings(token_file=str(token), client_secrets="credentials.json")
+
+    flow = FakeFlow(FakeCreds(refresh_token="rt_e2e"))
+    with patch("google.oauth2.credentials.Credentials.from_authorized_user_file",
+               return_value=None), \
+         patch("pathlib.Path.exists", return_value=True), \
+         patch("google_auth_oauthlib.flow.InstalledAppFlow") as mock_flow, \
+         patch("builtins.input", return_value="https://localhost/?code=abc&state=xyz"):
+        mock_flow.from_client_secrets_file.return_value = flow
+        creds = Y.get_credentials(s, interactive=True)
+
+    # Credentials should be returned with a refresh token.
+    assert creds.refresh_token == "rt_e2e"
+
+    # Diagnostic output must confirm scope is present and correct.
+    captured = capsys.readouterr().out
+    assert "Scope present: True" in captured, (
+        "Diagnostic did not report scope present in auth URL"
+    )
+    assert "YouTube upload scope: True" in captured, (
+        "Diagnostic did not report YouTube upload scope in auth URL"
+    )
+    assert "Redirect URI localhost: True" in captured, (
+        "Diagnostic did not report localhost redirect URI"
+    )
 
 
 # ------------------------------------------------------------------ get_credentials: successful token refresh

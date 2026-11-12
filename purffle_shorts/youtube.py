@@ -123,12 +123,35 @@ def _run_interactive_flow(secrets: Path, scopes: list[str]):
         include_granted_scopes="true",
     )
 
+    # Safe diagnostic: verify the authorization URL carries the required scopes
+    # without leaking the full URL, state, or credentials.
+    parsed_auth_url = urllib.parse.urlparse(auth_url)
+    auth_params = urllib.parse.parse_qs(parsed_auth_url.query)
+    auth_scope = auth_params.get("scope", [""])[0]
+    has_scope = bool(auth_scope)
+    has_youtube_upload = "https://www.googleapis.com/auth/youtube.upload" in auth_scope
+    redirect_uri = flow.redirect_uri or "http://localhost"
+    is_localhost = redirect_uri.startswith("http://localhost") or redirect_uri.startswith(
+        "http://127.0.0.1"
+    )
+
     print("\n" + "=" * 66)
     print("YouTube OAuth Authorization")
     print("=" * 66)
     print("1. Open this URL in your browser:")
     print()
     print(f"   {auth_url}")
+    print()
+    print("OAuth authorization URL diagnostics:")
+    print(f"  Scope present: {has_scope}")
+    print(f"  YouTube upload scope: {has_youtube_upload}")
+    print(f"  Redirect URI localhost: {is_localhost}")
+    print()
+    if not has_scope or not has_youtube_upload:
+        print(
+            "WARNING: Authorization URL may be missing required scopes. "
+            "Authorization may fail with Error 400: invalid_request."
+        )
     print()
     print("2. Sign in to your Google account and grant permission.")
     print("3. After authorization, copy the FULL redirect URL from your")
