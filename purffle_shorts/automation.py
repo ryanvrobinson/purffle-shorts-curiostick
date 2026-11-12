@@ -739,12 +739,10 @@ class SlotAutomation:
 
         # If a video was already rendered, reuse it (QC + upload only).
         if recovery.get("rendered") and recovery.get("video_id"):
-            log.info("Slot %s recovery: reusing rendered video #%d",
-                     self.key, recovery["video_id"])
-            # generates fresh; we override below
-            # Fetch the previously rendered record
             rec_row = self.history.get(recovery["video_id"])
             if rec_row and rec_row.get("video_path") and Path(rec_row["video_path"]).exists():
+                log.info("Slot %s recovery: reusing rendered video #%d", self.key, recovery["video_id"])
+                # Fetch the previously rendered record
                 # Re-run quality gate on the existing video
                 from .pipeline import Result as _Result
                 existing_result = _Result(
@@ -800,8 +798,13 @@ class SlotAutomation:
                     ok=True, slot=self.slot, run_date=self.run_date, key=self.key,
                     publish_at_utc=publish_at_utc, publish_at_ist=publish_at.isoformat(),
                     dry_run=True)
-
-        # No reusable video: generate fresh, but record this as a new attempt.
+            else:
+                missing_path = rec_row.get("video_path") if rec_row else "(no record)"
+                log.warning(
+                    "Slot %s recovery: rendered video file not found at %s; generating fresh",
+                    self.key, missing_path,
+                )
+        # No usable rendered video: generate fresh, but record this as a new attempt.
         log.info("Slot %s recovery: no reusable video; generating fresh", self.key)
         out = self._run_slot(publish_at, publish_at_utc, now)
         # If the fresh generation also failed, the failure is already recorded by _run_slot.

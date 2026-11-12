@@ -22,6 +22,12 @@ SCOPE_MANAGE = "https://www.googleapis.com/auth/youtube"
 SCOPE_READONLY = "https://www.googleapis.com/auth/youtube.readonly"
 RETRY_STATUS = {500, 502, 503, 504}
 
+# ``invalid_grant`` from Google's OAuth2 token endpoint means the refresh token
+# is revoked, expired, or belongs to a different client. It is permanent: no
+# amount of retrying will obtain a new access token. Only a fresh interactive
+# authorization flow (``purffle-shorts auth``) can repair it.
+_INVALID_GRANT = "invalid_grant"
+
 _lock = threading.Lock()
 
 
@@ -78,6 +84,7 @@ def _load_legacy_pickle():
 
 
 def get_credentials(settings: Settings, interactive: bool = True, extra_scopes: list[str] | None = None):
+    from google.auth.exceptions import RefreshError
     from google.auth.transport.requests import Request
     from google.oauth2.credentials import Credentials
     from google_auth_oauthlib.flow import InstalledAppFlow
@@ -95,6 +102,18 @@ def get_credentials(settings: Settings, interactive: bool = True, extra_scopes: 
     if creds is not None and not creds.valid and creds.expired and creds.refresh_token:
         try:
             creds.refresh(Request())
+        except RefreshError as e:
+            err_text = str(e).lower()
+            if _INVALID_GRANT in err_text:
+                log.error(
+                    "YouTube refresh token is revoked or invalid (invalid_grant). "
+                    "Re-authorization is required: run 'purffle-shorts auth' with credentials.json, "
+                    "then paste the new token.json into the YOUTUBE_TOKEN_JSON GitHub Actions secret. "
+                    "Code cannot repair a revoked refresh token."
+                )
+            else:
+                log.warning("Refreshing YouTube token failed (%s); re-authorization needed", e)
+            creds = None
         except Exception as e:
             log.warning("Refreshing YouTube token failed (%s); re-authorization needed", e)
             creds = None

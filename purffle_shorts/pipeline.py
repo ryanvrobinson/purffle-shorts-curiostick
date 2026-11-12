@@ -341,6 +341,15 @@ class Studio:
             return None
         scenes = script.scenes
         flagged = "\n".join(f"  Scene {i + 1}: {scenes[i].narration}" for i in scene_indices)
+        # List the source titles and URLs so the LLM can ground its rewrite
+        # in actual, citable material instead of inventing claims.
+        source_lines = []
+        for ref in (pick.source_references or []):
+            title = ref.get("title", "")
+            url = ref.get("url", "")
+            if title or url:
+                source_lines.append(f"  - {title}: {url}")
+        source_block = "\n".join(source_lines)
         system, user = build_prompt(
             script.topic, script.style, settings, [],
             context=pick.context or "",
@@ -348,6 +357,8 @@ class Studio:
                 "REWRITE ONLY THE SCENES LISTED BELOW. Every other scene, the hook, "
                 "the sources, scene order and length must stay unchanged.\n"
                 + flagged
+                + "\n\nAvailable sources (ground your claims in these only):\n"
+                + source_block
                 + "\n\nReplace each listed narration with wording whose factual claims "
                 "are supported by the cited background sources: drop unsupported "
                 "statistics, names, dates and certainty; keep what the sources confirm. "
