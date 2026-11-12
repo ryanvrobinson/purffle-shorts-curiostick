@@ -363,6 +363,59 @@ def test_readonly_scope_for_stats():
     assert "https://www.googleapis.com/auth/youtube.upload" in scopes
 
 
+# ------------------------------------------------------------------ regression: scope parameter in auth URL
+
+
+def test_authorization_url_contains_scope_parameter(tmp_path):
+    """The generated authorization URL must contain a non-empty scope parameter.
+
+    Regression test for Google Error 400: invalid_request — Missing required
+    parameter: scope. Verifies that scopes passed to
+    InstalledAppFlow.from_client_secrets_file() appear in the authorization
+    URL, which is the code path used in _run_interactive_flow().
+    """
+    import urllib.parse
+
+    # Create a temporary client secrets file (Desktop app type).
+    client_secrets = tmp_path / "credentials.json"
+    client_secrets.write_text(
+        json.dumps(
+            {
+                "installed": {
+                    "client_id": "test-client-id.apps.googleusercontent.com",
+                    "client_secret": "test-secret-12345",
+                    "auth_uri": "https://accounts.google.com/o/oauth2/v2/auth",
+                    "token_uri": "https://oauth2.googleapis.com/token",
+                    "redirect_uris": ["http://localhost"],
+                }
+            }
+        )
+    )
+
+    from google_auth_oauthlib.flow import InstalledAppFlow
+
+    expected_scopes = ["https://www.googleapis.com/auth/youtube.upload"]
+
+    # Scopes are passed to from_client_secrets_file(), not to authorization_url().
+    # This matches the code path in _run_interactive_flow().
+    flow = InstalledAppFlow.from_client_secrets_file(
+        str(client_secrets), expected_scopes
+    )
+
+    auth_url, _state = flow.authorization_url(
+        access_type="offline",
+        prompt="consent",
+        include_granted_scopes="true",
+    )
+
+    parsed = urllib.parse.urlparse(auth_url)
+    params = urllib.parse.parse_qs(parsed.query)
+
+    scope_value = params.get("scope", [""])[0]
+    assert scope_value, "scope parameter must not be empty"
+    assert "https://www.googleapis.com/auth/youtube.upload" in scope_value
+
+
 # ------------------------------------------------------------------ get_credentials: successful token refresh
 
 
