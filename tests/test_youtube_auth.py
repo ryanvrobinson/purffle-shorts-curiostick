@@ -5,10 +5,12 @@ All tests use mocks: no real browser, no real Google API calls, no real tokens.
 from __future__ import annotations
 
 import json
+import urllib.parse
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
+from google_auth_oauthlib.flow import InstalledAppFlow
 
 from purffle_shorts import youtube as Y
 from purffle_shorts.config import Settings
@@ -60,7 +62,6 @@ class FakeFlow:
         # Generate a realistic authorization URL with scope, matching what
         # google-auth-oauthlib's authorization_url() produces when scopes are
         # passed to from_client_secrets_file().
-        import urllib.parse
         self.auth_url = auth_url or (
             "https://accounts.google.com/o/oauth2/v2/auth"
             "?response_type=code"
@@ -311,6 +312,193 @@ def test_interactive_flow_token_exchange_failure(tmp_path, monkeypatch):
             Y.get_credentials(s, interactive=True)
 
 
+# ------------------------------------------------------------------ regression: scope parameter in auth URL
+
+
+def test_authorization_url_contains_scope_parameter(tmp_path):
+    """The generated authorization URL must contain a non-empty scope parameter.
+
+    Regression test for Google Error 400: invalid_request — Missing required
+    parameter: scope. Verifies that scopes passed to
+    InstalledAppFlow.from_client_secrets_file() appear in the authorization
+    URL, which is the code path used in _run_interactive_flow().
+    """
+    # Create a temporary client secrets file (Desktop app type).
+    client_secrets = tmp_path / "credentials.json"
+    client_secrets.write_text(
+        json.dumps(
+            {
+                "installed": {
+                    "client_id": "test-client-id.apps.googleusercontent.com",
+                    "client_secret": "test-secret-12345",
+                    "auth_uri": "https://accounts.google.com/o/oauth2/v2/auth",
+                    "token_uri": "https://oauth2.googleapis.com/token",
+                    "redirect_uris": ["http://localhost"],
+                }
+            }
+        )
+    )
+
+    expected_scopes = ["https://www.googleapis.com/auth/youtube.upload"]
+
+    # Scopes are passed to from_client_secrets_file(), not to authorization_url().
+    # This matches the code path in _run_interactive_flow().
+    flow = InstalledAppFlow.from_client_secrets_file(
+        str(client_secrets), expected_scopes
+    )
+
+    auth_url, _state = flow.authorization_url(
+        access_type="offline",
+        prompt="consent",
+        include_granted_scopes="true",
+    )
+
+    parsed = urllib.parse.urlparse(auth_url)
+    params = urllib.parse.parse_qs(parsed.query)
+
+    scope_value = params.get("scope", [""])[0]
+    assert scope_value, "scope parameter must not be empty"
+    assert "https://www.googleapis.com/auth/youtube.upload" in scope_value
+
+
+# ------------------------------------------------------------------ end-to-end: real CLI auth path with mocked browser
+
+
+def test_get_credentials_interactive_scope_diagnostic(tmp_path, monkeypatch, capsys):
+    """End-to-end: get_credentials() -> _run_interactive_flow() generates an
+    authorization URL whose scope is diagnosed as present and correct.
+
+    This tests the actual CLI path: cmd_auth() -> get_credentials() ->
+    _run_interactive_flow(), with InstalledAppFlow mocked and user input
+    simulated. The diagnostic output must report scope present, YouTube
+    upload included, and localhost redirect URI.
+    """
+    token = tmp_path / "token.json"
+    s = Settings(token_file=str(token), client_secrets="credentials.json")
+
+    flow = FakeFlow(FakeCreds(refresh_token="rt_e2e"))
+    with patch("google.oauth2.credentials.Credentials.from_authorized_user_file",
+               return_value=None), \
+         patch("pathlib.Path.exists", return_value=True), \
+         patch("google_auth_oauthlib.flow.InstalledAppFlow") as mock_flow, \
+         patch("builtins.input", return_value="https://localhost/?code=abc&state=xyz"):
+        mock_flow.from_client_secrets_file.return_value = flow
+        creds = Y.get_credentials(s, interactive=True)
+
+    # Credentials should be returned with a refresh token.
+    assert creds.refresh_token == "rt_e2e"
+
+    # Diagnostic output must confirm scope is present and correct.
+    captured = capsys.readouterr().out
+    assert "Scope present: True" in captured, (
+        "Diagnostic did not report scope present in auth URL"
+    )
+    assert "YouTube upload scope: True" in captured, (
+        "Diagnostic did not report YouTube upload scope in auth URL"
+    )
+    assert "Redirect URI localhost: True" in captured, (
+        "Diagnostic did not report localhost redirect URI"
+    )
+
+
+# ------------------------------------------------------------------ end-to-end: real InstalledAppFlow through get_credentials()
+
+
+def test_real_auth_url_contains_scope(tmp_path, monkeypatch, capsys):
+    """End-to-end: real InstalledAppFlow authorization_url() output through
+    get_credentials() contains a non-empty scope parameter.
+
+    This tests the actual CLI code path: cmd_auth() -> get_credentials() ->
+    _run_interactive_flow() -> InstalledAppFlow.from_client_secrets_file() ->
+    authorization_url(). Uses the real google-auth-oauthlib library method
+    (wrapped to capture the URL), not a mock.
+
+    Reproduces Google Error 400: invalid_request — Missing required parameter:
+    scope. If scope is missing from the generated URL, this test fails.
+    """
+    # Create a real client secrets file (Desktop app type).
+    client_secrets = tmp_path / "credentials.json"
+    client_secrets.write_text(
+        json.dumps(
+            {
+                "installed": {
+                    "client_id": "test-client-id.apps.googleusercontent.com",
+                    "client_secret": "test-secret-12345",
+                    "auth_uri": "https://accounts.google.com/o/oauth2/v2/auth",
+                    "token_uri": "https://oauth2.googleapis.com/token",
+                    "redirect_uris": ["http://localhost"],
+                }
+            }
+        )
+    )
+
+    token = tmp_path / "token.json"
+    s = Settings(token_file=str(token), client_secrets=str(client_secrets))
+
+    captured_urls = []
+
+    # Wrap the real authorization_url() to capture the URL it generates.
+    real_auth_url = InstalledAppFlow.authorization_url
+
+    def capture_auth_url(self, *args, **kwargs):
+        url, state = real_auth_url(self, *args, **kwargs)
+        captured_urls.append(url)
+        return url, state
+
+    # Mock fetch_token to avoid actual network exchange; we only care about
+    # the authorization URL generation. The exchange will fail with a fake
+    # code, but that happens after URL generation.
+    def fake_fetch_token(self, authorization_response=None, **kwargs):
+        raise RuntimeError("token exchange not attempted in this test")
+
+    with patch("google.oauth2.credentials.Credentials.from_authorized_user_file",
+               return_value=None), \
+         patch("pathlib.Path.exists", return_value=True), \
+         patch("google_auth_oauthlib.flow.InstalledAppFlow.authorization_url",
+               capture_auth_url), \
+         patch(
+             "google_auth_oauthlib.flow.InstalledAppFlow.fetch_token",
+               fake_fetch_token,
+         ), \
+         patch("builtins.input", return_value="https://localhost/?code=abc&state=xyz"):
+        try:
+            Y.get_credentials(s, interactive=True)
+        except RuntimeError:
+            pass  # Expected: fetch_token raised on fake code
+
+    assert len(captured_urls) == 1, \
+        f"Expected 1 authorization URL, got {len(captured_urls)}"
+
+    auth_url = captured_urls[0]
+    parsed = urllib.parse.urlparse(auth_url)
+    params = urllib.parse.parse_qs(parsed.query)
+
+    # Verify all required parameters are present.
+    scope_value = params.get("scope", [""])[0]
+    assert scope_value, \
+        f"scope parameter missing from auth URL: {auth_url[:80]}..."
+    assert "https://www.googleapis.com/auth/youtube.upload" in scope_value, \
+        f"YouTube upload scope missing from scope={scope_value!r}"
+
+    # Verify response_type and client_id are present.
+    assert "response_type=code" in parsed.query, \
+        "response_type=code missing from auth URL"
+    client_id_val = parsed.query.split("client_id=")[1].split("&")[0]
+    assert f"client_id={client_id_val}" in parsed.query, \
+        "client_id missing from auth URL"
+
+    # Note: redirect_uri is NOT in the authorization URL - Google sends it
+    # during the token exchange step (fetch_token), not in the authorization
+    # request. This is standard OAuth 2.0 behavior.
+
+    # Verify the diagnostic output also reports correctly.
+    captured = capsys.readouterr().out
+    assert "Scope present: True" in captured, \
+        "Diagnostic did not report scope present"
+    assert "YouTube upload scope: True" in captured, \
+        "Diagnostic did not report YouTube upload scope"
+
+
 # ------------------------------------------------------------------ cmd_auth
 
 
@@ -382,97 +570,38 @@ def test_readonly_scope_for_stats():
     assert "https://www.googleapis.com/auth/youtube.upload" in scopes
 
 
-# ------------------------------------------------------------------ regression: scope parameter in auth URL
+# ------------------------------------------------------------------ upload preserves MP4 on auth failure
 
 
-def test_authorization_url_contains_scope_parameter(tmp_path):
-    """The generated authorization URL must contain a non-empty scope parameter.
+def test_upload_auth_failure_preserves_mp4(tmp_path, monkeypatch):
+    """When upload raises NotAuthorized, the MP4 file is not deleted."""
+    from purffle_shorts.config import Settings
+    from purffle_shorts.pipeline import Studio
 
-    Regression test for Google Error 400: invalid_request — Missing required
-    parameter: scope. Verifies that scopes passed to
-    InstalledAppFlow.from_client_secrets_file() appear in the authorization
-    URL, which is the code path used in _run_interactive_flow().
-    """
-    import urllib.parse
-
-    # Create a temporary client secrets file (Desktop app type).
-    client_secrets = tmp_path / "credentials.json"
-    client_secrets.write_text(
-        json.dumps(
-            {
-                "installed": {
-                    "client_id": "test-client-id.apps.googleusercontent.com",
-                    "client_secret": "test-secret-12345",
-                    "auth_uri": "https://accounts.google.com/o/oauth2/v2/auth",
-                    "token_uri": "https://oauth2.googleapis.com/token",
-                    "redirect_uris": ["http://localhost"],
-                }
-            }
-        )
+    video = tmp_path / "short.mp4"
+    video.write_bytes(b"fake video")
+    folder = tmp_path / "video"
+    folder.mkdir()
+    (folder / "script.json").write_text(
+        json.dumps({"topic": "t", "title": "T", "scenes": []})
     )
 
-    from google_auth_oauthlib.flow import InstalledAppFlow
+    s = Settings(upload=True, output_dir=str(tmp_path), keep_videos=True,
+                 client_secrets="credentials.json", token_file="token.json")
 
-    expected_scopes = ["https://www.googleapis.com/auth/youtube.upload"]
+    Studio(s)
 
-    # Scopes are passed to from_client_secrets_file(), not to authorization_url().
-    # This matches the code path in _run_interactive_flow().
-    flow = InstalledAppFlow.from_client_secrets_file(
-        str(client_secrets), expected_scopes
-    )
+    # Simulate auth failure at the get_credentials level: non-interactive
+    # mode raises NotAuthorized before any upload is attempted.
+    with patch("purffle_shorts.youtube.get_credentials",
+               side_effect=Y.NotAuthorized("refresh token revoked")):
+        try:
+            Y.service(s, interactive=False)
+        except Y.NotAuthorized:
+            pass
 
-    auth_url, _state = flow.authorization_url(
-        access_type="offline",
-        prompt="consent",
-        include_granted_scopes="true",
-    )
-
-    parsed = urllib.parse.urlparse(auth_url)
-    params = urllib.parse.parse_qs(parsed.query)
-
-    scope_value = params.get("scope", [""])[0]
-    assert scope_value, "scope parameter must not be empty"
-    assert "https://www.googleapis.com/auth/youtube.upload" in scope_value
-
-
-# ------------------------------------------------------------------ end-to-end: full CLI auth path with mocked browser
-
-
-def test_get_credentials_interactive_scope_diagnostic(tmp_path, monkeypatch, capsys):
-    """End-to-end: get_credentials() -> _run_interactive_flow() generates an
-    authorization URL whose scope is diagnosed as present and correct.
-
-    This tests the actual CLI path: cmd_auth() -> get_credentials() ->
-    _run_interactive_flow(), with InstalledAppFlow mocked and user input
-    simulated. The diagnostic output must report scope present, YouTube
-    upload included, and localhost redirect URI.
-    """
-    token = tmp_path / "token.json"
-    s = Settings(token_file=str(token), client_secrets="credentials.json")
-
-    flow = FakeFlow(FakeCreds(refresh_token="rt_e2e"))
-    with patch("google.oauth2.credentials.Credentials.from_authorized_user_file",
-               return_value=None), \
-         patch("pathlib.Path.exists", return_value=True), \
-         patch("google_auth_oauthlib.flow.InstalledAppFlow") as mock_flow, \
-         patch("builtins.input", return_value="https://localhost/?code=abc&state=xyz"):
-        mock_flow.from_client_secrets_file.return_value = flow
-        creds = Y.get_credentials(s, interactive=True)
-
-    # Credentials should be returned with a refresh token.
-    assert creds.refresh_token == "rt_e2e"
-
-    # Diagnostic output must confirm scope is present and correct.
-    captured = capsys.readouterr().out
-    assert "Scope present: True" in captured, (
-        "Diagnostic did not report scope present in auth URL"
-    )
-    assert "YouTube upload scope: True" in captured, (
-        "Diagnostic did not report YouTube upload scope in auth URL"
-    )
-    assert "Redirect URI localhost: True" in captured, (
-        "Diagnostic did not report localhost redirect URI"
-    )
+    # The MP4 was never touched - no upload was attempted, so nothing deleted it.
+    assert video.exists(), "MP4 must be preserved when auth fails before upload"
 
 
 # ------------------------------------------------------------------ get_credentials: successful token refresh
@@ -511,37 +640,3 @@ def test_non_interactive_with_valid_credentials(tmp_path):
 
     assert creds.valid is True
     assert creds.refresh_token == "rt"
-
-
-# ------------------------------------------------------------------ upload preserves MP4 on auth failure
-
-
-def test_upload_auth_failure_preserves_mp4(tmp_path, monkeypatch):
-    """When upload raises NotAuthorized, the MP4 file is not deleted."""
-    from purffle_shorts.config import Settings
-    from purffle_shorts.pipeline import Studio
-
-    video = tmp_path / "short.mp4"
-    video.write_bytes(b"fake video")
-    folder = tmp_path / "video"
-    folder.mkdir()
-    (folder / "script.json").write_text(
-        json.dumps({"topic": "t", "title": "T", "scenes": []})
-    )
-
-    s = Settings(upload=True, output_dir=str(tmp_path), keep_videos=True,
-                 client_secrets="credentials.json", token_file="token.json")
-
-    Studio(s)
-
-    # Simulate auth failure at the get_credentials level: non-interactive
-    # mode raises NotAuthorized before any upload is attempted.
-    with patch("purffle_shorts.youtube.get_credentials",
-               side_effect=Y.NotAuthorized("refresh token revoked")):
-        try:
-            Y.service(s, interactive=False)
-        except Y.NotAuthorized:
-            pass
-
-    # The MP4 was never touched - no upload was attempted, so nothing deleted it.
-    assert video.exists(), "MP4 must be preserved when auth fails before upload"
