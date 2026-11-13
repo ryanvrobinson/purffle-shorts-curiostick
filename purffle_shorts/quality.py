@@ -259,8 +259,8 @@ class QualityGate:
                 return QualityCheck("duration", False, "Invalid duration")
 
             min_dur, max_dur = duration_window(self.settings.target_seconds)
-            # The 40-second Shorts format uses a strict window: preferred 36-40s
-            # with a hard maximum of 40s (no encoding tolerance added above the cap).
+            # The 30-second Shorts format uses a strict window: preferred 27-30s
+            # with a hard maximum of 30s plus only the encoding tolerance.
             short = short_duration_bounds(self.settings.target_seconds)
             if short is not None:
                 min_dur, max_dur = short

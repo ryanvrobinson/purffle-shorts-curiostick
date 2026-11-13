@@ -880,11 +880,10 @@ def review_script(llm, script: Script, settings: Settings) -> Script:
         score = score if score is not None else current.score
         adopted = result is not current
         # Set the review/score/blocking on the script we return: always in
-        # score-only mode, and in rewrite mode when a rewrite was accepted. A
-        # rejected rewrite must never overwrite the retained script's score,
-        # review findings, or blocking issues -- but on the first Doctor pass
-        # there is nothing to preserve, so the assessed score is recorded.
-        should_set_review = (not rewrite) or adopted or current.score is None
+        # score-only mode, and in rewrite mode only when the rewrite was
+        # accepted. A rejected rewrite must never overwrite the retained
+        # script's score, review findings, or blocking issues.
+        should_set_review = (not rewrite) or adopted
         if should_set_review:
             result.score = score
             result.review = issues

@@ -66,10 +66,10 @@ def _install_fake_genai(monkeypatch, captured=None, *, fail=False, rate_limited=
 
     genai_pkg = types.ModuleType("google")
     genai_pkg.genai = mod
-    monkeypatch.setitem(sys.modules, "google", genai_pkg)
-    monkeypatch.setitem(sys.modules, "google.genai", mod)
-    monkeypatch.setitem(sys.modules, "google.genai.errors", errors_mod)
-    monkeypatch.setitem(sys.modules, "google.genai.types", types_mod)
+    sys.modules["google"] = genai_pkg
+    sys.modules["google.genai"] = mod
+    sys.modules["google.genai.errors"] = errors_mod
+    sys.modules["google.genai.types"] = types_mod
     mod.Client = FakeClient
     mod.errors = errors_mod
     mod.types = types_mod

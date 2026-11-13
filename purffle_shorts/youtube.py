@@ -7,10 +7,8 @@ import logging
 import os
 import pickle
 import random
-import shutil
 import threading
 import time
-import urllib.parse
 from datetime import datetime, timedelta, timezone
 from datetime import time as dtime
 from pathlib import Path
@@ -23,12 +21,6 @@ SCOPE_UPLOAD = "https://www.googleapis.com/auth/youtube.upload"
 SCOPE_MANAGE = "https://www.googleapis.com/auth/youtube"
 SCOPE_READONLY = "https://www.googleapis.com/auth/youtube.readonly"
 RETRY_STATUS = {500, 502, 503, 504}
-
-# ``invalid_grant`` from Google's OAuth2 token endpoint means the refresh token
-# is revoked, expired, or belongs to a different client. It is permanent: no
-# amount of retrying will obtain a new access token. Only a fresh interactive
-# authorization flow (``purffle-shorts auth``) can repair it.
-_INVALID_GRANT = "invalid_grant"
 
 _lock = threading.Lock()
 
@@ -85,113 +77,10 @@ def _load_legacy_pickle():
         return None
 
 
-def _backup_existing_token(token: Path) -> None:
-    """Back up an existing token file before replacement, without exposing contents.
-
-    The backup is a plain copy (original is preserved). Contents are never logged
-    or printed.
-    """
-    if token.exists():
-        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-        backup = token.with_name(f"{token.name}.bak.{stamp}")
-        try:
-            shutil.copy2(token, backup)
-            log.info("Existing token backed up to %s", backup.name)
-        except OSError as e:
-            log.warning("Could not back up existing token file: %s", e)
-
-
-def _run_interactive_flow(secrets: Path, scopes: list[str]):
-    """Run an interactive OAuth authorization-code flow for remote environments.
-
-    Designed for GitHub Codespaces where a localhost callback server cannot be
-    reached from the user's browser. Instead of ``run_local_server()`` this
-    displays the Google authorization URL, asks the user to open it in their
-    normal browser, and then prompts them to paste the authorization response
-    (or just the code) back into the terminal.
-
-    Uses PKCE with state validation. Never prints or logs authorization codes,
-    access tokens, refresh tokens, client secrets, or complete credential JSON.
-    """
-    from google_auth_oauthlib.flow import InstalledAppFlow
-
-    flow = InstalledAppFlow.from_client_secrets_file(str(secrets), scopes)
-
-    auth_url, state = flow.authorization_url(
-        access_type="offline",
-        prompt="consent",
-        include_granted_scopes="true",
-    )
-
-    # Safe diagnostic: verify the authorization URL carries the required scopes
-    # without leaking the full URL, state, or credentials.
-    parsed_auth_url = urllib.parse.urlparse(auth_url)
-    auth_params = urllib.parse.parse_qs(parsed_auth_url.query)
-    auth_scope = auth_params.get("scope", [""])[0]
-    has_scope = bool(auth_scope)
-    has_youtube_upload = "https://www.googleapis.com/auth/youtube.upload" in auth_scope
-    redirect_uri = flow.redirect_uri or "http://localhost"
-    is_localhost = redirect_uri.startswith("http://localhost") or redirect_uri.startswith(
-        "http://127.0.0.1"
-    )
-
-    print("\n" + "=" * 66)
-    print("YouTube OAuth Authorization")
-    print("=" * 66)
-    print("1. Open this URL in your browser:")
-    print()
-    print(f"   {auth_url}")
-    print()
-    print("OAuth authorization URL diagnostics:")
-    print(f"  Scope present: {has_scope}")
-    print(f"  YouTube upload scope: {has_youtube_upload}")
-    print(f"  Redirect URI localhost: {is_localhost}")
-    print()
-    if not has_scope or not has_youtube_upload:
-        print(
-            "WARNING: Authorization URL may be missing required scopes. "
-            "Authorization may fail with Error 400: invalid_request."
-        )
-    print()
-    print("2. Sign in to your Google account and grant permission.")
-    print("3. After authorization, copy the FULL redirect URL from your")
-    print("   browser's address bar (it may start with http://localhost).")
-    print()
-    print("4. Paste the full URL (or just the authorization code) below:")
-    print("=" * 66)
-
-    response = input("Authorization response: ").strip()
-    if not response:
-        raise NotAuthorized("No authorization response provided.")
-
-    if response.startswith("http://") or response.startswith("https://"):
-        flow.fetch_token(authorization_response=response)
-    else:
-        # User pasted just the authorization code; wrap it in a synthetic
-        # authorization response URL so PKCE and state validation still run.
-        redirect_uri = flow.redirect_uri or "http://localhost"
-        fake_response = f"{redirect_uri}?{urllib.parse.urlencode({'code': response, 'state': state})}"
-        flow.fetch_token(authorization_response=fake_response)
-
-    creds = flow.credentials
-
-    if not creds.refresh_token:
-        raise NotAuthorized(
-            "Google did not issue a refresh token. This can happen if you already "
-            "authorized this OAuth client before (Google issues refresh tokens only "
-            "on first grant) or if the client is not configured as a Desktop app in "
-            "Google Cloud Console. Revoke the client in your Google Account "
-            "permissions (myaccount.google.com/permissions), then run "
-            "'purffle-shorts auth' again."
-        )
-
-    return creds
-
-
 def get_credentials(settings: Settings, interactive: bool = True, extra_scopes: list[str] | None = None):
-    from google.auth.exceptions import RefreshError
     from google.auth.transport.requests import Request
     from google.oauth2.credentials import Credentials
+    from google_auth_oauthlib.flow import InstalledAppFlow
 
     scopes = list(dict.fromkeys(scopes_for(settings) + list(extra_scopes or [])))
     token = Path(settings.token_file)
@@ -206,18 +95,6 @@ def get_credentials(settings: Settings, interactive: bool = True, extra_scopes: 
     if creds is not None and not creds.valid and creds.expired and creds.refresh_token:
         try:
             creds.refresh(Request())
-        except RefreshError as e:
-            err_text = str(e).lower()
-            if _INVALID_GRANT in err_text:
-                log.error(
-                    "YouTube refresh token is revoked or invalid (invalid_grant). "
-                    "Re-authorization is required: run 'purffle-shorts auth' with credentials.json, "
-                    "then paste the new token.json into the YOUTUBE_TOKEN_JSON GitHub Actions secret. "
-                    "Code cannot repair a revoked refresh token."
-                )
-            else:
-                log.warning("Refreshing YouTube token failed (%s); re-authorization needed", e)
-            creds = None
         except Exception as e:
             log.warning("Refreshing YouTube token failed (%s); re-authorization needed", e)
             creds = None
@@ -229,8 +106,8 @@ def get_credentials(settings: Settings, interactive: bool = True, extra_scopes: 
             raise NotAuthorized(
                 f"{secrets} not found. Create an OAuth client (Desktop app) in Google Cloud Console with the "
                 "YouTube Data API v3 enabled, download its JSON as credentials.json, then run the auth command.")
-        creds = _run_interactive_flow(secrets, scopes)
-    _backup_existing_token(token)
+        flow = InstalledAppFlow.from_client_secrets_file(str(secrets), scopes)
+        creds = flow.run_local_server(port=0, prompt="consent")
     token.write_text(creds.to_json(), encoding="utf-8")
     try:
         os.chmod(token, 0o600)

@@ -372,34 +372,8 @@ def _review_upload(rec: dict, s: Settings, scheduled_times: list[str] | None = N
 
 def cmd_auth(args, s: Settings) -> int:
     from . import youtube
-
-    print("\nYouTube OAuth authorization")
-    print("=" * 50)
-    print("1. A browser window will open to Google's authorization page.")
-    print("2. Sign in to the YouTube channel you want to upload to.")
-    print("3. Grant permission for PurffleShorts to upload videos on your behalf.")
-    print("4. After authorization, the token is saved locally as token.json.")
-    print()
-    print("After this command completes, copy the contents of token.json into the")
-    print("YOUTUBE_TOKEN_JSON GitHub Actions secret so unattended runs can upload.")
-    print("Never paste token contents into chat or commit them to version control.")
-    print()
-
-    try:
-        creds = youtube.get_credentials(s, interactive=True, extra_scopes=youtube.auth_scopes(s))
-    except youtube.NotAuthorized as e:
-        print(f"\nAuthorization failed: {e}")
-        return 1
-
-    # Verify refresh token is present (required for unattended GitHub Actions runs)
-    if not creds.refresh_token:
-        print("\nAuthorization succeeded but no refresh token was issued.")
-        print("Unattended GitHub Actions uploads require a refresh token.")
-        print("Revoke this client in your Google Account permissions, then run 'purffle-shorts auth' again.")
-        return 1
-
-    print(f"\nYouTube authorized. Token saved to {s.token_file}")
-    print("Update the YOUTUBE_TOKEN_JSON GitHub Actions secret with the new token.json contents.")
+    youtube.get_credentials(s, interactive=True, extra_scopes=youtube.auth_scopes(s))
+    print(f"âœ” YouTube authorized. Token saved to {s.token_file}")
     return 0
 
 

@@ -173,51 +173,21 @@ claims, return {{"claims": []}}.
     return cleaned
 
 
-def _claim_relevance(claim: str, source: dict, context: str = "") -> bool:
-    """Heuristic: does a source's title/URL or context seem to cover the claim's subject?
-
-    A claim counts as supported when enough of its significant words (4+ chars)
-    appear in the source's title/URL or the gathered context text. Proper nouns
-    from the claim also count as strong evidence if they appear in the source.
-    An LLM never confers ``verified`` status by itself; this is only a relevance
-    signal used alongside actual source evidence.
-    """
+def _claim_relevance(claim: str, source: dict) -> bool:
+    """Heuristic: does a source's title/URL seem to cover the claim's subject?"""
     claim_words = set(re.findall(r"[a-z]{4,}", claim.lower()))
-    if not claim_words:
-        return False
-
-    # Source title + URL words
     source_text = f"{source.get('title', '')} {source.get('url', '')}".lower()
     source_words = set(re.findall(r"[a-z]{4,}", source_text))
-
-    # Context words (article text, Wikipedia extract, RSS summary, etc.)
-    context_words = set(re.findall(r"[a-z]{4,}", context.lower())) if context else set()
-
-    all_source_words = source_words | context_words
-    overlap = len(claim_words & all_source_words)
-
-    # Base threshold: at least one word for short claims, one-quarter for longer ones.
-    threshold = max(1, len(claim_words) // 4)
-    if overlap >= threshold:
-        return True
-
-    # Secondary check: proper nouns (entities) from the claim appearing in the
-    # source are strong evidence of relevance, as long as at least one claim
-    # word also overlaps (avoids matching on a single common word).
-    claim_entities = set(re.findall(r"\b[A-Z][a-z]+\b", claim))
-    source_for_entities = f"{source_text} {context}".lower()
-    if claim_entities and overlap >= 1:
-        if any(e.lower() in source_for_entities for e in claim_entities):
-            return True
-
-    return False
+    if not claim_words:
+        return False
+    overlap = len(claim_words & source_words)
+    return overlap >= max(1, len(claim_words) // 3)
 
 
 def verify_claims(
     claims: list[str],
     sources: list[dict],
     llm: Optional[LLM] = None,
-    context: str = "",
 ) -> list[Claim]:
     """Verify each claim against the gathered sources.
 
@@ -226,8 +196,8 @@ def verify_claims(
     An LLM never confers ``verified`` status by itself.
     """
     verified: list[Claim] = []
-    for claim in claims:
-        supporting = [s.get("url", "") for s in sources if _claim_relevance(claim, s, context)]
+    for i, claim in enumerate(claims):
+        supporting = [s.get("url", "") for s in sources if _claim_relevance(claim, s)]
         supporting = [u for u in supporting if u]
         if supporting:
             status = VERIFIED
@@ -241,13 +211,7 @@ def verify_claims(
                 source_urls=supporting,
                 status=status,
                 reason=reason,
-                # scene_index is remapped by verify_script_claims from the
-                # (scene_index, claim_text) pairs it receives. It stays None
-                # here because a claim's ordinal in a flattened list is not
-                # a scene index: multiple claims can come from one scene and
-                # an LLM re-extraction can change the list length, so using
-                # the ordinal here can point past the last scene.
-                scene_index=None,
+                scene_index=i,
             )
         )
     return verified
@@ -263,7 +227,6 @@ def verify_script_claims(
     ``script_claims`` is a list of ``(scene_index, claim_text)`` pairs.
     """
     sources = list(topic.source_references or [])
-    context = topic.context or ""
     all_claims = [c for _, c in script_claims]
     checked_by = "heuristic"
     llm_extraction_failed = False
@@ -289,7 +252,7 @@ def verify_script_claims(
                 "LLM claim extraction failed (extraction error, not a verification "
                 "result): %s. Falling back to heuristic claims.", extraction_error)
 
-    claims = verify_claims(all_claims, sources, llm, context=context)
+    claims = verify_claims(all_claims, sources, llm)
     if llm_extraction_failed:
         log.warning(
             "Claim extraction failed for topic %r; %d heuristic claim(s) carry "
@@ -297,23 +260,12 @@ def verify_script_claims(
             topic.subject, len(claims), extraction_error,
         )
 
-    # Re-map scene indices onto the script's scenes. Claims correspond
-    # positionally to script_claims only when the claim list did not change.
-    # When the LLM re-extracted a different number of claims we can no longer
-    # place every claim on a scene: unplaceable claims keep scene_index None
-    # so no scene is wrongly flagged, and the extraction is recorded as
-    # unreliable rather than silently associating claims with the wrong scenes.
+    # Re-map scene indices when LLM re-extraction changed the claim list.
     indexed: list[Claim] = []
-    if len(claims) == len(script_claims):
-        for claim, (scene_index, _text) in zip(claims, script_claims):
-            claim.scene_index = scene_index
-            indexed.append(claim)
-    else:
-        llm_extraction_failed = True
-        for idx, claim in enumerate(claims):
-            if idx < len(script_claims):
-                claim.scene_index = script_claims[idx][0]
-            indexed.append(claim)
+    for idx, claim in enumerate(claims):
+        if idx < len(script_claims):
+            claim.scene_index = script_claims[idx][0]
+        indexed.append(claim)
 
     overall = _overall_status(indexed)
     log.info(
