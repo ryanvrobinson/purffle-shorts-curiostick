@@ -94,6 +94,7 @@ SCRIPT = {"topic": "cats", "title": "Why Cats Purr", "hook_text": "PURR POWER", 
               {"speaker": "A", "narration": "A cat's purr can heal bones and soothe stress in humans too.", "search_query": "cat", "image_prompt": "cat"},
               {"speaker": "A", "narration": "They purr when happy, scared, or giving birth to their kittens.", "search_query": "cat", "image_prompt": "cat"},
               {"speaker": "A", "narration": "The vibration is good for their health and helps them heal faster.", "search_query": "cat", "image_prompt": "cat"},
+              {"speaker": "A", "narration": "Not every purr means joy — some cats purr to comfort themselves when afraid.", "search_query": "cat", "image_prompt": "cat"},
           ],
           "description": "Purring.", "hashtags": ["#cats"], "tags": ["cats"]}
 

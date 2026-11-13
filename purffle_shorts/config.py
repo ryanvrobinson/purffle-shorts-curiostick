@@ -144,7 +144,7 @@ class Settings:
     trends_geo: str = "US"
     style: str = "auto"               # auto|facts|story|listicle|myth|quiz|motivational|news|explainer|dialogue|chat
     language: str = "en"
-    target_seconds: int = 30
+    target_seconds: int = 40
     channel_name: str = "PurffleStudios"
     audience: str = "curious general audience"
     rss_feeds: list[str] = field(default_factory=list)   # for TOPIC_SOURCES=rss

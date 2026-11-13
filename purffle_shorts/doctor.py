@@ -13,7 +13,7 @@ from .config import Settings
 
 
 def checks(s: Settings) -> list[dict]:
-    from . import ffmpeg
+    from . import ffmpeg, youtube
     from .llm import LLMError, build_provider, ollama_has, ollama_models, resolve_provider_name
     out: list[dict] = []
 
@@ -87,7 +87,23 @@ def checks(s: Settings) -> list[dict]:
         cs = Path(s.client_secrets).exists()
         tok = Path(s.token_file).exists() or Path("token.pickle").exists()
         add(cs or tok, "YouTube OAuth client", s.client_secrets if cs else "credentials.json missing")
-        add(tok if cs else None, "YouTube token", "found" if tok else "run: purffle-shorts auth")
+        if cs and tok:
+            # Non-interactive authentication validation: load the token, refresh
+            # the access token when necessary, and confirm the credentials are
+            # usable. Never prints token material and never uploads a video.
+            try:
+                creds = youtube.get_credentials(s, interactive=False)
+            except youtube.NotAuthorized:
+                add(False, "YouTube token",
+                    "refresh token revoked or invalid: run 'purffle-shorts auth' and "
+                    "refresh the YOUTUBE_TOKEN_JSON secret")
+            except Exception as e:  # network hiccup: cannot confirm right now
+                add(None, "YouTube token", f"validation could not complete: {e}")
+            else:
+                add(bool(creds and creds.valid), "YouTube token",
+                    "refreshed and valid" if creds and creds.valid else "invalid")
+        else:
+            add(tok if cs else None, "YouTube token", "found" if tok else "run: purffle-shorts auth")
         add(None, "Publishing", f"{s.privacy}" + (f", scheduled at {', '.join(s.publish_times)}" if s.publish_times
                                                  else "") + f", max {s.daily_upload_limit}/day")
     else:

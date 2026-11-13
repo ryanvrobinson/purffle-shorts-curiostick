@@ -10,7 +10,6 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
-from google_auth_oauthlib.flow import InstalledAppFlow
 
 from purffle_shorts import youtube as Y
 from purffle_shorts.config import Settings
@@ -341,6 +340,8 @@ def test_authorization_url_contains_scope_parameter(tmp_path):
 
     expected_scopes = ["https://www.googleapis.com/auth/youtube.upload"]
 
+    from google_auth_oauthlib.flow import InstalledAppFlow
+
     # Scopes are passed to from_client_secrets_file(), not to authorization_url().
     # This matches the code path in _run_interactive_flow().
     flow = InstalledAppFlow.from_client_secrets_file(
@@ -416,6 +417,10 @@ def test_real_auth_url_contains_scope(tmp_path, monkeypatch, capsys):
     Reproduces Google Error 400: invalid_request — Missing required parameter:
     scope. If scope is missing from the generated URL, this test fails.
     """
+    import urllib.parse
+
+    from google_auth_oauthlib.flow import InstalledAppFlow
+
     # Create a real client secrets file (Desktop app type).
     client_secrets = tmp_path / "credentials.json"
     client_secrets.write_text(
@@ -591,10 +596,16 @@ def test_upload_auth_failure_preserves_mp4(tmp_path, monkeypatch):
 
     Studio(s)
 
-    # Simulate auth failure at the get_credentials level: non-interactive
+    # Simulate auth failure at the service level: non-interactive
     # mode raises NotAuthorized before any upload is attempted.
-    with patch("purffle_shorts.youtube.get_credentials",
-               side_effect=Y.NotAuthorized("refresh token revoked")):
+    # Patch youtube.service directly to avoid importing
+    # googleapiclient.discovery (which triggers google.api_core import
+    # and can conflict with google_auth_oauthlib namespace packages
+    # when run in the full test suite).
+    def mock_service(*args, **kwargs):
+        raise Y.NotAuthorized("refresh token revoked")
+
+    with patch("purffle_shorts.youtube.service", side_effect=mock_service):
         try:
             Y.service(s, interactive=False)
         except Y.NotAuthorized:
@@ -640,3 +651,76 @@ def test_non_interactive_with_valid_credentials(tmp_path):
 
     assert creds.valid is True
     assert creds.refresh_token == "rt"
+
+
+# ------------------------------------------------------------------ non-interactive auth validation (no upload ever)
+
+def test_non_interactive_validation_refreshes_expired_token(tmp_path, monkeypatch):
+    """Reading the token, refreshing it, and confirming validity never uploads a video."""
+    calls = {"refresh": 0}
+    real_refresh = FakeCreds.refresh
+
+    def counting_refresh(self, request):
+        calls["refresh"] += 1
+        return real_refresh(self, request)
+
+    token = tmp_path / "token.json"
+    token.write_text('{"refresh_token": "rt", "token": "old", "expiry": "2020-01-01T00:00:00Z"}')
+    s = Settings(token_file=str(token), client_secrets="credentials.json")
+
+    fake_creds = FakeCreds(refresh_token="rt", valid=False, expired=True)
+    monkeypatch.setattr(FakeCreds, "refresh", counting_refresh)
+    with patch("google.oauth2.credentials.Credentials.from_authorized_user_file",
+               return_value=fake_creds), \
+         patch("google.auth.transport.requests.Request"):
+        creds = Y.get_credentials(s, interactive=False)
+
+    assert calls["refresh"] == 1          # the access token was refreshed
+    assert creds.valid is True            # credentials confirmed valid
+    assert json.loads(token.read_text())["refresh_token"] == "rt"
+    # No YouTube service was built and no upload was attempted in this path.
+
+
+def test_non_interactive_validation_invalid_grant_raises_not_authorized(tmp_path):
+    """A revoked refresh token (invalid_grant) fails closed: no upload, no silent retry."""
+    token = tmp_path / "token.json"
+    token.write_text('{"refresh_token": "rt", "token": "old", "expiry": "2020-01-01T00:00:00Z"}')
+    s = Settings(token_file=str(token), client_secrets="credentials.json")
+
+    fake_creds = FakeCreds(refresh_token="", valid=False, expired=True)
+    with patch("google.oauth2.credentials.Credentials.from_authorized_user_file",
+               return_value=fake_creds), \
+         patch("google.auth.transport.requests.Request"):
+        with pytest.raises(Y.NotAuthorized):
+            Y.get_credentials(s, interactive=False)
+
+
+def test_doctor_validates_youtube_token_without_uploading(tmp_path, monkeypatch):
+    """`purffle-shorts doctor` validates the token non-interactively: refresh if needed,
+    report validity, never upload a video and never print token material."""
+    from purffle_shorts import doctor
+
+    token = tmp_path / "token.json"
+    token.write_text('{"refresh_token": "rt", "token": "old", "expiry": "2020-01-01T00:00:00Z"}')
+    (tmp_path / "credentials.json").write_text("{}")
+    monkeypatch.chdir(tmp_path)
+    s = Settings(upload=True, token_file=str(token), client_secrets="credentials.json")
+
+    calls = {"upload": 0}
+
+    class FakeService:
+        def videos(self):
+            calls["upload"] += 1
+            raise AssertionError("no upload may happen during auth validation")
+
+    def fake_get_credentials(settings, interactive=True, extra_scopes=None):
+        assert interactive is False
+        return FakeCreds(refresh_token="rt", valid=True, expired=False)
+
+    monkeypatch.setattr(Y, "get_credentials", fake_get_credentials)
+    monkeypatch.setattr(Y, "service", lambda *a, **k: FakeService())
+
+    results = {c["label"]: c for c in doctor.checks(s)}
+    assert results["YouTube token"]["ok"] is True
+    assert "valid" in results["YouTube token"]["detail"].lower()
+    assert calls["upload"] == 0

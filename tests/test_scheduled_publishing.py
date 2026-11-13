@@ -493,3 +493,110 @@ def test_daily_parser_slot_flags(tmp_path, monkeypatch):
 def test_invalid_slot_is_rejected():
     with pytest.raises(Exception):
         SlotAutomation(Settings(), slot=9)
+
+
+# ------------------------------------------------------------------ slot 2 and slot 3 hit their own IST targets
+
+def test_slot_two_schedules_at_14_00_ist(tmp_path, monkeypatch):
+    """Slot 2 must never resolve to slot 1's 09:00 or slot 3's 19:00 target."""
+    history = History(tmp_path / "history.db")
+    studio = FakeStudio(tmp_path, history)
+    monkeypatch.setattr("purffle_shorts.automation.QualityGate",
+                        lambda settings: FakeGate())
+
+    settings = Settings(output_dir=str(tmp_path / "out"), data_dir=str(tmp_path / "data"),
+                        upload=False, timezone="Asia/Kolkata")
+    run_date = future_run_date()
+    expected = Y.to_rfc3339(slot_publish_moments(run_date)[2])  # 14:00 IST -> 08:30 UTC
+    auto = SlotAutomation(settings, slot=2, run_date=run_date,
+                          dry_run=False, studio=studio, history=history)
+    result = auto.run_slot()
+
+    assert result.ok is True
+    assert result.uploaded is True
+    assert result.publish_at_utc == expected
+    published = datetime.fromisoformat(result.publish_at_utc.replace("Z", "+00:00"))
+    assert published.hour == 8 and published.minute == 30   # 08:30 UTC = 14:00 IST
+    assert result.publish_at_ist.endswith("T14:00:00+05:30")
+    assert len(studio.upload_calls) == 1
+    assert studio.upload_calls[0][2] == 2                   # slot carried to the upload
+
+
+def test_slot_three_schedules_at_19_00_ist(tmp_path, monkeypatch):
+    """Slot 3 must never resolve to slot 1's 09:00 or slot 2's 14:00 target."""
+    history = History(tmp_path / "history.db")
+    studio = FakeStudio(tmp_path, history)
+    monkeypatch.setattr("purffle_shorts.automation.QualityGate",
+                        lambda settings: FakeGate())
+
+    settings = Settings(output_dir=str(tmp_path / "out"), data_dir=str(tmp_path / "data"),
+                        upload=False, timezone="Asia/Kolkata")
+    run_date = future_run_date()
+    expected = Y.to_rfc3339(slot_publish_moments(run_date)[3])  # 19:00 IST -> 13:30 UTC
+    auto = SlotAutomation(settings, slot=3, run_date=run_date,
+                          dry_run=False, studio=studio, history=history)
+    result = auto.run_slot()
+
+    assert result.ok is True
+    assert result.uploaded is True
+    assert result.publish_at_utc == expected
+    published = datetime.fromisoformat(result.publish_at_utc.replace("Z", "+00:00"))
+    assert published.hour == 13 and published.minute == 30    # 13:30 UTC = 19:00 IST
+    assert result.publish_at_ist.endswith("T19:00:00+05:30")
+    assert studio.upload_calls[0][2] == 3
+
+
+def test_slot_moments_advance_with_run_date():
+    """Date rollover: each slot keeps its time of day on the next calendar day."""
+    today = slot_publish_moments("2026-10-31")
+    tomorrow = slot_publish_moments("2026-11-01")
+    for slot in (1, 2, 3):
+        assert tomorrow[slot] == today[slot] + timedelta(days=1)
+        assert tomorrow[slot].utcoffset() == today[slot].utcoffset()
+
+
+# ------------------------------------------------------------------ delayed execution never schedules into the past
+
+def test_delayed_slot_two_catches_up_at_a_future_moment(tmp_path, monkeypatch):
+    """A delayed slot-2 run: nominal 14:00 IST is in the past -> catch up, never publish late."""
+    history = History(tmp_path / "history.db")
+    studio = FakeStudio(tmp_path, history)
+    monkeypatch.setattr("purffle_shorts.automation.QualityGate",
+                        lambda settings: FakeGate())
+
+    yesterday = "2026-10-30"  # guaranteed in the past
+    settings = Settings(output_dir=str(tmp_path / "out"), data_dir=str(tmp_path / "data"),
+                        upload=False, timezone="Asia/Kolkata")
+    auto = SlotAutomation(settings, slot=2, run_date=yesterday,
+                          dry_run=False, studio=studio, history=history)
+    result = auto.run_slot()
+
+    assert result.ok is True
+    assert result.uploaded is True
+    published = datetime.fromisoformat(result.publish_at_utc.replace("Z", "+00:00"))
+    assert published > datetime.now(timezone.utc)             # future, never the past
+    nominal = datetime(2026, 10, 30, 8, 30, tzinfo=timezone.utc)
+    assert result.publish_at_utc != nominal.isoformat().replace("+00:00", "Z")
+    row = history.get_slot(slot_key(yesterday, 2))
+    assert row["status"] == "scheduled"
+
+
+def test_delayed_slot_three_catches_up_at_a_future_moment(tmp_path, monkeypatch):
+    history = History(tmp_path / "history.db")
+    studio = FakeStudio(tmp_path, history)
+    monkeypatch.setattr("purffle_shorts.automation.QualityGate",
+                        lambda settings: FakeGate())
+
+    yesterday = "2026-10-30"
+    settings = Settings(output_dir=str(tmp_path / "out"), data_dir=str(tmp_path / "data"),
+                        upload=False, timezone="Asia/Kolkata")
+    auto = SlotAutomation(settings, slot=3, run_date=yesterday,
+                          dry_run=False, studio=studio, history=history)
+    result = auto.run_slot()
+
+    assert result.ok is True
+    assert result.uploaded is True
+    published = datetime.fromisoformat(result.publish_at_utc.replace("Z", "+00:00"))
+    assert published > datetime.now(timezone.utc)
+    row = history.get_slot(slot_key(yesterday, 3))
+    assert row["status"] == "scheduled"

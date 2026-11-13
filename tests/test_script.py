@@ -83,10 +83,10 @@ def test_prompt_mentions_language_and_length():
 
 def test_retention_defaults_favor_short_visual_beats():
     settings = Settings()
-    assert settings.target_seconds == 30
+    assert settings.target_seconds == 40
     assert "Chicxulub" in settings.niches[1]
     from purffle_shorts.script import scene_plan
-    assert scene_plan("facts", settings.target_seconds)[1] == 9
+    assert scene_plan("facts", settings.target_seconds)[1] == 10
 
 
 def test_load_script_cleans_like_an_ai_script(tmp_path):

@@ -226,7 +226,7 @@ def verify_claims(
     An LLM never confers ``verified`` status by itself.
     """
     verified: list[Claim] = []
-    for i, claim in enumerate(claims):
+    for claim in claims:
         supporting = [s.get("url", "") for s in sources if _claim_relevance(claim, s, context)]
         supporting = [u for u in supporting if u]
         if supporting:
@@ -241,7 +241,13 @@ def verify_claims(
                 source_urls=supporting,
                 status=status,
                 reason=reason,
-                scene_index=i,
+                # scene_index is remapped by verify_script_claims from the
+                # (scene_index, claim_text) pairs it receives. It stays None
+                # here because a claim's ordinal in a flattened list is not
+                # a scene index: multiple claims can come from one scene and
+                # an LLM re-extraction can change the list length, so using
+                # the ordinal here can point past the last scene.
+                scene_index=None,
             )
         )
     return verified
@@ -291,12 +297,23 @@ def verify_script_claims(
             topic.subject, len(claims), extraction_error,
         )
 
-    # Re-map scene indices when LLM re-extraction changed the claim list.
+    # Re-map scene indices onto the script's scenes. Claims correspond
+    # positionally to script_claims only when the claim list did not change.
+    # When the LLM re-extracted a different number of claims we can no longer
+    # place every claim on a scene: unplaceable claims keep scene_index None
+    # so no scene is wrongly flagged, and the extraction is recorded as
+    # unreliable rather than silently associating claims with the wrong scenes.
     indexed: list[Claim] = []
-    for idx, claim in enumerate(claims):
-        if idx < len(script_claims):
-            claim.scene_index = script_claims[idx][0]
-        indexed.append(claim)
+    if len(claims) == len(script_claims):
+        for claim, (scene_index, _text) in zip(claims, script_claims):
+            claim.scene_index = scene_index
+            indexed.append(claim)
+    else:
+        llm_extraction_failed = True
+        for idx, claim in enumerate(claims):
+            if idx < len(script_claims):
+                claim.scene_index = script_claims[idx][0]
+            indexed.append(claim)
 
     overall = _overall_status(indexed)
     log.info(

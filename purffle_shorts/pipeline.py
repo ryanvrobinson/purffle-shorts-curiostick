@@ -340,6 +340,22 @@ class Studio:
         if not scene_indices:
             return None
         scenes = script.scenes
+        valid_scenes = len(scenes)
+        # Claims can carry scene indices that point past the last scene (for
+        # example after a mismatched LLM claim re-extraction). Rewriting
+        # scenes[i] with such an index would crash with IndexError and, worse,
+        # could rewrite the wrong scene. Drop invalid indices and keep the
+        # rest: an unverified claim on a missing scene is reported in the
+        # verification record, never silently discarded.
+        dropped = [i for i in scene_indices if i < 0 or i >= valid_scenes]
+        if dropped:
+            log.warning(
+                "Unverified-claim rewrite: %d claim(s) reference scene(s) outside the "
+                "script (%d scene(s)); those claims stay unresolved instead of being rewritten",
+                len(dropped), valid_scenes)
+        scene_indices = [i for i in scene_indices if 0 <= i < valid_scenes]
+        if not scene_indices:
+            return None
         flagged = "\n".join(f"  Scene {i + 1}: {scenes[i].narration}" for i in scene_indices)
         # List the source titles and URLs so the LLM can ground its rewrite
         # in actual, citable material instead of inventing claims.
@@ -382,7 +398,8 @@ class Studio:
             return None
         # Adopt only the flagged scenes' narration; everything else is preserved.
         for i in scene_indices:
-            scenes[i].narration = rewritten.scenes[i].narration
+            if i < len(rewritten.scenes):
+                scenes[i].narration = rewritten.scenes[i].narration
         return script
 
     # ------------------------------------------------------------------ one video
