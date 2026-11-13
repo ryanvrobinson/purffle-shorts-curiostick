@@ -313,6 +313,8 @@ def _openai(text: str, out: Path, settings: Settings) -> tuple[Path, list[Word],
         path.write_bytes(r.content)
 
     with_retries(_do, attempts=3, label="OpenAI TTS")
+    if not path.exists() or path.stat().st_size == 0:
+        raise RuntimeError("OpenAI TTS produced no audio")
     return path, [], voice
 
 
@@ -333,6 +335,8 @@ def _elevenlabs(text: str, out: Path, settings: Settings) -> tuple[Path, list[Wo
 
     data = with_retries(_do, attempts=3, label="ElevenLabs TTS")
     path.write_bytes(base64.b64decode(data["audio_base64"]))
+    if not path.exists() or path.stat().st_size == 0:
+        raise RuntimeError("ElevenLabs TTS produced no audio")
     al = data.get("alignment") or data.get("normalized_alignment") or {}
     words: list[Word] = []
     cur, cs, prev_e = "", 0.0, 0.0
@@ -379,6 +383,8 @@ def _kokoro(text: str, out: Path, settings: Settings) -> tuple[Path, list[Word],
         w.setsampwidth(2)
         w.setframerate(24000)
         w.writeframes(pcm.tobytes())
+    if not path.exists() or path.stat().st_size == 0:
+        raise RuntimeError("kokoro produced no audio")
     return path, [], voice
 
 
@@ -394,6 +400,8 @@ def _coqui(text: str, out: Path, settings: Settings) -> tuple[Path, list[Word], 
         if tts is None:
             tts = _model_cache[model] = TTS(model_name=model)
         tts.tts_to_file(text=text, file_path=str(path))
+    if not path.exists() or path.stat().st_size == 0:
+        raise RuntimeError("Coqui TTS produced no audio")
     return path, [], model
 
 
@@ -426,6 +434,10 @@ def _system(text: str, out: Path, settings: Settings) -> tuple[Path, list[Word],
         # Retry without capturing output if encoding fails
         log.warning("Unicode decode error in system TTS, retrying without capture: %s", e)
         subprocess.run(cmd, check=True, timeout=300)
+    if not raw.exists() or raw.stat().st_size == 0:
+        raise RuntimeError(
+            f"System voice produced no audio ({cmd[0]} wrote an empty file). "
+            f"On Linux make sure espeak-ng is installed: apt install espeak-ng")
     return raw, [], voice or "system-default"
 
 

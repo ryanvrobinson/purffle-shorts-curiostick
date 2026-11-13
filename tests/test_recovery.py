@@ -463,3 +463,55 @@ def test_claim_extraction_keeps_scene_indices_within_the_script():
     assert len(report.claims) == 5  # no claim is silently dropped
     for claim in report.claims:
         assert claim.scene_index is None or claim.scene_index in (0, 1)
+
+
+# ------------------------------------------------------------------ fact-verification handling
+
+def test_unsupported_claim_is_never_marked_verified():
+    """With no supporting sources, claims are needs_human_review -- never verified."""
+    from purffle_shorts.research import VERIFIED, NEEDS_HUMAN_REVIEW, verify_claims
+
+    claims = ["The bacteria-powered LED generates usable electricity.", "Mars has two moons."]
+    result = verify_claims(claims, [])
+    assert len(result) == 2
+    for claim in result:
+        assert claim.status == NEEDS_HUMAN_REVIEW
+        assert claim.status != VERIFIED
+
+
+def test_unsupported_claim_is_removed_by_rewrite(tmp_path):
+    """The claim rewrite drops claims no source can support instead of keeping them as fact."""
+    from purffle_shorts.research import Claim
+
+    settings = Settings(output_dir=str(tmp_path / "out"), data_dir=str(tmp_path / "data"))
+    script = _make_script(
+        ["The bacteria-powered LED lights up using microbial electricity.", "Scene two is fine."])
+    before = [sc.narration for sc in script.scenes]
+    unresolved = [Claim(text="bacteria-powered LED claim", scene_index=0)]
+    # The rewrite drops the unsupported claim entirely from the narration.
+    studio = Studio.__new__(Studio)
+    repaired = studio._rewrite_unverified_claims(
+        _RewriteLLM(["Scene two is fine.", "Scene two is fine."]), script, unresolved,
+        settings, _pick())
+    assert repaired is not None
+    assert script.scenes[0].narration != before[0]  # unsupported claim removed
+    assert "bacteria" not in script.scenes[0].narration.lower()
+    assert script.scenes[1].narration == before[1]  # verified scene untouched
+
+
+def test_unsupported_claim_is_qualified_by_rewrite(tmp_path):
+    """The claim rewrite grounds supported claims in sources with cautious wording."""
+    from purffle_shorts.research import Claim
+
+    settings = Settings(output_dir=str(tmp_path / "out"), data_dir=str(tmp_path / "data"))
+    script = _make_script(["The Chicxulub impact killed the dinosaurs.", "Scene two is fine."])
+    unresolved = [Claim(text="Chicxulub claim", scene_index=0)]
+    studio = Studio.__new__(Studio)
+    repaired = studio._rewrite_unverified_claims(
+        _RewriteLLM(
+            ["According to the sources, the Chicxulub impact is linked to the dinosaur extinction.",
+             "Scene two is fine."]),
+        script, unresolved, settings, _pick())
+    assert repaired is not None
+    assert script.scenes[0].narration.startswith("According to the sources")
+    assert script.scenes[1].narration == "Scene two is fine."

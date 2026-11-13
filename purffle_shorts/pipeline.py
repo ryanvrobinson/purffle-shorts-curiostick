@@ -178,12 +178,46 @@ class Studio:
             try:
                 cfg = s if eng == s.tts_engine else replace(s, tts_engine=eng, tts_voice="", tts_voice_b="")
                 if lines:
-                    return tts.synthesize_lines(lines, work / "voice", cfg)
-                return tts.synthesize(script.narration, work, cfg)
+                    speech = tts.synthesize_lines(lines, work / "voice", cfg)
+                else:
+                    speech = tts.synthesize(script.narration, work, cfg)
             except Exception as e:
                 last = e
-                log.warning("Voice engine '%s' failed: %s", eng, e)
+                log.warning("Voice engine '%s' failed: %s", eng, redact(e))
+                continue
+            # Never hand FFmpeg missing, empty, or undecodable narration: a bad
+            # audio file is treated as an engine failure and the next engine is tried.
+            if not self._valid_speech(speech, eng):
+                try:
+                    speech.audio.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                continue
+            log.info("Voice: using engine %s%s", eng,
+                     f" (fell back from {s.tts_engine})" if eng != s.tts_engine else "")
+            return speech
         raise RuntimeError(f"All voice engines failed: {last}")
+
+    def _valid_speech(self, speech: tts.Speech, engine: str) -> bool:
+        """True only when ``speech`` carries usable narration audio.
+
+        Checks the file exists, is nonempty, and ffmpeg can decode it with a
+        positive duration. Invalid audio is deleted so a partial/corrupt file is
+        never mistaken for good narration and passed to the renderer.
+        """
+        audio = speech.audio
+        try:
+            if not audio.exists() or audio.stat().st_size == 0:
+                log.warning("Voice engine '%s' produced no audio file", engine)
+                return False
+            duration = ffmpeg.duration(audio)
+            if duration <= 0:
+                log.warning("Voice engine '%s' produced undecodable or zero-length audio", engine)
+                return False
+        except Exception as e:  # ffmpeg missing or probe failure: treat as bad audio
+            log.warning("Voice engine '%s' audio could not be validated: %s", engine, redact(e))
+            return False
+        return True
 
     # ------------------------------------------------------------------ script only
     def draft(self, topic: str | None = None, *, source: str | None = None, style: str | None = None,
@@ -378,6 +412,10 @@ class Studio:
                 + "\n\nReplace each listed narration with wording whose factual claims "
                 "are supported by the cited background sources: drop unsupported "
                 "statistics, names, dates and certainty; keep what the sources confirm. "
+                "Where a source confirms a claim, phrase it as source-grounded "
+                "(for example 'according to ...' or 'research suggests'). Where no "
+                "source supports a claim, drop that claim entirely -- never keep an "
+                "unsupported scientific or factual claim as an established fact. "
                 "Do not invent facts, studies or quotes. Return the complete script JSON."
             ),
         )
