@@ -108,20 +108,21 @@ def duration_window(target_seconds: int | float | str) -> tuple[int, int]:
 
 
 def short_duration_bounds(target_seconds: int | float | str) -> tuple[float, float] | None:
-    """Strict duration bounds for the 40-second Shorts format.
+    """Duration bounds for a short-format target.
 
-    Returns ``(min_seconds, max_seconds)`` when the target is a Short
-    (``target <= SHORT_FORMAT_MAX_TARGET``), else ``None`` so the general
-    ``duration_window`` applies. The hard maximum is the format cap
-    (``SHORT_FORMAT_MAX_SECONDS`` plus ``SHORT_ENCODING_TOLERANCE`` = 40.0s)
-    for *every* short target: a 30s target is capped at 40s, not at 30s. The
-    preferred minimum is 90% of the requested target; nothing above the cap
-    ever passes QC.
+    Returns (min_seconds, max_seconds) when the target is a short
+    (target <= SHORT_FORMAT_MAX_TARGET), else None so the general
+    duration_window applies. The maximum is the configured
+    target_seconds, not a hard-coded 40s cap: a 30s target yields
+    a 27-30s band, and a 60s target returns None so
+    duration_window handles it with its ±30% range.
+
+    The minimum is 90 % of the requested target. Nothing above the
+    target ever passes QC when short bounds are active.
     """
     target = clamp_target_seconds(target_seconds)
     if SHORT_FORMAT_MIN_TARGET <= target <= SHORT_FORMAT_MAX_TARGET:
-        return (target * 0.9,
-                SHORT_FORMAT_MAX_SECONDS + SHORT_ENCODING_TOLERANCE)
+        return (target * 0.9, float(target))
     return None
 
 
@@ -176,8 +177,8 @@ class Settings:
     align: str = "auto"               # auto|none|faster-whisper|openai — word timing for engines without it
 
     # --- visuals --------------------------------------------------------------------------
-    visual_sources: list[str] = field(default_factory=lambda: ["pexels", "pixabay"])
-    visual_mode: str = "auto"          # auto|hybrid; hybrid alternates stock clips and AI stills
+    visual_sources: list[str] = field(default_factory=lambda: ["pexels", "pixabay", "wikimedia"])
+    visual_mode: str = "auto"          # auto|hybrid|production; production rejects gradient-only shorts
     hybrid_image_every: int = 2        # hybrid: every Nth scene is an AI image (min 2)
     media_dir: str = "media"
     image_model: str = "gpt-image-1"
@@ -239,7 +240,7 @@ class Settings:
     playlist_id: str = ""
     client_secrets: str = "credentials.json"
     token_file: str = "token.json"
-    keep_videos: bool = False
+    keep_videos: bool = True
     credit_footage: bool = True
     youtube_api_key: str = ""         # optional, only for reading view counts (learn_from_stats)
     notify_webhook: str = ""          # Discord / Slack / any URL: a message per rendered, uploaded or failed video
@@ -265,8 +266,8 @@ class Settings:
         if self.target_seconds:
             self.target_seconds = clamp_target_seconds(self.target_seconds)
         self.visual_mode = (self.visual_mode or "auto").strip().lower()
-        if self.visual_mode not in {"auto", "hybrid"}:
-            raise ConfigError(f"VISUAL_MODE={self.visual_mode!r}: choose auto or hybrid")
+        if self.visual_mode not in {"auto", "hybrid", "production"}:
+            raise ConfigError(f"VISUAL_MODE={self.visual_mode!r}: choose auto, hybrid, or production")
         self.hybrid_image_every = max(2, int(self.hybrid_image_every))
 
     @property
@@ -362,7 +363,7 @@ class Settings:
             tts_instructions=_env("TTS_INSTRUCTIONS", d.tts_instructions),
             tts_pronunciations=_pronunciations(_env("TTS_PRONUNCIATIONS")),
             align=_env("ALIGN", d.align).lower(),
-            visual_sources=[v.lower() for v in _list(_env("VISUAL_SOURCES", "pexels,pixabay"))],
+            visual_sources=[v.lower() for v in _list(_env("VISUAL_SOURCES", "pexels,pixabay,wikimedia"))],
             visual_mode=_env("VISUAL_MODE", d.visual_mode),
             hybrid_image_every=_int("HYBRID_IMAGE_EVERY", d.hybrid_image_every),
             media_dir=_env("MEDIA_DIR", d.media_dir),
@@ -420,7 +421,7 @@ class Settings:
             playlist_id=_env("PLAYLIST_ID"),
             client_secrets=_env("GOOGLE_CLIENT_SECRETS_FILE", d.client_secrets),
             token_file=_env("YT_TOKEN_FILE", d.token_file),
-            keep_videos=_bool(_env("KEEP_VIDEOS", "false")),
+            keep_videos=_bool(_env("KEEP_VIDEOS", "true")),
             credit_footage=_bool(_env("CREDIT_FOOTAGE", "true")),
             batch_size=max(1, _int("BATCH_SIZE", d.batch_size, "SHORTS_BATCH_SIZE")),
             batch_delay=max(0, _int("BATCH_DELAY", d.batch_delay, "SHORTS_BATCH_DELAY")),
@@ -452,9 +453,37 @@ def load_env(env_file: str | None = None) -> None:
         return
     if env_file:
         load_dotenv(env_file, override=True)
+        _load_local_credentials()
         return
     # The .env in the folder you run from (or PURFFLE_HOME). Plain load_dotenv() searches upwards from the
     # package's own folder, which never reaches your folder once the package is installed with pip or uvx.
     path = find_dotenv(usecwd=True) or find_dotenv()
     if path:
         load_dotenv(path)
+    _load_local_credentials()
+
+
+def _load_local_credentials() -> None:
+    """Load known API keys from local credentials.json without logging or rewriting it."""
+    credentials = Path("credentials.json")
+    if not credentials.exists():
+        return
+    try:
+        import json
+        data = json.loads(credentials.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            return
+        for env_name in (
+            "GROQ_API_KEY",
+            "AGNES_API_KEY",
+            "PIXABAY_API_KEY",
+            "OPENAI_API_KEY",
+            "ANTHROPIC_API_KEY",
+            "GEMINI_API_KEY",
+            "PEXELS_API_KEY",
+            "ELEVENLABS_API_KEY",
+        ):
+            if not os.getenv(env_name) and isinstance(data.get(env_name), str) and data[env_name].strip():
+                os.environ[env_name] = data[env_name].strip()
+    except (OSError, json.JSONDecodeError):
+        return

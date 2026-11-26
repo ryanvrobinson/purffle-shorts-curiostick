@@ -146,6 +146,7 @@ class QualityGate:
 
         # 8. Captions file exists (automated)
         checks.append(self._check_captions_exist(result.folder))
+        checks.append(self._check_thumbnail_exists(result.folder))
 
         # 9. Caption-audio synchronization (automated)
         checks.append(self._check_caption_sync(result))
@@ -316,6 +317,22 @@ class QualityGate:
             return QualityCheck("captions", True, f"Captions found ({len(entries)} entries)")
         except Exception as e:
             return QualityCheck("captions", False, f"Failed to read captions: {e}")
+
+    def _check_thumbnail_exists(self, folder: Path | None) -> QualityCheck:
+        if not folder:
+            return QualityCheck("thumbnail", False, "No folder path provided")
+        thumbnail = folder / "cover.jpg"
+        if not thumbnail.exists() or thumbnail.stat().st_size == 0:
+            return QualityCheck("thumbnail", False, "cover.jpg not found or is empty")
+        try:
+            from PIL import Image
+            with Image.open(thumbnail) as image:
+                width, height = image.size
+            if width <= 0 or height <= 0:
+                return QualityCheck("thumbnail", False, "cover.jpg has invalid dimensions")
+            return QualityCheck("thumbnail", True, f"Cover image valid ({width}x{height})")
+        except Exception as exc:
+            return QualityCheck("thumbnail", False, f"cover.jpg could not be read: {exc}")
 
     def _check_metadata(self, folder: Path | None) -> QualityCheck:
         """Check metadata.json exists and has required fields."""
@@ -625,6 +642,9 @@ class QualityGate:
         Inspects metadata.visual_selection for scenes whose source is "generated"
         with kind "generated" (the gradient placeholder). Those scenes have no
         real visual matched to their narration.
+
+        In production mode, gradient placeholders always fail the quality gate.
+        In demo/auto mode, gradients are acceptable with a warning.
         """
         if not result.folder:
             return QualityCheck("visuals_present", False, "No folder path provided",
@@ -643,14 +663,30 @@ class QualityGate:
                 v for v in visuals
                 if v.get("source") == "generated" and v.get("kind") == "generated"
             ]
+            # Check if production mode: gradient placeholders always fail
+            try:
+                from purffle_shorts.config import Settings
+                settings = getattr(result, "settings", None)
+                is_production = settings is not None and                                isinstance(settings, Settings) and                                settings.visual_mode == "production"
+            except Exception:
+                is_production = False
             if gradient_scenes:
                 scene_nums = [v.get("scene") for v in gradient_scenes if "scene" in v]
-                return QualityCheck(
-                    "visuals_present", False,
-                    f"{len(gradient_scenes)} scene(s) lack a real visual (gradient placeholder)",
-                    details={"method": "automated", "gradient_scenes": scene_nums,
-                             "total_scenes": len(visuals)},
-                )
+                if is_production:
+                    return QualityCheck(
+                        "visuals_present", False,
+                        f"{len(gradient_scenes)} scene(s) lack a real visual (gradient placeholder) — production mode requires real assets",
+                        details={"method": "automated", "gradient_scenes": scene_nums,
+                                 "total_scenes": len(visuals)},
+                    )
+                else:
+                    # Demo/auto mode: gradient placeholders are acceptable
+                    return QualityCheck(
+                        "visuals_present", True,
+                        f"{len(gradient_scenes)} scene(s) use gradient placeholders (demo mode)",
+                        details={"method": "automated", "gradient_scenes": scene_nums,
+                                 "total_scenes": len(visuals), "mode": "demo"},
+                    )
             return QualityCheck(
                 "visuals_present", True,
                 f"All {len(visuals)} scenes have a real visual source",

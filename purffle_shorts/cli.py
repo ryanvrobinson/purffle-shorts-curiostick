@@ -79,7 +79,7 @@ def _common(p: argparse.ArgumentParser) -> None:
                    help="minimum Script Doctor score; rewrite mode stops if one bounded retry still misses (0-100)")
     g.add_argument("--also-lang", help="also make translated copies, e.g. es,hi (same footage)")
     g.add_argument("--visuals", help="comma list: pexels,pixabay,local,openai-images,pollinations,agnes")
-    g.add_argument("--visual-mode", choices=["auto", "hybrid"],
+    g.add_argument("--visual-mode", choices=["auto", "hybrid", "production"],
                    help="auto=stock-first with AI fallback; hybrid=alternate stock clips and AI images")
     g.add_argument("--hybrid-image-every", type=int,
                    help="hybrid mode: make every Nth scene an AI image (min 2, default 2)")
@@ -655,6 +655,30 @@ def cmd_recover(args, s: Settings) -> int:
     return 0 if recovered == len(pending) else 1
 
 
+def cmd_produce(args, s: Settings) -> int:
+    """Create and validate one persistent 10-Short production batch."""
+    from .production import ProductionManifest
+
+    manifest = ProductionManifest(s, start_date=args.start_date)
+    print(f"Production manifest: {manifest.path}")
+    print(f"Generating batch {args.batch} (Shorts {((args.batch - 1) * 10 + 1):03d}-"
+          f"{args.batch * 10:03d})")
+
+    def progress(stage: str, percent: int, message: str) -> None:
+        print(f"[{percent:3d}%] {stage}: {message}")
+
+    results = manifest.generate_batch(args.batch, progress=progress)
+    passed = sum(1 for row in results if row["ok"])
+    failed = len(results) - passed
+    print(f"\nBatch {args.batch}: {passed} passed, {failed} failed")
+    for row in results:
+        if row["ok"]:
+            print(f"  CS: {row['content_id']} -> {row.get('video', 'already completed')}")
+        else:
+            print(f"  CS: {row['content_id']} -> FAILED: {row['error']}")
+    return 0 if failed == 0 else 1
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="purffle-shorts", description="Autonomous AI YouTube Shorts studio.")
     p.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
@@ -740,6 +764,12 @@ def build_parser() -> argparse.ArgumentParser:
     rec.add_argument("--dry-run", action="store_true",
                      help="list recoverable jobs without attempting them")
     rec.set_defaults(func=cmd_recover)
+
+    prod = sub.add_parser("produce", help="generate and validate one 10-Short CurioStick batch")
+    prod.add_argument("--batch", type=int, choices=[1, 2, 3], required=True)
+    prod.add_argument("--start-date", metavar="YYYY-MM-DD",
+                      help="first production day (Asia/Kolkata)")
+    prod.set_defaults(func=cmd_produce)
 
     d = sub.add_parser("demo", help="render a sample Short with no API keys")
     _common(d)

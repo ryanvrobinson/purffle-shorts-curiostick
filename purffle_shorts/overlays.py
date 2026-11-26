@@ -332,9 +332,12 @@ CENTER_Y = {"upper": 0.30, "center": 0.56, "lower": 0.68}
 # ------------------------------------------------------------------ subscribe end card
 # One reusable animated end card rendered into every Short, inside the total
 # duration (never appended after it). Roughly 2-3 seconds: a reveal, a subtle
-# scale pulse and an optional bell, then a fade. No fake clickable controls.
+# scale pulse and an optional bell. No fake clickable controls.
+# Configurable via END_CARD_SECONDS and END_CARD_TEXT environment variables.
 END_CARD_SECONDS = 2.5
-END_CARD_TEXT = "SUBSCRIBE FOR MORE"
+# Default multi-line end card text: LIKE / SUBSCRIBE / SHARE
+# Set END_CARD_TEXT= (empty) to disable the end card entirely.
+END_CARD_TEXT = "LIKE\\nSUBSCRIBE\\nSHARE"
 END_CARD_BELL = "\U0001f514"  # bell glyph; drawn as a fallback shape when unsupported
 
 
@@ -1285,19 +1288,28 @@ def _end_card_frame(
 
 
 def build_end_card(settings: Settings, font_path: Path | None, total: float, work: Path
-                   ) -> tuple[Path, int, int, float, float] | None:
-    """Build the reusable animated subscribe end card.
+) -> tuple[Path, int, int, float, float] | None:
+    """Build the reusable animated end card.
 
     Returns ``(playlist, x, y, start, duration)`` or ``None`` when it cannot be
     built. The card plays inside ``[start, start + duration]`` which lies within
     ``[0, total]`` so it never extends the video past its total duration.
+
+    ``END_CARD_SECONDS`` and ``END_CARD_TEXT`` may be set as environment variables
+    (``END_CARD_SECONDS`` and ``END_CARD_TEXT``) to customise the card without
+    modifying code.  Set ``END_CARD_TEXT=`` (empty) to disable the end card entirely.
     """
     try:
         from PIL import ImageFilter  # noqa: F401 (used in _end_card_frame)
     except Exception:
         return None
     work.mkdir(parents=True, exist_ok=True)
-    dur = END_CARD_SECONDS
+    # Allow environment-variable overrides without code changes.
+    card_seconds = max(0.5, min(10.0, float(os.getenv("END_CARD_SECONDS", str(END_CARD_SECONDS)))))
+    card_text = os.getenv("END_CARD_TEXT", END_CARD_TEXT)
+    if not card_text.strip():
+        return None
+    dur = card_seconds
     start = max(0.0, total - dur)
     if start <= 0:
         return None

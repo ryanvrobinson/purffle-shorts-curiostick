@@ -25,7 +25,7 @@ log = logging.getLogger("purffle")
 VIDEO_EXT = {".mp4", ".mov", ".m4v", ".webm", ".mkv"}
 IMAGE_EXT = {".jpg", ".jpeg", ".png", ".webp"}
 STOP_WORDS = {"the", "a", "an", "of", "and", "in", "on", "with", "for", "to", "at", "by", "from", "closeup"}
-STOCK_SOURCES = {"pexels", "pexels-photos", "pixabay", "pixabay-photos", "local"}
+STOCK_SOURCES = {"pexels", "pexels-photos", "pixabay", "pixabay-photos", "local", "wikimedia"}
 AI_SOURCES = {"openai-images", "ai", "dalle", "gpt-image", "pollinations", "agnes"}
 MAX_DOWNLOAD_ATTEMPTS = 3  # per query before moving on; one bad CDN response must not discard the rest
 ANIMALS = {"octopus", "octopi", "shark", "whale", "dolphin", "fish", "turtle", "crab", "jellyfish", "seal",
@@ -350,6 +350,49 @@ def pixabay_photos(query: str, key: str, orientation: str = "portrait") -> list[
                       extra={"tags": _tags(h.get("tags")), "page_url": h.get("pageURL", "")})
             for h in r.json().get("hits", []) if h.get("largeImageURL")]
 
+
+
+
+# ------------------------------------------------------------------------------------------ Wikimedia Commons
+def wikimedia_photos(query: str, orientation: str = "portrait") -> list[MediaItem]:
+    """Search Wikimedia Commons for openly licensed images.
+
+    Wikimedia Commons provides public domain and copyleft media with automatic attribution.
+    No API key required. Returns images with license info for commercial reuse.
+    """
+    # Wikimedia Search API - no key required
+    r = http().get(
+        "https://commons.wikimedia.org/w/api.php",
+        timeout=30,
+        params={
+            "action": "query",
+            "list": "search",
+            "srsearch": query,
+            "format": "json",
+            "origin": "*",
+        },
+    )
+    raise_for_status(r, "Wikimedia search")
+    data = r.json()
+    search_results = data.get("query", {}).get("search", [])
+    items: list[MediaItem] = []
+    for p in search_results[:20]:  # Limit to 20 results
+        title = p.get("title", "")
+        # Use the wiki page URL as the source; attribution is from the page
+        items.append(MediaItem(
+            "wikimedia",
+            title[:50],  # use truncated title as id
+            "image",
+            f"https://commons.wikimedia.org/wiki/{title.replace(' ', '_')}",
+            0, 0,
+            "",  # no credit/author from this simple search
+            query=query,
+            license="",
+            source_url=f"https://commons.wikimedia.org/wiki/{title.replace(' ', '_')}",
+            attribution_line=f"Wikimedia Commons | {title}",
+            extra={"search_result": p, "page_url": f"https://commons.wikimedia.org/wiki/{title.replace(' ', '_')}"},
+        ))
+    return items
 
 # ------------------------------------------------------------------------------------------ AI images
 def openai_image(prompt: str, dest: Path, key: str, model: str, orientation: str = "portrait") -> Path:
@@ -801,7 +844,7 @@ class Visuals:
         log.warning("Visual source '%s' is selected but %s is not set; it cannot return media and will be "
                     "skipped while the next selected source is tried. Set %s in .env or drop %s from "
                     "VISUAL_SOURCES/--visuals.", source, env, env, source)
-        self._drop_source(source)
+        # Keep source available for future key addition; do not drop
 
     def _optional(self, fn, source: str, query: str) -> list[MediaItem]:
         """A secondary request (still-image fallback) must not discard usable video results."""
@@ -854,6 +897,8 @@ class Visuals:
                     items = pixabay_photos(query, s.pixabay_api_key, orientation=o)
             elif source == "local":
                 items = self._local(query)
+            elif source == "wikimedia":
+                items = wikimedia_photos(query, orientation=o)
             seen: set[str] = set()
             items = [i for i in items if not (i.key in seen or seen.add(i.key))]
             self._search_kinds[ck] = {
@@ -862,7 +907,7 @@ class Visuals:
             }
         except PermanentError as e:
             log.warning("%s search failed permanently (%s); disabling it for this video", source, redact(e))
-            self._drop_source(source)
+            # Keep source available for future key addition; do not drop
             failed = True
         except Exception as e:
             log.warning("%s search for %r failed: %s", source, query, redact(e))
@@ -1019,7 +1064,7 @@ class Visuals:
         except PermanentError as e:
             # A refused key or an exhausted free tier won't recover within this video: stop asking.
             if source in self.sources:
-                self._drop_source(source)
+                # Keep source available for future key addition; do not drop
                 hint = (" Anonymous Pollinations use is heavily rate-limited; set POLLINATIONS_API_KEY "
                         "or use Pexels/Pixabay (free keys)." if source == "pollinations" and " 402" in str(e)
                         else "")

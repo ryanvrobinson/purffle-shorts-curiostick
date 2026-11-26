@@ -511,7 +511,7 @@ class Studio:
             # never exceed the target (40s). No tolerance is added above the cap.
             short = short_duration_bounds(s.target_seconds)
             if short is not None:
-                max_dur = min(max_dur, short[1])
+                max_dur = short[1]
             if total > max_dur:
                 log.warning(
                     "Narration too long (%.1fs incl. pad; max %.1fs), attempting script reduction",
@@ -627,6 +627,11 @@ class Studio:
 
             extract_frame(video, min(1.2, total / 3), folder / "cover.jpg")
             (folder / "captions.srt").write_text(srt(chunks), encoding="utf-8")
+            narration_audio = folder / "narration.wav"
+            try:
+                shutil.copy2(speech.audio, narration_audio)
+            except OSError as e:
+                log.warning("Could not preserve narration audio in %s: %s", folder, redact(e))
 
             title = final_title(script, s)
             description = final_description(script, credits, s)
@@ -653,6 +658,10 @@ class Studio:
                 script_review["claims"] = script.verification_report.get("claims", [])
             meta = {
                 "title": title, "description": description, "tags": script.tags,
+                "pinned_comment": script.description.strip() if script.description.strip() else "Which fact surprised you most?",
+                "hashtags": script.hashtags,
+                "audience": s.audience,
+                "content_category": script.category,
                 "category_id": script.category_id, "language": s.language,
                 "topic": script.topic, "source": pick.source, "style": script.style,
                 "duration": round(info["duration"], 2), "resolution": f"{s.width}x{s.height}",

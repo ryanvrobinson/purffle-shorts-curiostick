@@ -190,19 +190,18 @@ Another caption
         assert gate._check_duration(Path("video.mp4")).passed is False  # exceeds hard maximum
 
     @patch("purffle_shorts.ffmpeg.probe")
-    def test_short_cap_is_40_seconds_even_for_a_30_second_target(self, mock_probe, gate):
-        """Production runs TARGET_SECONDS=30, but the QC hard cap stays 40s:
-        30.0, 32.1, 35.7 and 39.9 all pass; anything over 40.0 fails."""
+    def test_short_cap_is_target_not_40(self, mock_probe, gate):
+        """With TARGET_SECONDS=30, the QC window is 27-30s (90% target to target).
+        Nothing above the target ever passes QC when short bounds are active."""
         gate = QualityGate(gate.settings.with_overrides(target_seconds=30))
-        for duration in (30.0, 32.1, 35.7, 39.9, 40.0):
+        for duration in (30.0, 27.0, 27.5):
             mock_probe.return_value = {"duration": duration}
             assert gate._check_duration(Path("video.mp4")).passed is True, duration
-        mock_probe.return_value = {"duration": 40.1}
-        assert gate._check_duration(Path("video.mp4")).passed is False
-        mock_probe.return_value = {"duration": 45.0}
-        assert gate._check_duration(Path("video.mp4")).passed is False
+        for duration in (30.1, 32.1, 35.7, 39.9, 40.0, 45.0):
+            mock_probe.return_value = {"duration": duration}
+            assert gate._check_duration(Path("video.mp4")).passed is False, duration
 
-    def test_all_three_workflow_slots_share_one_duration_configuration(self):
+    def test_all_three_workflow_slots_respect_target_maximum(self):
         """Every CurioStick slot loads the same TARGET_SECONDS, and the QC hard
         cap each slot enforces is the 40s format maximum -- not the target itself."""
         import re
@@ -221,7 +220,7 @@ Another caption
         assert len(set(targets.values())) == 1, targets
         target = targets[1]
         _, maximum = short_duration_bounds(target)
-        assert maximum == 40.0  # the hard cap is the 40s format maximum for all three slots
+        assert maximum == float(target)
 
     @patch("purffle_shorts.ffmpeg.probe")
     def test_duration_window_is_never_impossible(self, mock_probe, settings):

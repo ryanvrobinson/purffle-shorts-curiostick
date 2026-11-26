@@ -258,7 +258,7 @@ def compose(settings: Settings, segments: list[Path], lengths: list[float], voic
         inputs += ["-f", "concat", "-safe", "0", "-i", str(playlist.resolve())]
         f.append(f"[{idx}:v]format=rgba[ec]")
         overlay("ec",
-                f"x={x}:y={y}:enable='gte(t,{e_start:.3f}):lte(t,{e_start + e_dur:.3f})':format=auto",
+                f"x={x}:y={y}:enable='gte(t,{e_start:.3f})*lte(t,{e_start + e_dur:.3f})':format=auto",
                 "vec")
         idx += 1
     f.append(f"[{last}]format=yuv420p[vout]")
