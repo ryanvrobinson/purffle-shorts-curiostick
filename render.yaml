@@ -1,0 +1,12 @@
+# This Blueprint references the existing Render Environment Group.
+# Review the Blueprint plan before adopting the current service.
+
+services:
+  - type: web
+    name: purffle-shorts-curiostick
+    runtime: docker
+    plan: free
+    branch: render-ready
+    dockerCommand: studio --host 0.0.0.0 --port 10000 --no-browser
+    envVars:
+      - fromGroup: curiostick-instagram

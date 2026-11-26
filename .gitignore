@@ -6,6 +6,7 @@ credentials.json
 client_secret*.json
 token.json
 token.pickle
+instagram_oauth.json
 *.pickle
 
 # Python

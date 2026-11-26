@@ -11,6 +11,7 @@ import logging
 import os
 import shutil
 import time
+import re
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
@@ -28,6 +29,7 @@ from .script import (
     CARD_STYLES,
     DEFAULT_CAST,
     MULTI_SPEAKER,
+    word_count,
     SCRIPT_SCHEMA,
     Script,
     ScriptQualityError,
@@ -39,7 +41,7 @@ from .script import (
 )
 from .timing import caption_chunks, scene_timeline, srt, tokenize
 from .topics import Topic, pick_topic
-from .utils import redact, slugify, truncate_words
+from .utils import redact, slugify, truncate_title, truncate_words
 
 log = logging.getLogger("purffle")
 
@@ -88,14 +90,23 @@ def seconds_until_quota_reset() -> float:
 def final_title(script: Script, settings: Settings | None = None) -> str:
     t = script.title
     if settings is not None and not settings.vertical:
-        return truncate_words(t, 100)  # a 16:9 video is not a Short
-    return f"{t} #shorts" if len(t) + 8 <= 100 else truncate_words(t, 100)
+        return truncate_title(t, 100)  # a 16:9 video is not a Short
+    return f"{truncate_title(t, 92)} #shorts"
 
 
 def final_description(script: Script, credits: set[str], settings: Settings) -> str:
-    parts = [script.description.strip()] if script.description.strip() else []
-    tags = script.hashtags if settings.vertical else [h for h in script.hashtags if h.lower() != "#shorts"]
-    parts.append(" ".join(tags))
+    # Clean the summary by removing any standalone hashtags
+    summary = re.sub(r"(?<!\\w)#\\w+", "", script.description).strip()
+    parts = [summary] if summary else []
+    # Include a relevant question when appropriate
+    question = re.sub(r"(?<!\\w)#\\w+", "", script.question).strip()
+    if question.endswith("?") and word_count(question, script.language) >= 3:
+        parts.append(question)
+    # Hashtags are kept separate from the main description, with #shorts removed
+    tags = [h for h in script.hashtags if h.strip().lower() != "#shorts"]
+    if tags:
+        parts.append(" ".join(tags))
+    # Include footage credits when enabled
     if settings.credit_footage and credits:
         parts.append("Footage: " + ", ".join(sorted(credits)))
     return "\n\n".join(p for p in parts if p)
@@ -696,6 +707,11 @@ class Studio:
                             len(qc_report.automated_failures), qc_report.summary)
                 for adv in qc_report.heuristic_advisories:
                     log.info("QC advisory (%s): %s", adv.name, adv.message)
+            else:
+                # Quality gate passed - transition to quality_approved state
+                self.history.update_video(
+                    rid, status="quality_approved",
+                    approval_status="approved", approved_at=now_iso())
 
             rid = self.history.add_video(
                 subject=pick.subject, source=pick.source, topic=script.topic, style=script.style,
@@ -959,13 +975,42 @@ class Studio:
             notify.send(self.s, "failed", title=rec["title"], detail=f"scheduled upload failed: {redact(e)}")
             return "failed"
 
+        # Upload succeeded - video is now private on YouTube
         vid = resp.get("id")
+        self.history.update_video(rid, youtube_id=vid, status="uploaded_private",
+                                 uploaded_at=now_iso(), publish_at=None)
+        if result:
+            result.status, result.youtube_id, result.publish_at = "uploaded_private", vid, None
+        # Attach the thumbnail - this is critical: failure blocks public scheduling
+        try:
+            from . import youtube as YT
+            _wait_until_processed(YT.service(self.s, interactive=False), str(vid))
+            thumb_response = YT.thumbnails().set(
+                videoId=str(vid),
+                media_body=YT.MediaFileUpload(str(Path(rec["folder"]) / "cover.jpg"), mimetype="image/jpeg", resumable=False),
+            ).execute()
+            YT._verify_thumbnail_response(thumb_response)
+            # Thumbnail attached successfully - upgrade state
+            self.history.update_video(rid, status="thumbnail_verified")
+            if result:
+                result.status = "thumbnail_verified"
+        except Exception as e:
+            log.error("Thumbnail attachment failed for private video %s (%s)", vid, type(e).__name__)
+            # Keep video private but mark as thumbnail failed; never schedule without thumbnail
+            self.history.update_video(rid, status="uploaded_private",
+                                     error=f"Thumbnail attachment failed: {e}"[:500])
+            if result:
+                result.status = "uploaded_private"
+            raise YT.ThumbnailUploadError(
+                str(vid), f"Thumbnail attachment failed for video {vid}; it remains private."
+            ) from e
+
+        # All mandatory checks passed - mark as ready for scheduling
         publish_iso = YT.to_rfc3339(publish_at)
-        fields = dict(status="scheduled", youtube_id=vid, uploaded_at=now_iso(), publish_at=publish_iso)
-        if not self.s.keep_videos:
-            Path(rec["video_path"]).unlink(missing_ok=True)
-            fields["video_path"] = None
-        self.history.update_video(rid, **fields)
+        self.history.update_video(rid, status="ready_for_schedule", youtube_id=vid,
+                                 uploaded_at=now_iso(), publish_at=publish_iso)
+        if result:
+            result.status, result.youtube_id, result.publish_at = "ready_for_schedule", vid, publish_iso
         log.info("Scheduled: https://youtube.com/shorts/%s, public %s", vid,
                  publish_at.strftime("%a %d %b %H:%M %Z"))
         notify.send(self.s, "scheduled", title=rec["title"],

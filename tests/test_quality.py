@@ -9,7 +9,13 @@ from unittest.mock import patch
 import pytest
 
 from purffle_shorts.config import ASPECTS, Settings
-from purffle_shorts.quality import QualityGate
+from purffle_shorts.quality import (
+    CATEGORY_MINIMUMS,
+    MINIMUM_QUALITY_SCORE,
+    QUALITY_WEIGHTS,
+    QualityCheck,
+    QualityGate,
+)
 
 
 class TestQualityGate:
@@ -240,3 +246,55 @@ Another caption
         assert gate._check_duration(Path("video.mp4")).passed is True  # 60 + 30%
         mock_probe.return_value = {"duration": 79.0}
         assert gate._check_duration(Path("video.mp4")).passed is False
+
+
+def test_srt_validation_accepts_valid_nonpunctuated_captions(tmp_path):
+    folder = tmp_path / "captions"
+    folder.mkdir()
+    (folder / "captions.srt").write_bytes(
+        b"1\r\n00:00:00,000 --> 00:00:01,000\r\nOctopuses have three hearts\r\n\r\n"
+        b"2\r\n00:00:02,000 --> 00:00:03,000\r\nTheir blood is blue\r\n"
+    )
+
+    check = QualityGate(Settings())._check_captions_exist(folder, duration=4)
+
+    assert check.passed
+    assert "2 entries" in check.message
+
+
+@pytest.mark.parametrize(("caption", "duration", "message"), [
+    ("1\n-00:00:01,000 --> 00:00:02,000\nNegative start", 10, "before zero"),
+    ("1\n00:00:02,000 --> 00:00:01,000\nReversed", 10, "before or at"),
+    ("1\n00:00:01,000 --> 00:00:01,000\nZero interval", 10, "before or at"),
+    ("1\n00:00:09,000 --> 00:00:11,000\nToo late", 10, "beyond video duration"),
+    ("1\n00:00:00,000 --> 00:00:01,000\nFirst\n\n2\n00:00:05,000 --> 00:00:06,000\nGap", 10,
+     "excessive"),
+    ("1\n00:00:00.000 --> 00:00:01.000\nBad timestamp", 10, "invalid timestamp"),
+])
+def test_srt_validation_rejects_invalid_timing(tmp_path, caption, duration, message):
+    folder = tmp_path / "captions"
+    folder.mkdir()
+    (folder / "captions.srt").write_text(caption, encoding="utf-8")
+
+    check = QualityGate(Settings())._check_captions_exist(folder, duration=duration)
+
+    assert not check.passed
+    assert message in check.message
+
+
+def test_quality_report_uses_weighted_score_category_floors_and_critical_blockers():
+    checks = [QualityCheck(name, True) for name in QUALITY_WEIGHTS]
+    passing = QualityGate._report(checks, Path("video.mp4"))
+    assert passing.passed
+    assert passing.score == 100
+    assert passing.category_minimums == CATEGORY_MINIMUMS
+    assert passing.to_dict()["minimum_score"] == MINIMUM_QUALITY_SCORE
+
+    advisory_loss = [QualityCheck(c.name, c.name != "research_verification") for c in checks]
+    assert QualityGate._report(advisory_loss, Path("video.mp4")).passed
+
+    missing_audio = [QualityCheck(c.name, c.name != "audio_present") for c in checks]
+    blocked = QualityGate._report(missing_audio, Path("video.mp4"))
+    assert not blocked.passed
+    assert "audio_present" in blocked.critical_failures
+    assert blocked.score >= MINIMUM_QUALITY_SCORE

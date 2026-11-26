@@ -682,8 +682,8 @@ def test_duplicate_upload_prevented(monkeypatch):
         assert "already exists on YouTube" in str(e)
 
 
-def test_duplicate_upload_check_failure_does_not_block(monkeypatch):
-    """Duplicate check failure (network error) never blocks upload."""
+def test_duplicate_upload_check_failure_blocks_upload(monkeypatch):
+    """A network failure during duplicate verification fails closed."""
     from pathlib import Path
 
     from purffle_shorts.config import Settings
@@ -692,8 +692,11 @@ def test_duplicate_upload_check_failure_does_not_block(monkeypatch):
     settings = Settings()
     studio = Studio.__new__(Studio)
     studio.s = settings
+    import purffle_shorts.pipeline as pip
 
     class FakeYouTubeModule:
+        DuplicateCheckError = pip.youtube.DuplicateCheckError
+
         @staticmethod
         def service(settings, interactive=False):
             raise ConnectionError("network down")
@@ -701,11 +704,10 @@ def test_duplicate_upload_check_failure_does_not_block(monkeypatch):
         def find_existing_video(yt, marker):
             return None
 
-    import purffle_shorts.pipeline as pip
     monkeypatch.setattr(pip, "youtube", FakeYouTubeModule)
 
-    # Should not raise — duplicate check failure is non-blocking
-    studio._check_duplicate_upload(settings, "My Video", Path("video.mp4"))
+    with pytest.raises(pip.youtube.DuplicateCheckError, match="upload blocked"):
+        studio._check_duplicate_upload(settings, "My Video", Path("video.mp4"))
 
 
 # ------------------------------------------------------------------ 50/100 production threshold tests

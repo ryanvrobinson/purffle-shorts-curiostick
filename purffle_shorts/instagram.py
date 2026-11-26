@@ -1,19 +1,4 @@
-"""Instagram Reels publishing via Meta Graph API.
-
-Requires:
-- Instagram Professional Account (Business or Creator)
-- Meta App with Instagram Graph API access
-- Long-lived access token with permissions:
-  - instagram_graph_user_profile
-  - instagram_graph_user_media
-  - instagram_content_publish
-
-Environment variables:
-- INSTAGRAM_APP_ID: Meta App ID
-- INSTAGRAM_APP_SECRET: Meta App Secret
-- INSTAGRAM_USER_ID: Instagram Business Account ID (not the username)
-- INSTAGRAM_ACCESS_TOKEN: Long-lived access token
-"""
+"""Instagram Graph API integration using a Meta Business System User Access Token."""
 
 from __future__ import annotations
 
@@ -27,7 +12,7 @@ from typing import Optional
 
 from .config import Settings
 from .pipeline import Result
-from .utils import http, raise_for_status
+from .utils import raise_for_status
 
 log = logging.getLogger("purffle")
 
@@ -36,24 +21,20 @@ API_BASE = "https://graph.facebook.com/v20.0"
 
 @dataclass
 class InstagramConfig:
-    """Instagram publishing configuration."""
-    app_id: str
-    app_secret: str
+    """Meta Graph API configuration using a Business Manager System User Access Token."""
     user_id: str
     access_token: str
 
     @classmethod
     def from_env(cls) -> Optional["InstagramConfig"]:
-        """Load config from environment variables."""
-        app_id = os.getenv("INSTAGRAM_APP_ID")
-        app_secret = os.getenv("INSTAGRAM_APP_SECRET")
+        """Load the account ID and SUAT directly from the service environment."""
         user_id = os.getenv("INSTAGRAM_USER_ID")
         access_token = os.getenv("INSTAGRAM_ACCESS_TOKEN")
 
-        if not all([app_id, app_secret, user_id, access_token]):
+        if not user_id or not access_token:
             return None
 
-        return cls(app_id, app_secret, user_id, access_token)
+        return cls(user_id, access_token)
 
 
 @dataclass

@@ -51,6 +51,49 @@ def test_normalize_cleans_everything():
     assert "#" not in s.description
 
 
+def test_optional_description_question_is_validated_and_split_from_summary():
+    from purffle_shorts.pipeline import final_description
+
+    script = normalize({
+        "title": "Octopus facts",
+        "scenes": [{"narration": "Octopuses have three hearts.", "search_query": "octopus",
+                    "image_prompt": "octopus"}],
+        "description": "Octopuses have three hearts. #shorts",
+        "question": "Which heart stops while they swim?",
+        "hashtags": ["#shorts", "#octopus"],
+    }, "octopus", "facts", "en")
+    description = final_description(script, {"Pexels"}, Settings(credit_footage=True))
+
+    assert description.split("\n\n") == [
+        "Octopuses have three hearts.",
+        "Which heart stops while they swim?",
+        "#octopus",
+        "Footage: Pexels",
+    ]
+    assert "#shorts" not in description
+
+    script.question = "More about octopuses"
+    assert "More about octopuses" not in final_description(script, set(), Settings())
+
+
+def test_final_title_reserves_shorts_suffix_and_truncates_by_characters():
+    from purffle_shorts.pipeline import final_title
+
+    script = normalize({
+        "title": "Octopus " * 30,
+        "scenes": [{"narration": "Octopuses have three hearts.", "search_query": "octopus",
+                    "image_prompt": "octopus"}],
+    }, "octopus", "facts", "en")
+    script.title = "Octopus " * 20
+
+    title = final_title(script, Settings())
+
+    assert len(title) <= 100
+    assert title.endswith(" #shorts")
+    assert not title.removesuffix(" #shorts").endswith("Octopu")
+    assert "…" in title
+
+
 def test_normalize_merges_too_many_scenes():
     data = {"scenes": [{"narration": f"Sentence {i}.", "search_query": "q", "image_prompt": "p"} for i in range(20)]}
     s = normalize(data, "x", "facts", "en")
@@ -266,6 +309,21 @@ def test_write_script_rejects_undersized_without_recovery():
         write_script(llm, "cats", settings)
     assert len(llm.calls) == 2  # both attempts used, then raised
 
+
+def test_write_script_rejects_a_draft_below_55_percent_of_target():
+    settings = Settings(target_seconds=30)
+    target_words, _ = scene_plan("facts", 30)
+
+    def replies():
+        yield _full_script_data(_scenes_data(10, int(target_words * 0.54) // 10))
+        yield _full_script_data(_scenes_data(10, target_words // 10))
+
+    llm = _WriteFakeLLM(replies())
+    script = write_script(llm, "cats", settings)
+
+    assert len(llm.calls) == 2
+    assert len(script.narration.split()) >= int(target_words * 0.55)
+
 def test_write_script_rejects_oversized_and_retries():
     """An oversized initial script is rejected; the retry with a concise prompt produces an in-range script."""
     settings = Settings(target_seconds=16)
@@ -335,6 +393,20 @@ def test_validate_opening_hook_accepts_specific_opening():
     )
     issue = validate_opening_hook(script)
     assert issue is None
+
+
+def test_validate_opening_hook_rejects_too_short_but_accepts_three_word_opening():
+    from purffle_shorts.script import Scene, Script, validate_opening_hook
+
+    def make_script(opening):
+        return Script(
+            topic="cats", title="T", hook_text="HOOK",
+            scenes=[Scene(narration=opening, search_query="cats", image_prompt="cats")],
+            description="d",
+        )
+
+    assert "too short" in validate_opening_hook(make_script("Cats sleep."))
+    assert validate_opening_hook(make_script("Cats sleep upside-down.")) is None
 
 
 def test_validate_opening_hook_empty_narration():

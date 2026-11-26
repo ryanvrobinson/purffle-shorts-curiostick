@@ -9,9 +9,9 @@ import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import Mock
+from zoneinfo import ZoneInfo
 
 import pytest
-from zoneinfo import ZoneInfo
 
 from purffle_shorts import youtube as Y
 from purffle_shorts.automation import (
@@ -204,6 +204,8 @@ def test_build_body_scheduled_is_private_with_future_publish_at():
     assert body["status"]["privacyStatus"] == "private"
     assert body["status"]["publishAt"] == "2026-11-01T03:30:00Z"
     assert body["status"]["containsSyntheticMedia"] is True
+    long_title = Y.build_body(Settings(), "x" * 150, "", [], "27", "en")
+    assert len(long_title["snippet"]["title"]) == 100
 
 
 def test_duplicate_slot_is_not_uploaded_twice(tmp_path, monkeypatch):
@@ -395,6 +397,7 @@ def test_youtube_upload_retries_transient_errors(monkeypatch, tmp_path):
 
     video = tmp_path / "v.mp4"
     video.write_bytes(b"fake")
+    (tmp_path / "cover.jpg").write_bytes(b"fake-jpeg")
     calls = {"n": 0}
 
     class FakeRequest:
@@ -407,10 +410,20 @@ def test_youtube_upload_retries_transient_errors(monkeypatch, tmp_path):
     class FakeVideos:
         def insert(self, **k):
             return FakeRequest()
+        def list(self, **k):
+            return Mock(execute=lambda: {"items": [{"processingDetails": {"processingStatus": "succeeded"}}]})
+        def update(self, **k):
+            return Mock(execute=lambda: {
+                "id": "vid-retry", "status": {"privacyStatus": k["body"]["status"]["privacyStatus"]},
+            })
 
     class FakeYT:
         def videos(self):
             return FakeVideos()
+        def thumbnails(self):
+            return Mock(set=lambda **k: Mock(execute=lambda: {
+                "items": [{"default": {"url": "https://example.test/thumbnail.jpg"}}],
+            }))
 
     monkeypatch.setattr(Y, "service", lambda settings, interactive=False: FakeYT())
     monkeypatch.setattr(Y.time, "sleep", lambda *a: None)  # skip real backoff sleeps
@@ -420,6 +433,89 @@ def test_youtube_upload_retries_transient_errors(monkeypatch, tmp_path):
     resp = Y.upload(Settings(), video, {"snippet": {}, "status": {}})
     assert resp["id"] == "vid-retry"
     assert calls["n"] == 2  # first attempt failed, second succeeded
+
+
+def test_youtube_upload_attaches_thumbnail_before_releasing_video(monkeypatch, tmp_path):
+    video = tmp_path / "short.mp4"
+    video.write_bytes(b"video")
+    (tmp_path / "cover.jpg").write_bytes(b"jpeg")
+    calls = []
+
+    class FakeRequest:
+        def next_chunk(self):
+            return None, {"id": "vid-private"}
+
+    class FakeVideos:
+        def insert(self, **kwargs):
+            calls.append(("insert", kwargs["body"]["status"].copy()))
+            return FakeRequest()
+        def list(self, **kwargs):
+            calls.append(("processing", kwargs["id"]))
+            return Mock(execute=lambda: {"items": [{"processingDetails": {"processingStatus": "succeeded"}}]})
+        def update(self, **kwargs):
+            calls.append(("update", kwargs["body"]["status"].copy()))
+            status = kwargs["body"]["status"]
+            return Mock(execute=lambda: {"id": "vid-private", "status": status})
+
+    class FakeYT:
+        def videos(self):
+            return FakeVideos()
+        def thumbnails(self):
+            return Mock(set=lambda **kwargs: (
+                calls.append(("thumbnail", kwargs["videoId"]))
+                or Mock(execute=lambda: {
+                    "items": [{"default": {"url": "https://example.test/cover.jpg"}}],
+                })
+            ))
+
+    monkeypatch.setattr(Y, "service", lambda *a, **k: FakeYT())
+    monkeypatch.setattr("googleapiclient.http.MediaFileUpload", lambda *a, **k: "media")
+    requested = {"snippet": {}, "status": {"privacyStatus": "public"}}
+
+    response = Y.upload(Settings(privacy="public"), video, requested)
+
+    assert calls[0] == ("insert", {"privacyStatus": "private"})
+    assert calls.index(("thumbnail", "vid-private")) < calls.index(("update", {"privacyStatus": "public"}))
+    assert response["status"]["privacyStatus"] == "public"
+
+
+def test_thumbnail_failure_retains_private_video_id_without_release(monkeypatch, tmp_path):
+    video = tmp_path / "short.mp4"
+    video.write_bytes(b"video")
+    (tmp_path / "cover.jpg").write_bytes(b"jpeg")
+    calls = []
+
+    class FakeRequest:
+        def next_chunk(self):
+            return None, {"id": "vid-stays-private"}
+
+    class FakeVideos:
+        def insert(self, **kwargs):
+            calls.append(("insert", kwargs["body"]["status"].copy()))
+            return FakeRequest()
+        def list(self, **kwargs):
+            return Mock(execute=lambda: {"items": [{"processingDetails": {"processingStatus": "succeeded"}}]})
+        def update(self, **kwargs):
+            calls.append(("update", kwargs))
+            return Mock(execute=lambda: {})
+
+    class FakeYT:
+        def videos(self):
+            return FakeVideos()
+        def thumbnails(self):
+            return Mock(set=lambda **kwargs: Mock(execute=lambda: (_ for _ in ()).throw(
+                RuntimeError("YouTube rejected thumbnail"))))
+
+    monkeypatch.setattr(Y, "service", lambda *a, **k: FakeYT())
+    monkeypatch.setattr("googleapiclient.http.MediaFileUpload", lambda *a, **k: "media")
+
+    with pytest.raises(Y.ThumbnailUploadError) as error:
+        Y.upload(Settings(privacy="public"), video, {
+            "snippet": {}, "status": {"privacyStatus": "public", "publishAt": "2099-01-01T00:00:00Z"},
+        })
+
+    assert error.value.video_id == "vid-stays-private"
+    assert calls == [("insert", {"privacyStatus": "private"})]
 
 
 # ------------------------------------------------------------------ workflow files

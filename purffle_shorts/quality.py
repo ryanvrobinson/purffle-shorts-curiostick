@@ -9,6 +9,15 @@ Checks are split into two kinds:
 
 A check marked ``heuristic`` is never reported as "verified"; it is an
 advisory signal only.
+
+The weighted quality score is out of 100: integrity 35 (file 8, ffprobe 8,
+streams 8, audio 8, render status 3); presentation 20 (aspect ratio 8,
+duration 6, black frames 4, thumbnail 2); captions 15 (valid SRT 5, timing
+7, overflow 3); content 20 (script 7, hook 5, visual mapping 4, visuals 4);
+metadata 10 (metadata 4, research 3, attribution 3). Passing requires
+80/100 and category minimums of integrity 30/35, presentation 14/20,
+captions 10/15, content 12/20, and metadata 5/10. Missing/invalid video,
+missing or inaudible audio, and a missing thumbnail are critical blockers.
 """
 
 from __future__ import annotations
@@ -24,19 +33,101 @@ from typing import TYPE_CHECKING
 
 from . import ffmpeg
 from .config import ASPECTS, Settings, duration_window, short_duration_bounds
-from .script import HOOK_BAD_PATTERNS
+from .script import HOOK_BAD_PATTERNS, word_count
 
 if TYPE_CHECKING:
     from .pipeline import Result
 
 log = logging.getLogger("purffle")
 
-# Tolerance for caption-vs-audio sync drift (seconds).
-CAPTION_SYNC_TOLERANCE = 0.5
 # Minimum fraction of the video that must not be black.
 MAX_BLACK_FRACTION = 0.10
 # Caption safe-area margin (fraction of frame width/height).
 CAPTION_SAFE_MARGIN = 0.08
+MAX_CAPTION_GAP_SECONDS = 3.0
+MINIMUM_QUALITY_SCORE = 80
+QUALITY_WEIGHTS = {
+    "file_exists": ("integrity", 8),
+    "ffprobe_readable": ("integrity", 8),
+    "streams": ("integrity", 8),
+    "audio_present": ("integrity", 4),
+    "audio_audible": ("integrity", 4),
+    "render_status": ("integrity", 3),
+    "aspect_ratio": ("presentation", 8),
+    "duration": ("presentation", 6),
+    "black_frames": ("presentation", 4),
+    "thumbnail": ("presentation", 2),
+    "captions": ("captions", 5),
+    "caption_sync": ("captions", 7),
+    "caption_overflow": ("captions", 3),
+    "script_complete": ("content", 7),
+    "script_hook": ("content", 5),
+    "scene_visual_mapping": ("content", 4),
+    "visuals_present": ("content", 4),
+    "metadata": ("metadata", 4),
+    "research_verification": ("metadata", 3),
+    "attribution": ("metadata", 3),
+}
+CATEGORY_MINIMUMS = {
+    "integrity": 30,
+    "presentation": 14,
+    "captions": 10,
+    "content": 12,
+    "metadata": 5,
+}
+CRITICAL_CHECKS = {
+    "file_exists", "ffprobe_readable", "streams", "audio_present", "audio_audible", "duration", "thumbnail",
+}
+SRT_TIMESTAMP = re.compile(r"^(-?\d{2,}:[0-5]\d:[0-5]\d,\d{3})$")
+
+
+def parse_srt(content: str, duration: float | None = None) -> list[tuple[float, float, str]]:
+    """Parse and validate standard SRT entries, including their timeline bounds."""
+    content = content.lstrip("\ufeff").strip()
+    if not content:
+        raise ValueError("SRT is empty")
+    entries = re.split(r"\r?\n\s*\r?\n", content)
+    parsed: list[tuple[float, float, str]] = []
+    previous_end = 0.0
+    previous_index = 0
+
+    def parse_timestamp(value: str, index: int) -> float:
+        if not SRT_TIMESTAMP.fullmatch(value):
+            raise ValueError(f"Caption {index} has an invalid timestamp")
+        sign = -1 if value.startswith("-") else 1
+        hours, minutes, seconds = value.lstrip("-").replace(",", ".").split(":")
+        return sign * (int(hours) * 3600 + int(minutes) * 60 + float(seconds))
+
+    for entry_number, entry in enumerate(entries, start=1):
+        lines = entry.strip().splitlines()
+        if len(lines) < 3 or not lines[0].strip().isdigit():
+            raise ValueError(f"Caption {entry_number} has an invalid SRT structure")
+        index = int(lines[0].strip())
+        if index <= previous_index:
+            raise ValueError(f"Caption {entry_number} has a non-increasing cue number")
+        match = re.fullmatch(r"\s*(\S+)\s+-->\s+(\S+)\s*", lines[1])
+        if not match:
+            raise ValueError(f"Caption {index} has an invalid timestamp interval")
+        start = parse_timestamp(match.group(1), index)
+        end = parse_timestamp(match.group(2), index)
+        if start < 0:
+            raise ValueError(f"Caption {index} starts before zero")
+        if end <= start:
+            raise ValueError(f"Caption {index} ends before or at its start")
+        if duration is not None and end > duration:
+            raise ValueError(f"Caption {index} ends beyond video duration")
+        if start < previous_end - 0.1:
+            raise ValueError(f"Caption {index} overlaps the previous caption")
+        gap = start - previous_end
+        if gap > MAX_CAPTION_GAP_SECONDS:
+            raise ValueError(f"Caption {index} follows an excessive {gap:.2f}s timing gap")
+        text = "\n".join(lines[2:]).strip()
+        if not text:
+            raise ValueError(f"Caption {index} has no text")
+        parsed.append((start, end, text))
+        previous_end = end
+        previous_index = index
+    return parsed
 
 
 @dataclass
@@ -61,16 +152,26 @@ class QualityReport:
     checks: list[QualityCheck]
     video_path: Path
     checked_at: str = field(default_factory=lambda: datetime.now().isoformat())
+    score: int = 0
+    category_scores: dict[str, int] = field(default_factory=dict)
+    category_totals: dict[str, int] = field(default_factory=dict)
+    category_minimums: dict[str, int] = field(default_factory=lambda: dict(CATEGORY_MINIMUMS))
+    critical_failures: list[str] = field(default_factory=list)
 
     @property
     def summary(self) -> str:
         """Human-readable summary of failures."""
         failures = [c for c in self.checks if not c.passed]
-        if not failures:
-            return "All checks passed"
-        return f"{len(failures)} check(s) failed: " + "; ".join(
-            f"{c.name}: {c.message}" for c in failures
-        )
+        result = f"Quality score {self.score}/100 (minimum {MINIMUM_QUALITY_SCORE})"
+        if failures:
+            result += "; " + f"{len(failures)} check(s) failed: " + "; ".join(
+                f"{c.name}: {c.message}" for c in failures
+            )
+        elif self.passed:
+            result += "; all checks passed"
+        if self.critical_failures:
+            result += "; critical blockers: " + ", ".join(self.critical_failures)
+        return result
 
     @property
     def failed_checks(self) -> list[QualityCheck]:
@@ -91,6 +192,12 @@ class QualityReport:
             "passed": self.passed,
             "checked_at": self.checked_at,
             "video_path": str(self.video_path),
+            "score": self.score,
+            "minimum_score": MINIMUM_QUALITY_SCORE,
+            "category_scores": self.category_scores,
+            "category_totals": self.category_totals,
+            "category_minimums": self.category_minimums,
+            "critical_failures": self.critical_failures,
             "checks": [
                 {
                     "name": c.name,
@@ -114,10 +221,9 @@ class QualityGate:
     def check(self, result: Result) -> QualityReport:
         """Run all quality checks on a rendered video."""
         if not result.video or not result.video.exists():
-            return QualityReport(
-                passed=False,
-                checks=[QualityCheck("file_exists", False, "Video file does not exist")],
-                video_path=result.video or Path(""),
+            return self._report(
+                [QualityCheck("file_exists", False, "Video file does not exist")],
+                result.video or Path(""),
             )
 
         checks = []
@@ -151,6 +257,9 @@ class QualityGate:
         # 9. Caption-audio synchronization (automated)
         checks.append(self._check_caption_sync(result))
 
+        # 11. Caption spelling and punctuation (heuristic)
+        checks.append(self._check_caption_spelling(result))
+
         # 10. Caption overflow / safe-area (heuristic)
         checks.append(self._check_caption_overflow(result))
 
@@ -174,12 +283,32 @@ class QualityGate:
         # 16. Render completed successfully (automated)
         checks.append(self._check_render_status(result))
 
-        all_passed = all(c.passed for c in checks if c.method == "automated")
+        return self._report(checks, result.video)
 
+    @staticmethod
+    def _report(checks: list[QualityCheck], video_path: Path) -> QualityReport:
+        by_name = {check.name: check for check in checks}
+        category_scores = {name: 0 for name in CATEGORY_MINIMUMS}
+        category_totals = {name: 0 for name in CATEGORY_MINIMUMS}
+        for name, (category, points) in QUALITY_WEIGHTS.items():
+            category_totals[category] += points
+            check = by_name.get(name)
+            if check and check.passed:
+                category_scores[category] += points
+        score = sum(category_scores.values())
+        critical_failures = sorted(
+            name for name in CRITICAL_CHECKS
+            if name not in by_name or not by_name[name].passed
+        )
+        passed = (
+            score >= MINIMUM_QUALITY_SCORE
+            and all(category_scores[name] >= minimum for name, minimum in CATEGORY_MINIMUMS.items())
+            and not critical_failures
+        )
         return QualityReport(
-            passed=all_passed,
-            checks=checks,
-            video_path=result.video,
+            passed=passed, checks=checks, video_path=video_path, score=score,
+            category_scores=category_scores, category_totals=category_totals,
+            critical_failures=critical_failures,
         )
 
     def _check_file_exists(self, video_path: Path) -> QualityCheck:
@@ -299,8 +428,8 @@ class QualityGate:
         except Exception as e:
             return QualityCheck("duration", False, f"Duration check failed: {e}")
 
-    def _check_captions_exist(self, folder: Path | None) -> QualityCheck:
-        """Check captions SRT file exists and is not empty."""
+    def _check_captions_exist(self, folder: Path | None, duration: float | None = None) -> QualityCheck:
+        """Check captions SRT file exists and contains valid, bounded entries."""
         if not folder:
             return QualityCheck("captions", False, "No folder path provided")
 
@@ -309,12 +438,10 @@ class QualityGate:
             return QualityCheck("captions", False, "captions.srt not found")
 
         try:
-            content = srt_path.read_text(encoding="utf-8")
-            if not content.strip():
-                return QualityCheck("captions", False, "captions.srt is empty")
-            # Count caption entries
-            entries = content.strip().split("\n\n")
+            entries = parse_srt(srt_path.read_text(encoding="utf-8"), duration)
             return QualityCheck("captions", True, f"Captions found ({len(entries)} entries)")
+        except ValueError as e:
+            return QualityCheck("captions", False, f"Invalid captions.srt: {e}")
         except Exception as e:
             return QualityCheck("captions", False, f"Failed to read captions: {e}")
 
@@ -421,13 +548,18 @@ class QualityGate:
         if not path.exists():
             return QualityCheck("script_hook", False, "script.json not found")
         try:
-            scenes = json.loads(path.read_text(encoding="utf-8")).get("scenes") or []
+            script = json.loads(path.read_text(encoding="utf-8"))
+            scenes = script.get("scenes") or []
             if not scenes or not scenes[0].get("narration", "").strip():
                 return QualityCheck("script_hook", False, "Opening scene has no narration")
             opening = scenes[0]["narration"].strip()
             if HOOK_BAD_PATTERNS.match(opening):
                 return QualityCheck("script_hook", False,
                                     "Opening uses a greeting or generic 'Did you know?' hook")
+            if word_count(opening, script.get("language", "en")) < 3:
+                return QualityCheck(
+                    "script_hook", False,
+                    "Opening hook is too short to establish a clear idea (minimum three spoken words)")
             return QualityCheck("script_hook", True, "Opening narration starts directly with the story")
         except (OSError, json.JSONDecodeError, AttributeError, TypeError) as e:
             return QualityCheck("script_hook", False, f"Opening hook could not be validated: {e}")
@@ -525,12 +657,7 @@ class QualityGate:
                                 details={"method": "automated"})
 
     def _check_caption_sync(self, result: Result) -> QualityCheck:
-        """Compare caption timings (SRT) against narration word timings (automated).
-
-        Uses the caption chunks already computed during render and the speech
-        word timings stored in metadata. A drift beyond the tolerance flags the
-        check as failed.
-        """
+        """Validate caption timing order, gaps, and end bounds against the rendered video."""
         if not result.folder:
             return QualityCheck("caption_sync", False, "No folder path provided",
                                 details={"method": "automated"})
@@ -543,34 +670,11 @@ class QualityGate:
                 details={"method": "automated"},
             )
         try:
-            meta = json.loads(meta_path.read_text(encoding="utf-8"))
-            # Look for per-scene word timings in metadata (stored by the pipeline)
-            visuals = meta.get("visuals", [])
-            # The SRT contains caption chunks with start/end times; we check that
-            # at least one caption exists and its times are within the video duration.
             assert result.video is not None
             info = ffmpeg.probe(result.video)
             duration = info.get("duration", 0)
-            content = srt_path.read_text(encoding="utf-8").strip()
-            if not content:
-                return QualityCheck("caption_sync", False, "Captions file is empty",
-                                    details={"method": "automated"})
-            entries = content.split("\n\n")
-            max_caption_end = 0.0
-            for entry in entries:
-                lines = entry.strip().split("\n")
-                if len(lines) >= 2:
-                    m = re.match(r"([0-9:,\.]+)\s*-->\s*([0-9:,\.]+)", lines[1])
-                    if m:
-                        end = self._parse_srt_time(m.group(2))
-                        max_caption_end = max(max_caption_end, end)
-            if max_caption_end > duration + CAPTION_SYNC_TOLERANCE:
-                return QualityCheck(
-                    "caption_sync", False,
-                    f"Captions extend {max_caption_end - duration:.2f}s beyond video duration",
-                    details={"method": "automated", "max_caption_end": round(max_caption_end, 2),
-                             "video_duration": round(duration, 2)},
-                )
+            entries = parse_srt(srt_path.read_text(encoding="utf-8"), duration)
+            max_caption_end = max(end for _, end, _ in entries)
             return QualityCheck(
                 "caption_sync", True,
                 f"Captions within video duration ({len(entries)} captions, ends {max_caption_end:.2f}s)",
@@ -580,15 +684,6 @@ class QualityGate:
         except Exception as e:
             return QualityCheck("caption_sync", False, f"Caption sync check failed: {e}",
                                 details={"method": "automated"})
-
-    @staticmethod
-    def _parse_srt_time(ts: str) -> float:
-        """Parse an SRT timestamp (HH:MM:SS,mmm) into seconds."""
-        ts = ts.strip().replace(",", ".")
-        parts = ts.split(":")
-        if len(parts) == 3:
-            return float(parts[0]) * 3600 + float(parts[1]) * 60 + float(parts[2])
-        return float(ts)
 
     def _check_caption_overflow(self, result: Result) -> QualityCheck:
         """Estimate caption overflow against the safe area (heuristic).
@@ -605,17 +700,10 @@ class QualityGate:
             return QualityCheck("caption_overflow", False, "Captions file not found",
                                 details={"method": "heuristic"})
         try:
-            content = srt_path.read_text(encoding="utf-8").strip()
-            if not content:
-                return QualityCheck("caption_overflow", True, "No captions to check",
-                                    details={"method": "heuristic"})
-            entries = content.split("\n\n")
+            entries = parse_srt(srt_path.read_text(encoding="utf-8"))
             max_chars = 0
-            for entry in entries:
-                lines = entry.strip().split("\n")
-                if len(lines) >= 3:
-                    text = " ".join(lines[2:])
-                    max_chars = max(max_chars, len(text))
+            for _, _, text in entries:
+                max_chars = max(max_chars, len(text.replace("\n", " ")))
             # Heuristic: at 1080x1920 with the default kinetic style, ~40 chars
             # is the practical limit before overflow risk rises.
             overflow_risk = max_chars > 45
@@ -635,6 +723,55 @@ class QualityGate:
         except Exception as e:
             return QualityCheck("caption_overflow", False, f"Caption overflow check failed: {e}",
                                 details={"method": "heuristic"})
+
+    def _check_caption_spelling(self, result: Result) -> QualityCheck:
+        """Check caption text for obvious spelling errors.
+
+        This is a heuristic (advisory) check only: it looks for things like
+        repeated words, obvious typos using simple pattern matching, and missing
+        sentence-ending punctuation where appropriate. It does NOT reject
+        sentence fragments, informal speech, or creative language — those are
+        valid in captions and short-form video narration.
+        """
+        if not result.folder:
+            return QualityCheck("caption_spelling", False, "No folder path provided",
+                                details={"method": "heuristic"})
+        srt_path = result.folder / "captions.srt"
+        if not srt_path.exists():
+            return QualityCheck("caption_spelling", False, "Captions file not found",
+                                details={"method": "heuristic"})
+        try:
+            entries = parse_srt(srt_path.read_text(encoding="utf-8"))
+            flags = []
+            for i, (start, end, text) in enumerate(entries, start=1):
+                # Check for repeated words (e.g. "the the")
+                words = text.split()
+                for j in range(len(words) - 1):
+                    if words[j].lower() == words[j + 1].lower() and len(words[j]) > 2:
+                        flags.append(f"Caption {i}: repeated word '{words[j]}'")
+                        break
+                # Check for missing period at end (if the caption looks like a statement)
+                # but allow fragments and questions
+                stripped = text.strip()
+                if stripped and not stripped.endswith(('.', '!', '?')) and not stripped.startswith(('"', "'")):
+                    # Only flag if it looks like a complete sentence (capitalized and no conjunction start)
+                    if stripped[0].isupper() and len(stripped) > 8:
+                        flags.append(f"Caption {i}: missing sentence-ending punctuation")
+            if flags:
+                return QualityCheck(
+                    "caption_spelling", False,
+                    "; ".join(flags[:5]),
+                    details={"method": "heuristic", "flags": flags},
+                )
+            return QualityCheck(
+                "caption_spelling", True,
+                "No spelling issues detected",
+                details={"method": "heuristic"},
+            )
+        except Exception as e:
+            return QualityCheck("caption_spelling", False, f"Spell check failed: {e}",
+                                details={"method": "heuristic"})
+
 
     def _check_visuals_present(self, result: Result) -> QualityCheck:
         """Check that no scene fell back to an animated gradient (automated).

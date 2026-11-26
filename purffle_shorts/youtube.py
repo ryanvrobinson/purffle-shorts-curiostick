@@ -16,6 +16,7 @@ from datetime import time as dtime
 from pathlib import Path
 
 from .config import Settings
+from .utils import truncate_title
 
 log = logging.getLogger("purffle")
 
@@ -23,6 +24,8 @@ SCOPE_UPLOAD = "https://www.googleapis.com/auth/youtube.upload"
 SCOPE_MANAGE = "https://www.googleapis.com/auth/youtube"
 SCOPE_READONLY = "https://www.googleapis.com/auth/youtube.readonly"
 RETRY_STATUS = {500, 502, 503, 504}
+PROCESSING_TIMEOUT_SECONDS = 900
+PROCESSING_POLL_INTERVAL_SECONDS = 10
 
 # ``invalid_grant`` from Google's OAuth2 token endpoint means the refresh token
 # is revoked, expired, or belongs to a different client. It is permanent: no
@@ -33,24 +36,46 @@ _INVALID_GRANT = "invalid_grant"
 _lock = threading.Lock()
 
 
+class DuplicateCheckError(RuntimeError):
+    """YouTube could not verify whether a matching video already exists."""
+
+
+class VideoUploadIncomplete(RuntimeError):
+    """A private YouTube upload exists but was not safely finalized."""
+
+    def __init__(self, video_id: str | None, message: str):
+        super().__init__(message)
+        self.video_id = video_id
+
+
+class ThumbnailUploadError(VideoUploadIncomplete):
+    """The uploaded video remains private because its thumbnail was not verified."""
+
+
+class UploadFinalizationError(VideoUploadIncomplete):
+    """The thumbnail was attached but the requested final status was not verified."""
+
+
 def find_existing_video(yt, marker: str) -> str | None:
-    """Best-effort check whether the authorized channel already has a video matching ``marker``.
+    """Return a matching video ID or fail closed when YouTube cannot be queried.
 
     Used as a cross-runner idempotency net: if a slot's video is already on YouTube
     (and the history database did not carry over to this runner), we do not re-upload.
-    Never blocks an upload: any failure returns None.
     """
-    from googleapiclient.errors import HttpError
     try:
         resp = yt.search().list(part="id", forMine=True, type="video",
                                 q=marker, maxResults=5).execute()
         items = resp.get("items") or []
         if items:
-            return items[0]["id"]["videoId"]
-    except HttpError as e:
-        log.warning("YouTube duplicate search failed: %s", e)
-    except Exception as e:  # pragma: no cover - network/auth hiccups
-        log.warning("YouTube duplicate search failed: %s", e)
+            video_id = (items[0].get("id") or {}).get("videoId")
+            if not video_id:
+                raise ValueError("duplicate search returned a malformed video resource")
+            return str(video_id)
+    except Exception as e:
+        log.warning("YouTube duplicate search failed (%s); upload blocked", type(e).__name__)
+        raise DuplicateCheckError(
+            f"YouTube duplicate search failed ({type(e).__name__}); upload blocked."
+        ) from e
     return None
 
 
@@ -295,7 +320,7 @@ def build_body(settings: Settings, title: str, description: str, tags: list[str]
         status["publishAt"] = to_rfc3339(publish_at)
     return {
         "snippet": {
-            "title": title[:100],
+            "title": truncate_title(title, 100),
             "description": description[:4900],
             "tags": tags,
             "categoryId": category_id,
@@ -307,14 +332,25 @@ def build_body(settings: Settings, title: str, description: str, tags: list[str]
 
 
 def upload(settings: Settings, video: Path, body: dict) -> dict:
-    """Resumable upload with exponential backoff. Returns the API video resource."""
+    """Upload privately, attach a verified thumbnail, then apply the requested visibility."""
     from googleapiclient.errors import HttpError
     from googleapiclient.http import MediaFileUpload
+
+    thumbnail = video.parent / "cover.jpg"
+    if not thumbnail.is_file() or thumbnail.stat().st_size == 0:
+        raise ThumbnailUploadError(None, "cover.jpg is missing or empty; upload was not started")
 
     with _lock:  # one upload at a time; the API client is not thread-safe
         yt = service(settings, interactive=False)
         media = MediaFileUpload(str(video), mimetype="video/mp4", chunksize=8 * 1024 * 1024, resumable=True)
-        request = yt.videos().insert(part="snippet,status", body=body, media_body=media)
+        requested_status = dict(body.get("status") or {})
+        requested_status.setdefault("privacyStatus", "private")
+        private_status = dict(requested_status)
+        private_status["privacyStatus"] = "private"
+        private_status.pop("publishAt", None)
+        private_body = dict(body)
+        private_body["status"] = private_status
+        request = yt.videos().insert(part="snippet,status", body=private_body, media_body=media)
         response, retry, last_pct = None, 0, -1
         while response is None:
             try:
@@ -343,11 +379,80 @@ def upload(settings: Settings, video: Path, body: dict) -> dict:
             log.warning("Upload retry %d in %.0fs", retry, wait)
             time.sleep(wait)
 
-        if settings.playlist_id and response.get("id"):
+        video_id = response.get("id") if isinstance(response, dict) else None
+        if not video_id:
+            raise RuntimeError("YouTube upload completed without returning a video ID")
+
+        try:
+            _wait_until_processed(yt, str(video_id))
+            thumb_response = yt.thumbnails().set(
+                videoId=str(video_id),
+                media_body=MediaFileUpload(str(thumbnail), mimetype="image/jpeg", resumable=False),
+            ).execute()
+            _verify_thumbnail_response(thumb_response)
+        except Exception as e:
+            log.error("Thumbnail attachment failed for private video %s (%s)",
+                      video_id, type(e).__name__)
+            raise ThumbnailUploadError(
+                str(video_id),
+                f"Thumbnail attachment failed for video {video_id}; it remains private.",
+            ) from e
+
+        if settings.playlist_id:
             try:
-                yt.playlistItems().insert(part="snippet", body={"snippet": {
+                playlist_body = {"snippet": {
                     "playlistId": settings.playlist_id,
-                    "resourceId": {"kind": "youtube#video", "videoId": response["id"]}}}).execute()
+                    "resourceId": {"kind": "youtube#video", "videoId": str(video_id)},
+                }}
+                yt.playlistItems().insert(part="snippet", body=playlist_body).execute()
             except Exception as e:
                 log.warning("Could not add video to playlist %s: %s", settings.playlist_id, e)
-        return response
+
+        try:
+            finalized = yt.videos().update(
+                part="status",
+                body={"id": str(video_id), "status": requested_status},
+            ).execute()
+            finalized_status = (finalized or {}).get("status") or {}
+            expected_privacy = requested_status["privacyStatus"]
+            if (not isinstance(finalized, dict) or finalized.get("id") != str(video_id)
+                    or finalized_status.get("privacyStatus") != expected_privacy):
+                raise ValueError("YouTube did not confirm the requested privacy status")
+            return finalized
+        except Exception as e:
+            log.error("Final status update failed for video %s (%s); video was not confirmed",
+                      video_id, type(e).__name__)
+            raise UploadFinalizationError(
+                str(video_id),
+                f"Final YouTube status was not verified for video {video_id}.",
+            ) from e
+
+
+def _wait_until_processed(yt, video_id: str) -> None:
+    deadline = time.monotonic() + PROCESSING_TIMEOUT_SECONDS
+    while True:
+        response = yt.videos().list(part="processingDetails", id=video_id).execute()
+        items = response.get("items") if isinstance(response, dict) else None
+        if not items:
+            raise RuntimeError("YouTube returned no processing status for the uploaded video")
+        status = (items[0].get("processingDetails") or {}).get("processingStatus")
+        if status == "succeeded":
+            return
+        if status in {"failed", "terminated"}:
+            raise RuntimeError(f"YouTube video processing ended with status {status}")
+        if time.monotonic() >= deadline:
+            raise TimeoutError("YouTube video processing did not finish before the thumbnail timeout")
+        time.sleep(PROCESSING_POLL_INTERVAL_SECONDS)
+
+
+def _verify_thumbnail_response(response: dict) -> None:
+    items = response.get("items") if isinstance(response, dict) else None
+    if not isinstance(items, list) or not items:
+        raise ValueError("YouTube returned no thumbnail resource")
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        if any(isinstance(item.get(size), dict) and item[size].get("url")
+               for size in ("default", "medium", "high", "standard", "maxres", "shortsAspectRatio")):
+            return
+    raise ValueError("YouTube response did not confirm a thumbnail URL")

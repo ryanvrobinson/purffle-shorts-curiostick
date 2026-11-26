@@ -17,7 +17,7 @@ FONT_CANDIDATES = [
 def _clean_env(monkeypatch):
     """Tests never see the developer's real keys or .env settings."""
     for key in list(os.environ):
-        if key.endswith("_API_KEY") or key.startswith(("LLM_", "ANTHROPIC_", "TTS_", "CAPTION_")) or key in (
+        if key.endswith("_API_KEY") or key.startswith(("LLM_", "ANTHROPIC_", "TTS_", "CAPTION_", "INSTAGRAM_")) or key in (
                 "OLLAMA_HOST", "UPLOAD", "ASPECT", "RESOLUTION", "TARGET_SECONDS", "SCRIPT_REVIEW", "ALSO_LANGUAGES",
                 "RSS_FEEDS", "NOTIFY_WEBHOOK", "LEARN_FROM_STATS", "PURFFLE_HOME", "KEEP_WORK"):
             monkeypatch.delenv(key, raising=False)

@@ -55,6 +55,11 @@ def test_other_host_names_are_refused(server):
     assert req(port, "GET", "/api/info", host=f"localhost:{port}")[0] == 200
 
 
+def test_instagram_login_callback_is_not_exposed(server):
+    _, port = server
+    assert req(port, "GET", "/instagram/callback")[0] == 404
+
+
 def test_writes_need_the_token(server):
     app, port = server
     assert req(port, "POST", "/api/ideas", {"subject": "x"})[0] == 403

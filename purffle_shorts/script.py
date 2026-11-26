@@ -93,6 +93,7 @@ SCRIPT_SCHEMA = {
         "cast": {"type": "array", "items": {"type": "string"}},
         "scenes": {"type": "array", "items": SCENE_SCHEMA},
         "description": {"type": "string"},
+        "question": {"type": "string"},
         "hashtags": {"type": "array", "items": {"type": "string"}},
         "tags": {"type": "array", "items": {"type": "string"}},
         "category": {"type": "string", "enum": list(CATEGORIES)},
@@ -163,6 +164,7 @@ class Script:
     sources: list[str] = field(default_factory=list)  # source references when research material was supplied
     verification_report: dict | None = None  # claim-based fact verification report (Phase 2)
     breakdown: dict[str, int] | None = None  # last Script Doctor rubric score breakdown (category -> points)
+    question: str = ""                # optional question for the video description
 
     @property
     def narration(self) -> str:
@@ -278,10 +280,11 @@ Language: {lang} for narration, title, hook_text, cast and description. search_q
 - visual_description: identify the actual place, geological/biological/astronomical subject, and visible details for this scene in one sentence. Do not depict an unverified event as a real photograph.
 - title: max 60 characters, curiosity-driven but honest, no hashtags, no quotes.
 - hook_text: max 6 words shown on screen during the first seconds.
-- description: a concise, accurate summary and one relevant question. No hashtags.
+- description: a concise, accurate summary only. No hashtags.
+- question: one specific, relevant question supported by this video, or an empty string if none fits.
 - hashtags: 3-5 relevant hashtags. tags: 8-15 search keywords.
 - category: one of {", ".join(CATEGORIES)}.
-{src_rule}Return JSON with keys: topic, title, hook_text, angle, hooks (exactly three strings), selected_hook, cast, scenes (array of {{speaker, narration, search_query, image_prompt, visual_description}}), description, hashtags, tags, category, sources (when background information was supplied).
+{src_rule}Return JSON with keys: topic, title, hook_text, angle, hooks (exactly three strings), selected_hook, cast, scenes (array of {{speaker, narration, search_query, image_prompt, visual_description}}), description, question, hashtags, tags, category, sources (when background information was supplied).
 - HARD LIMIT: Narration total must stay within {int(words * 0.9)}–{int(words * 1.1)} words across exactly {n_scenes} scenes. No filler, no padding, no extra scenes.
 """
     return system, user
@@ -377,6 +380,9 @@ def normalize(data: dict, subject: str, style: str, language: str) -> Script:
         cast = []
 
     description = re.sub(r"(?<!\w)#\w+", "", strip_emoji(str(data.get("description") or ""))).strip()
+    question = re.sub(r"(?<!\w)#\w+", "", strip_emoji(str(data.get("question") or ""))).strip()
+    if not question.endswith("?") or word_count(question, language) < 3:
+        question = ""
     score = data.get("score")
     return Script(
         topic=str(data.get("topic") or subject).strip(),
@@ -399,6 +405,7 @@ def normalize(data: dict, subject: str, style: str, language: str) -> Script:
         sources=[str(s).strip() for s in (data.get("sources") or []) if str(s).strip()],
         verification_report=data.get("verification_report"),
         breakdown=data.get("breakdown"),
+        question=question,
     )
 
 
@@ -434,6 +441,8 @@ def validate_opening_hook(script: Script) -> str | None:
         return "Opening scene has no narration"
     if HOOK_BAD_PATTERNS.match(opening):
         return "Opening uses a greeting or generic 'Did you know?' hook"
+    if word_count(opening, script.language) < 3:
+        return "Opening hook is too short to establish a clear idea (minimum three spoken words)"
     return None
 
 
@@ -445,7 +454,7 @@ def write_script(llm, subject: str, settings: Settings, *, source: str = "niche"
         return offline_script(subject, settings, style)
     system, user = build_prompt(subject, style, settings, avoid or [], context, insights)
     words, n_scenes = scene_plan(style, settings.target_seconds)
-    lo_words = int(words * 0.5)  # absolute floor: at least half the target
+    lo_words = int(words * 0.55)  # avoid thin drafts without forcing an exact target speaking rate
     hi_words = int(words * 1.2)  # ceiling: ~20% over target keeps total duration within limits
     min_scenes = max(1, n_scenes // 2)
 
@@ -955,7 +964,7 @@ def translate_script(llm, script: Script, language: str) -> Script:
 {json.dumps(src, ensure_ascii=False, indent=1)}
 
 Rules:
-- Translate title, hook_text, cast, description and every scene's narration into natural spoken {lang},
+- Translate title, hook_text, cast, description, question and every scene's narration into natural spoken {lang},
   the way a native creator would say it (not word for word). Keep numbers and names accurate.
 - Keep EXACTLY {len(script.scenes)} scenes in the same order, with the same speaker for each.
 - Keep search_query and image_prompt unchanged (English).

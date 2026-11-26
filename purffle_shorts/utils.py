@@ -150,3 +150,17 @@ def truncate_words(text: str, limit: int) -> str:
         return text
     cut = text[:limit].rsplit(" ", 1)[0].rstrip(" ,.;:-")
     return cut or text[:limit]
+
+
+def truncate_title(text: str, limit: int) -> str:
+    """Keep titles within a character limit, preferring a readable word boundary."""
+    text = text.strip()
+    if len(text) <= limit:
+        return text
+    ellipsis = "…"
+    budget = max(0, limit - len(ellipsis))
+    prefix = text[:budget]
+    boundary = prefix.rfind(" ")
+    if boundary > 0:
+        prefix = prefix[:boundary]
+    return prefix.rstrip(" ,.;:-") + ellipsis

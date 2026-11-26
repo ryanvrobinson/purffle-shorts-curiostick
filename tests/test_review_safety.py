@@ -212,6 +212,31 @@ def test_upload_record_api_failure_records_failed_status(settings, tmp_path, mon
     assert "YouTube rejected the upload" in rec["error"]
 
 
+def test_thumbnail_failure_preserves_private_video_id_and_prevents_retry(settings, tmp_path, monkeypatch):
+    video = tmp_path / "short.mp4"
+    _valid_video(video)
+    studio = Studio(settings)
+    record_id = studio.history.add_video(
+        title="T", folder=str(tmp_path), video_path=str(video), status="rendered")
+    _approve(studio, record_id)
+    calls = []
+
+    def fail_thumbnail(*args, **kwargs):
+        calls.append(True)
+        from purffle_shorts.youtube import ThumbnailUploadError
+        raise ThumbnailUploadError("vid-private", "thumbnail attachment failed")
+
+    monkeypatch.setattr("purffle_shorts.youtube.upload", fail_thumbnail)
+
+    assert studio.upload_record(record_id) == "thumbnail-failed"
+    record = studio.history.get(record_id)
+    assert record["status"] == "thumbnail-failed"
+    assert record["youtube_id"] == "vid-private"
+    assert record["publish_at"] is None
+    assert studio.upload_record(record_id) == "already-uploaded"
+    assert len(calls) == 1
+
+
 def test_upload_record_missing_credentials_raises_clear_error(settings, tmp_path, monkeypatch):
     """Missing OAuth credentials: NotAuthorized propagates with an actionable message."""
     from purffle_shorts.youtube import NotAuthorized
